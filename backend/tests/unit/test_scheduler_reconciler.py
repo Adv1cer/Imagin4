@@ -14,17 +14,17 @@ from app.services.scheduler import Scheduler
 
 
 def _job(**overrides) -> QueuedJob:
-    defaults = dict(
-        id=uuid.uuid4(),
-        user_id=uuid.uuid4(),
-        kind="txt2img_basic",
-        state="queued",
-        priority=0,
-        effective_priority=0.0,
-        input_payload={"prompt": "a cat"},
-        idempotency_key=str(uuid.uuid4()),
-        queued_at=datetime.now(timezone.utc),
-    )
+    defaults = {
+        "id": uuid.uuid4(),
+        "user_id": uuid.uuid4(),
+        "kind": "txt2img_basic",
+        "state": "queued",
+        "priority": 0,
+        "effective_priority": 0.0,
+        "input_payload": {"prompt": "a cat"},
+        "idempotency_key": str(uuid.uuid4()),
+        "queued_at": datetime.now(timezone.utc),
+    }
     defaults.update(overrides)
     return QueuedJob(**defaults)
 

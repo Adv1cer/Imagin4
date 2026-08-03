@@ -100,12 +100,19 @@ class Reconciler:
             self._emit_event(
                 job.id,
                 "job_retry_scheduled",
-                {"attempt_no": attempt_no, "delay_s": round(delay_s, 2), "error_code": error_code, "detail": detail},
+                {
+                    "attempt_no": attempt_no,
+                    "delay_s": round(delay_s, 2),
+                    "error_code": error_code,
+                    "detail": detail,
+                },
             )
         else:
             await self.job_queue.mark_failed(job.id, error_code)
             self._emit_event(
-                job.id, "job_failed", {"attempt_no": attempt_no, "error_code": error_code, "detail": detail}
+                job.id,
+                "job_failed",
+                {"attempt_no": attempt_no, "error_code": error_code, "detail": detail},
             )
 
     async def _reconcile_job(self, job: QueuedJob, now: datetime) -> None:
@@ -123,7 +130,9 @@ class Reconciler:
         # duplicate-execution risk window documented in README.md: a crash between
         # ComfyUI accepting the prompt and us persisting prompt_id.
         if lease_expired:
-            await self._fail_or_retry(job, error_code="worker_lease_expired", detail="lease expired with no prompt_id")
+            await self._fail_or_retry(
+                job, error_code="worker_lease_expired", detail="lease expired with no prompt_id"
+            )
 
     async def run_once(self) -> int:
         """Runs a single reconciliation pass; returns number of jobs examined."""

@@ -65,7 +65,9 @@ class Scheduler:
 
     def request_shutdown(self) -> None:
         if not self._shutdown.is_set():
-            logger.info("scheduler[%s]: shutdown requested; will stop claiming new jobs", self.owner_id)
+            logger.info(
+                "scheduler[%s]: shutdown requested; will stop claiming new jobs", self.owner_id
+            )
         self._shutdown.set()
 
     async def _reserve_capacity(self) -> int:

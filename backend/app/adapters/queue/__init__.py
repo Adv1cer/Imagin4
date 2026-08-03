@@ -8,7 +8,7 @@ port plus a deterministic in-memory fake used by tests and local dev without Pos
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
