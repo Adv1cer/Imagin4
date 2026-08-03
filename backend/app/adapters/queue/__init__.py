@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 
@@ -29,6 +29,10 @@ class QueuedJob:
     assigned_worker_id: uuid.UUID | None = None
     error_code: str | None = None
     result: dict | None = None
+    # Lease bookkeeping (used by the scheduler/reconciler; see claim_next_with_lease).
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    prompt_id: str | None = None
 
 
 class JobQueue(Protocol):
@@ -38,11 +42,28 @@ class JobQueue(Protocol):
 
     async def claim_next(self, worker_capacity: int = 1) -> list[QueuedJob]: ...
 
+    async def claim_next_with_lease(
+        self, worker_capacity: int, lease_owner: str, lease_seconds: float
+    ) -> list[QueuedJob]:
+        """Fairness-ordered claim (same selection as claim_next) that additionally stamps
+        a lease_owner/lease_expires_at on each claimed job, so a reconciler can later find
+        dispatched/running jobs whose lease expired without a heartbeat/finalization
+        (crashed scheduler, worker, or lost connection to ComfyUI)."""
+        ...
+
+    async def list_active(self) -> list[QueuedJob]:
+        """Returns jobs currently in `dispatched` or `running` state, for reconciliation."""
+        ...
+
     async def mark_running(self, job_id: uuid.UUID) -> None: ...
 
     async def mark_succeeded(self, job_id: uuid.UUID, result: dict) -> None: ...
 
     async def mark_failed(self, job_id: uuid.UUID, error_code: str) -> None: ...
+
+    async def mark_retry_wait(self, job_id: uuid.UUID, error_code: str) -> None: ...
+
+    async def set_prompt_id(self, job_id: uuid.UUID, prompt_id: str) -> None: ...
 
     async def cancel(self, job_id: uuid.UUID) -> bool: ...
 
@@ -74,6 +95,19 @@ class InMemoryJobQueue:
             claimed.append(job)
         return claimed
 
+    async def claim_next_with_lease(
+        self, worker_capacity: int, lease_owner: str, lease_seconds: float
+    ) -> list[QueuedJob]:
+        claimed = await self.claim_next(worker_capacity)
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+        for job in claimed:
+            job.lease_owner = lease_owner
+            job.lease_expires_at = expires_at
+        return claimed
+
+    async def list_active(self) -> list[QueuedJob]:
+        return [j for j in self._jobs.values() if j.state in ("dispatched", "running")]
+
     async def mark_running(self, job_id: uuid.UUID) -> None:
         if job_id in self._jobs:
             self._jobs[job_id].state = "running"
@@ -83,12 +117,29 @@ class InMemoryJobQueue:
             job = self._jobs[job_id]
             job.state = "succeeded"
             job.result = result
+            job.lease_owner = None
+            job.lease_expires_at = None
 
     async def mark_failed(self, job_id: uuid.UUID, error_code: str) -> None:
         if job_id in self._jobs:
             job = self._jobs[job_id]
             job.state = "failed"
             job.error_code = error_code
+            job.lease_owner = None
+            job.lease_expires_at = None
+
+    async def mark_retry_wait(self, job_id: uuid.UUID, error_code: str) -> None:
+        if job_id in self._jobs:
+            job = self._jobs[job_id]
+            job.state = "retry_wait"
+            job.error_code = error_code
+            job.current_attempt += 1
+            job.lease_owner = None
+            job.lease_expires_at = None
+
+    async def set_prompt_id(self, job_id: uuid.UUID, prompt_id: str) -> None:
+        if job_id in self._jobs:
+            self._jobs[job_id].prompt_id = prompt_id
 
     async def cancel(self, job_id: uuid.UUID) -> bool:
         job = self._jobs.get(job_id)
