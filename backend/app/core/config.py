@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,8 +34,16 @@ class Settings(BaseSettings):
     cookie_samesite: Literal["lax", "strict", "none"] = "lax"
     csrf_cookie_name: str = "imaginv_csrf"
 
-    # CORS
-    cors_allow_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    # CORS (comma-separated in the env var; pydantic-settings would otherwise try to
+    # JSON-decode a `list[str]` field before any validator runs, which breaks plain
+    # comma-separated values like "http://a,http://b" -- so we store it as `str` here
+    # and expose the parsed list via a computed property instead.)
+    cors_allow_origins_csv: str = "http://localhost:3000"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def cors_allow_origins(self) -> list[str]:
+        return [o.strip() for o in self.cors_allow_origins_csv.split(",") if o.strip()]
 
     # Admission / fairness defaults
     max_active_jobs_per_user: int = 1
@@ -64,13 +72,6 @@ class Settings(BaseSettings):
     rl_message_per_min: int = 60
     rl_generation_per_min: int = 10
     rl_sse_connect_per_min: int = 30
-
-    @field_validator("cors_allow_origins", mode="before")
-    @classmethod
-    def _split_origins(cls, v: object) -> object:
-        if isinstance(v, str):
-            return [o.strip() for o in v.split(",") if o.strip()]
-        return v
 
 
 @lru_cache
