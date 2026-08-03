@@ -47,11 +47,9 @@ services:
       DEFAULT_POOL_SIZE: 25
     ports:
       - "6432:6432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ${POSTGRES_USER:-imaginv}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+    # No reliable healthcheck binary (pg_isready/nc) ships inside this image, so we don't
+    # gate on service_healthy for pgbouncer -- dependents wait on service_started instead
+    # and retry their own DB connection on boot.
 
   redis:
     image: redis:7-alpine
@@ -123,7 +121,7 @@ services:
     restart: unless-stopped
     depends_on:
       pgbouncer:
-        condition: service_healthy
+        condition: service_started
       redis:
         condition: service_healthy
       minio:
@@ -143,7 +141,7 @@ services:
     restart: unless-stopped
     depends_on:
       pgbouncer:
-        condition: service_healthy
+        condition: service_started
       redis:
         condition: service_healthy
 
@@ -154,7 +152,7 @@ services:
     restart: unless-stopped
     depends_on:
       pgbouncer:
-        condition: service_healthy
+        condition: service_started
       redis:
         condition: service_healthy
 
