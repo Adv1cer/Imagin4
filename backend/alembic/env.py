@@ -42,6 +42,10 @@ def do_run_migrations(connection) -> None:
 async def run_migrations_online() -> None:
     cfg_section = config.get_section(config.config_ini_section) or {}
     cfg_section["sqlalchemy.url"] = get_url()
+    # See app/db/base.py:make_engine -- migrations also connect through PgBouncer
+    # (transaction pooling mode), so the same asyncpg prepared-statement-cache
+    # workaround applies here.
+    cfg_section["sqlalchemy.connect_args"] = {"statement_cache_size": 0}
     connectable = async_engine_from_config(cfg_section, prefix="sqlalchemy.", poolclass=pool.NullPool)
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

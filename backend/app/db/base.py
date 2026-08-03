@@ -20,6 +20,12 @@ def make_engine():
         max_overflow=settings.db_max_overflow,
         pool_timeout=settings.db_pool_timeout_s,
         pool_pre_ping=settings.db_pool_pre_ping,
+        # PgBouncer in transaction-pooling mode hands each transaction a different
+        # backend connection, so asyncpg's server-side prepared-statement cache
+        # (keyed to a single physical connection) goes stale mid-session and raises
+        # "prepared statement ... does not exist". Disabling the cache is the
+        # documented workaround when sitting behind PgBouncer transaction mode.
+        connect_args={"statement_cache_size": 0},
     )
 
 

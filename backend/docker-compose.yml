@@ -45,8 +45,12 @@ services:
       POOL_MODE: transaction
       MAX_CLIENT_CONN: 500
       DEFAULT_POOL_SIZE: 25
+      # postgres:16-alpine defaults password_encryption to scram-sha-256; edoburu/pgbouncer
+      # defaults AUTH_TYPE to md5, so without this pgbouncer rejects the upstream login with
+      # "wrong password type". Must match Postgres's actual encryption method.
+      AUTH_TYPE: scram-sha-256
     ports:
-      - "6432:6432"
+      - "6432:5432"
     # No reliable healthcheck binary (pg_isready/nc) ships inside this image, so we don't
     # gate on service_healthy for pgbouncer -- dependents wait on service_started instead
     # and retry their own DB connection on boot.

@@ -5,7 +5,6 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,7 +39,6 @@ class Settings(BaseSettings):
     # and expose the parsed list via a computed property instead.)
     cors_allow_origins_csv: str = "http://localhost:3000"
 
-    @computed_field  # type: ignore[prop-decorator]
     @property
     def cors_allow_origins(self) -> list[str]:
         return [o.strip() for o in self.cors_allow_origins_csv.split(",") if o.strip()]
