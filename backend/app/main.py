@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -22,6 +23,8 @@ from app.adapters.storage import InMemoryObjectStorage
 from app.api.v1 import auth, conversations, generations, health, jobs, metrics
 from app.core.config import get_settings
 from app.db.base import get_engine
+from app.services.reconciler import Reconciler
+from app.services.scheduler import Scheduler
 
 logger = logging.getLogger("imaginv")
 
@@ -50,7 +53,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logging.basicConfig(level=get_settings().log_level)
     _build_state(app)
     logger.info("imaginv backend starting up")
+
+    # The standalone `scheduler`/`reconciler` docker-compose services each construct
+    # their own InMemoryJobQueue (see app/services/scheduler.py:main /
+    # app/services/reconciler.py:main), which is process-local -- so in dev/in-memory
+    # mode they never actually see jobs enqueued by this API process. Until the
+    # Postgres-backed JobQueue lands (see README "Known limitations"), run both loops
+    # in-process here too, sharing app.state.job_queue/comfy_client, so a submitted
+    # generation is actually dispatched and finalized end to end without requiring the
+    # separate containers to coincidentally share state (they don't).
+    scheduler = Scheduler(job_queue=app.state.job_queue, comfy_client=app.state.comfy_client)
+    reconciler = Reconciler(job_queue=app.state.job_queue, comfy_client=app.state.comfy_client)
+    scheduler_task = asyncio.create_task(scheduler.run_forever())
+    reconciler_task = asyncio.create_task(reconciler.run_forever())
+
     yield
+
+    scheduler.request_shutdown()
+    reconciler.request_shutdown()
+    await asyncio.gather(scheduler_task, reconciler_task, return_exceptions=True)
+
     engine = getattr(app.state, "session_factory", None)
     if engine is not None:
         await get_engine().dispose()
