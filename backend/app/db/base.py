@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
+from sqlalchemy import DateTime
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -9,7 +12,15 @@ from app.core.config import get_settings
 
 
 class Base(DeclarativeBase):
-    pass
+    # Every `Mapped[datetime]` / `Mapped[datetime | None]` column in app/db/models.py
+    # maps to this by default. Without it, SQLAlchemy infers a bare `DateTime()`
+    # (TIMESTAMP WITHOUT TIME ZONE) from the plain `datetime` type annotation, which
+    # mismatches the `timestamptz` columns the Alembic migration actually creates --
+    # asyncpg then rejects timezone-aware Python datetimes (e.g. from
+    # `datetime.now(timezone.utc)`) with "can't subtract offset-naive and
+    # offset-aware datetimes" on insert. This one line fixes it repo-wide instead of
+    # annotating every column individually.
+    type_annotation_map = {datetime: DateTime(timezone=True)}
 
 
 def make_engine():
