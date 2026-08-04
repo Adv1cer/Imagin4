@@ -271,8 +271,12 @@ In production, prefer S3 versioning + cross-region replication over manual mirro
 - **Jobs stuck `dispatched`/`running` forever**: confirm the `reconciler` process is
   running; it is what finds expired leases and finalizes/retries orphaned jobs.
 - **`k6` scripts fail at login**: they expect a seeded test user (`student@example.edu`
-  by default, overridable via env vars); seed one via `POST /v1/auth` flows or a DB seed
-  script before running load tests.
+  / `correct-horse-battery-staple` by default, overridable via `SMOKE_EMAIL`/
+  `SMOKE_PASSWORD` env vars for k6 and `--email`/`--password` for the seed script).
+  Seed one with:
+  `docker compose run --rm api python -m scripts.seed_dev_user`
+  Safe to re-run (idempotent -- updates the existing user's password hash instead of
+  failing on the unique email constraint).
 - **429s under normal load**: check `rl_generation_per_min` / `global_queue_cap` in
   `.env` -- these are intentionally conservative defaults for a shared campus deployment.
 
