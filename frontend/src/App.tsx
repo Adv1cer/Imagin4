@@ -1,9 +1,12 @@
+import { useState } from 'react'
 import { useAuth } from './hooks/useAuth'
 import { LoginScreen } from './screens/LoginScreen'
+import { RegisterScreen } from './screens/RegisterScreen'
 import { ChatScreen } from './screens/ChatScreen'
 
 function App() {
-  const { status, user, login, logout } = useAuth()
+  const { status, user, login, register, logout } = useAuth()
+  const [authView, setAuthView] = useState<'login' | 'register'>('login')
 
   if (status === 'checking') {
     return (
@@ -14,7 +17,11 @@ function App() {
   }
 
   if (status === 'anon' || !user) {
-    return <LoginScreen onLogin={login} />
+    return authView === 'register' ? (
+      <RegisterScreen onRegister={register} onSwitchToLogin={() => setAuthView('login')} />
+    ) : (
+      <LoginScreen onLogin={login} onSwitchToRegister={() => setAuthView('register')} />
+    )
   }
 
   return <ChatScreen user={user} onLogout={logout} />

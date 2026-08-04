@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
-import { login as apiLogin, logout as apiLogout, me as apiMe } from '../api/endpoints'
+import {
+  login as apiLogin,
+  logout as apiLogout,
+  me as apiMe,
+  register as apiRegister,
+} from '../api/endpoints'
 import { ApiError } from '../api/client'
 import type { MeResponse } from '../api/types'
 
@@ -34,6 +39,16 @@ export function useAuth() {
     setStatus('authed')
   }, [])
 
+  const register = useCallback(async (email: string, password: string, displayName: string) => {
+    // POST /v1/auth/register already sets the session cookie and returns the same shape
+    // as /login, but we still call /me afterwards so `user` reflects exactly what the
+    // server stored (e.g. a trimmed/defaulted display_name) rather than the raw form input.
+    await apiRegister({ email, password, display_name: displayName })
+    const u = await apiMe()
+    setUser(u)
+    setStatus('authed')
+  }, [])
+
   const logout = useCallback(async () => {
     try {
       await apiLogout()
@@ -44,7 +59,7 @@ export function useAuth() {
     setStatus('anon')
   }, [])
 
-  return { status, user, login, logout }
+  return { status, user, login, register, logout }
 }
 
 export { ApiError }

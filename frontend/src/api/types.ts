@@ -5,15 +5,20 @@
 //   - backend/app/api/v1/generations.py     (GenerationCreate, GenerationOut)
 //   - backend/app/api/v1/jobs.py            (JobOut)
 //
-// NOTE (frontend-side workaround, no backend code was changed): the backend has no
-// endpoint to POST a new chat message (only GET .../messages exists) and no text-chat
-// / LLM completion endpoint at all. Only image generation (POST /v1/generations) is a
-// real, working backend capability. Plain text chat messages are therefore held in
-// local React state only (never persisted) -- see src/hooks/useConversation.ts.
+// UPDATE: POST /v1/conversations/{id}/messages now exists on the backend (added after
+// this frontend was first built) and persists messages for real. There is still no
+// chat-completion / LLM endpoint, so the "assistant" reply to a plain text message is a
+// client-side echo that we also persist via that same endpoint -- see ChatScreen.tsx.
 
 export interface LoginRequest {
   email: string
   password: string
+}
+
+export interface RegisterRequest {
+  email: string
+  password: string
+  display_name: string
 }
 
 export interface LoginResponse {
@@ -51,6 +56,12 @@ export interface MessageOut {
 export interface MessagePage {
   items: MessageOut[]
   next_cursor: string | null
+}
+
+export interface MessageCreate {
+  role?: 'user' | 'assistant' | 'system' | 'tool'
+  content: Record<string, unknown>
+  client_message_id?: string | null
 }
 
 export interface GenerationCreate {

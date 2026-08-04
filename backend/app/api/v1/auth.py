@@ -7,12 +7,13 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
 from app.core.config import get_settings
 from app.db.models import AuthSession, User
-from app.domain.auth.passwords import verify_password
+from app.domain.auth.passwords import hash_password, verify_password
 from app.domain.auth.sessions import hash_ip, issue_session
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -21,6 +22,12 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    display_name: str
 
 
 class LoginResponse(BaseModel):
@@ -38,23 +45,12 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-@router.post("/login", response_model=LoginResponse)
-async def login(
-    payload: LoginRequest,
-    request: Request,
-    response: Response,
-    session: AsyncSession = Depends(get_db_session),
+async def _issue_session(
+    session: AsyncSession, response: Response, request: Request, user: User
 ) -> LoginResponse:
+    """Shared by login/register/refresh: create an AuthSession row, commit, and set the
+    HttpOnly session cookie. Returns the same body shape all three endpoints expose."""
     settings = get_settings()
-    result = await session.execute(select(User).where(User.email == payload.email))
-    user = result.scalar_one_or_none()
-    if user is None or user.password_hash is None or not verify_password(
-        payload.password, user.password_hash
-    ):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
-    if user.status != "active":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account not active")
-
     issued = issue_session(settings.session_ttl_hours)
     auth_session = AuthSession(
         user_id=user.id,
@@ -75,6 +71,65 @@ async def login(
         max_age=settings.session_ttl_hours * 3600,
     )
     return LoginResponse(session_token=issued.raw_token, expires_at=issued.expires_at)
+
+
+@router.post("/register", response_model=LoginResponse, status_code=status.HTTP_201_CREATED)
+async def register(
+    payload: RegisterRequest,
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_db_session),
+) -> LoginResponse:
+    """Local self-registration for dev/demo use. `users.email` is case-insensitive
+    unique (CITEXT) at the DB level; we still pre-check so a duplicate email gets a
+    clean 409 rather than an unhandled IntegrityError."""
+    existing = (
+        await session.execute(select(User).where(User.email == payload.email))
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="email already registered")
+
+    if len(payload.password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="password must be at least 8 characters",
+        )
+
+    user = User(
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        display_name=payload.display_name.strip() or payload.email.split("@")[0],
+        status="active",
+        plan_code="standard",
+    )
+    session.add(user)
+    try:
+        await session.flush()
+    except IntegrityError:
+        # Lost a race against a concurrent registration with the same email.
+        await session.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="email already registered")
+
+    return await _issue_session(session, response, request, user)
+
+
+@router.post("/login", response_model=LoginResponse)
+async def login(
+    payload: LoginRequest,
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_db_session),
+) -> LoginResponse:
+    result = await session.execute(select(User).where(User.email == payload.email))
+    user = result.scalar_one_or_none()
+    if user is None or user.password_hash is None or not verify_password(
+        payload.password, user.password_hash
+    ):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials")
+    if user.status != "active":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account not active")
+
+    return await _issue_session(session, response, request, user)
 
 
 @router.post("/refresh", response_model=LoginResponse)

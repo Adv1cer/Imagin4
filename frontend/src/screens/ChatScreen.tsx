@@ -3,7 +3,13 @@ import { Composer } from '../components/Composer'
 import { MessageBubble } from '../components/MessageBubble'
 import { Toasts } from '../components/Toasts'
 import { useToasts } from '../hooks/useToasts'
-import { createConversation, createGeneration, getJob, listMessages } from '../api/endpoints'
+import {
+  createConversation,
+  createGeneration,
+  createMessage,
+  getJob,
+  listMessages,
+} from '../api/endpoints'
 import { ApiError } from '../api/client'
 import type { MeResponse } from '../api/types'
 import type { UiMessage } from '../types/chat'
@@ -117,6 +123,17 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
     try {
       const convId = await ensureConversation()
 
+      // Persist the user's message for real. Non-fatal if it fails (e.g. transient
+      // network blip) -- the message still shows locally, it just won't survive a
+      // reload; we don't want a persistence hiccup to block the rest of the send flow.
+      createMessage(convId, {
+        role: 'user',
+        content: { text },
+        client_message_id: userMessage.id,
+      }).catch(() => {
+        showToast('Message sent, but failed to save to history.', 'error')
+      })
+
       if (imageMode) {
         setImageMode(false)
         const assistantMsgId = nextId()
@@ -161,19 +178,26 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
           showToast(msg, 'error')
         }
       } else {
-        // NOTE (backend gap, worked around client-side): there is no chat-completion /
-        // message-creation endpoint on the backend, so this is a local mock reply rather
-        // than a real model response.
+        // NOTE: there is still no chat-completion / LLM endpoint on the backend, so this
+        // reply is a client-side placeholder rather than a real model response -- but
+        // (unlike before) it IS persisted for real via POST .../messages, same as the
+        // user's message above, so conversation history now survives a reload.
         setTimeout(() => {
+          const replyId = nextId()
+          const replyText =
+            "This is a placeholder reply — the backend doesn't have a chat/LLM " +
+            'completion endpoint yet, only image generation is wired to a real model.'
           setMessages((prev) => [
             ...prev,
-            {
-              id: nextId(),
-              role: 'assistant',
-              text: "This is a mock reply — the backend doesn't yet expose a chat/message endpoint, only image generation is wired to the real API.",
-              createdAt: new Date().toISOString(),
-            },
+            { id: replyId, role: 'assistant', text: replyText, createdAt: new Date().toISOString() },
           ])
+          createMessage(convId, {
+            role: 'assistant',
+            content: { text: replyText },
+            client_message_id: replyId,
+          }).catch(() => {
+            // Non-fatal, same reasoning as the user-message persistence above.
+          })
         }, 400)
       }
     } catch (err) {

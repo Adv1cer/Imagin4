@@ -8,11 +8,18 @@ import type {
   LoginRequest,
   LoginResponse,
   MeResponse,
+  MessageCreate,
+  MessageOut,
   MessagePage,
+  RegisterRequest,
 } from './types'
 
 export function login(payload: LoginRequest): Promise<LoginResponse> {
   return apiFetch<LoginResponse>('/v1/auth/login', { method: 'POST', body: payload })
+}
+
+export function register(payload: RegisterRequest): Promise<LoginResponse> {
+  return apiFetch<LoginResponse>('/v1/auth/register', { method: 'POST', body: payload })
 }
 
 export function me(): Promise<MeResponse> {
@@ -52,4 +59,14 @@ export function createGeneration(
 
 export function getJob(jobId: string): Promise<JobOut> {
   return apiFetch<JobOut>(`/v1/jobs/${jobId}`)
+}
+
+export function createMessage(
+  conversationId: string,
+  payload: MessageCreate,
+): Promise<MessageOut> {
+  return apiFetch<MessageOut>(`/v1/conversations/${conversationId}/messages`, {
+    method: 'POST',
+    body: payload,
+  })
 }
