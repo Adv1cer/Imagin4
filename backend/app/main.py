@@ -35,17 +35,48 @@ def _build_state(app: FastAPI) -> None:
     engine = get_engine()
     app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    if settings.comfy_mode == "mock":
-        app.state.comfy_client = MockComfyUIClient()
-    else:
-        # Live ComfyUI HTTP adapter would be constructed here from settings.comfy_base_url.
-        app.state.comfy_client = MockComfyUIClient()
-
     # NOTE: production job queue/storage should be swapped for the Postgres-SKIP-LOCKED
     # and S3/MinIO-backed adapters respectively; in-memory fakes keep `create_app()`
     # runnable without external infra for local dev smoke-testing.
     app.state.job_queue = InMemoryJobQueue()
     app.state.storage = InMemoryObjectStorage()
+
+    if settings.gemini_api_key:
+        # Gemini (Google AI Studio) takes over as both the image-generation backend
+        # (implements the same ComfyUIClient port as MockComfyUIClient / a real
+        # ComfyUI adapter would, so the scheduler/reconciler need no changes) and as
+        # the text chat completion backend. Takes priority over `comfy_mode` when set.
+        from app.adapters.gemini import GeminiImageComfyUIClient, GeminiTextClient
+
+        app.state.comfy_client = GeminiImageComfyUIClient(
+            api_key=settings.gemini_api_key,
+            model=settings.gemini_image_model,
+            storage=app.state.storage,
+            timeout_s=settings.gemini_request_timeout_s,
+        )
+        app.state.gemini_text_client = GeminiTextClient(
+            api_key=settings.gemini_api_key,
+            model=settings.gemini_text_model,
+            timeout_s=settings.gemini_request_timeout_s,
+        )
+        logger.info(
+            "gemini: wired as image backend (model=%s) and chat backend (model=%s)",
+            settings.gemini_image_model,
+            settings.gemini_text_model,
+        )
+    else:
+        if settings.comfy_mode == "mock":
+            app.state.comfy_client = MockComfyUIClient()
+        else:
+            # Live ComfyUI HTTP adapter would be constructed here from
+            # settings.comfy_base_url.
+            app.state.comfy_client = MockComfyUIClient()
+        app.state.gemini_text_client = None
+        logger.info(
+            "gemini: APP_GEMINI_API_KEY not set -- image generation uses %s, "
+            "chat replies are unavailable (POST .../assistant-reply returns 503)",
+            "mock ComfyUI" if settings.comfy_mode == "mock" else "ComfyUI",
+        )
 
 
 @asynccontextmanager

@@ -4,6 +4,7 @@ import { MessageBubble } from '../components/MessageBubble'
 import { Toasts } from '../components/Toasts'
 import { useToasts } from '../hooks/useToasts'
 import {
+  createAssistantReply,
   createConversation,
   createGeneration,
   createMessage,
@@ -178,27 +179,34 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
           showToast(msg, 'error')
         }
       } else {
-        // NOTE: there is still no chat-completion / LLM endpoint on the backend, so this
-        // reply is a client-side placeholder rather than a real model response -- but
-        // (unlike before) it IS persisted for real via POST .../messages, same as the
-        // user's message above, so conversation history now survives a reload.
-        setTimeout(() => {
-          const replyId = nextId()
+        // Real reply via Gemini (backend/app/adapters/gemini.py), using the full
+        // persisted conversation history -- see POST .../assistant-reply. The backend
+        // both generates AND persists this message itself, so we don't call
+        // createMessage() again here (that would double-save it).
+        const pendingId = nextId()
+        setMessages((prev) => [
+          ...prev,
+          { id: pendingId, role: 'assistant', text: '…', createdAt: new Date().toISOString() },
+        ])
+        try {
+          const reply = await createAssistantReply(convId)
           const replyText =
-            "This is a placeholder reply — the backend doesn't have a chat/LLM " +
-            'completion endpoint yet, only image generation is wired to a real model.'
-          setMessages((prev) => [
-            ...prev,
-            { id: replyId, role: 'assistant', text: replyText, createdAt: new Date().toISOString() },
-          ])
-          createMessage(convId, {
-            role: 'assistant',
-            content: { text: replyText },
-            client_message_id: replyId,
-          }).catch(() => {
-            // Non-fatal, same reasoning as the user-message persistence above.
-          })
-        }, 400)
+            typeof reply.content?.text === 'string' ? reply.content.text : '(empty response)'
+          setMessages((prev) =>
+            prev.map((m) => (m.id === pendingId ? { ...m, id: reply.id, text: replyText } : m)),
+          )
+        } catch (err) {
+          const msg =
+            err instanceof ApiError && err.status === 503
+              ? "Chat isn't configured on the backend yet (no Gemini API key set)."
+              : err instanceof ApiError
+                ? err.message
+                : 'Failed to get a reply.'
+          setMessages((prev) =>
+            prev.map((m) => (m.id === pendingId ? { ...m, text: msg } : m)),
+          )
+          showToast(msg, 'error')
+        }
       }
     } catch (err) {
       const msg =

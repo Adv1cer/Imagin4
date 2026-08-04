@@ -13,8 +13,14 @@
 name: imaginv4
 
 x-app-env: &app-env
+  # NOTE: this must be `.env`, NOT `.env.example` -- .env.example is a template only.
+  # (This previously pointed at .env.example, silently ignoring anything a user put in
+  # their real .env after following the documented `cp .env.example .env` setup step,
+  # e.g. a real APP_GEMINI_API_KEY.) Run `cp .env.example .env` before `docker compose
+  # up` if you haven't already; compose will fail to start with a clear error if `.env`
+  # doesn't exist, rather than silently falling back to placeholder values.
   env_file:
-    - .env.example
+    - .env
 
 services:
   postgres:

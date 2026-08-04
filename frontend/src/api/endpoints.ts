@@ -70,3 +70,9 @@ export function createMessage(
     body: payload,
   })
 }
+
+export function createAssistantReply(conversationId: string): Promise<MessageOut> {
+  return apiFetch<MessageOut>(`/v1/conversations/${conversationId}/assistant-reply`, {
+    method: 'POST',
+  })
+}

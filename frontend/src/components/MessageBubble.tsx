@@ -1,3 +1,4 @@
+import { API_BASE_URL } from '../api/client'
 import type { UiMessage } from '../types/chat'
 
 function ImageJobStatus({ job }: { job: NonNullable<UiMessage['imageJob']> }) {
@@ -10,16 +11,17 @@ function ImageJobStatus({ job }: { job: NonNullable<UiMessage['imageJob']> }) {
     )
   }
   if (job.state === 'succeeded') {
+    // Streamed via GET /v1/jobs/{id}/asset (ownership-checked on the backend); the
+    // browser sends the session cookie automatically for a same-origin/same-site
+    // <img> request the same way it does for fetch(), since credentials aren't
+    // opt-in for image loads the way they are for CORS fetch/XHR.
     return (
-      <div className="mt-2 rounded-lg bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
-        Image ready. Backend asset key:{' '}
-        <code className="rounded bg-emerald-100 px-1 py-0.5">
-          {job.objectKey ?? 'unknown'}
-        </code>
-        <div className="mt-1 text-[11px] text-emerald-700">
-          Note: the backend does not expose a signed-URL/asset endpoint yet, so the raw
-          storage key is shown instead of a preview image.
-        </div>
+      <div className="mt-2">
+        <img
+          src={`${API_BASE_URL}/v1/jobs/${job.jobId}/asset`}
+          alt="Generated"
+          className="max-h-80 max-w-full rounded-lg border border-gray-200 object-contain"
+        />
       </div>
     )
   }

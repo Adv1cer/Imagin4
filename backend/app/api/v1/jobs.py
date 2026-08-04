@@ -7,11 +7,12 @@ import json
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from app.adapters.queue import JobQueue
-from app.api.deps import get_current_user, get_job_queue
+from app.adapters.storage import ObjectStorage
+from app.api.deps import get_current_user, get_job_queue, get_storage
 from app.db.models import User
 from app.domain.jobs.ownership import NotOwnerError, assert_owner
 
@@ -50,8 +51,12 @@ async def get_job(
 ) -> JobOut:
     job = await _get_owned_job(queue, job_id, user)
     return JobOut(
-        id=str(job.id), state=job.state, kind=job.kind,
-        current_attempt=job.current_attempt, error_code=job.error_code, result=job.result,
+        id=str(job.id),
+        state=job.state,
+        kind=job.kind,
+        current_attempt=job.current_attempt,
+        error_code=job.error_code,
+        result=job.result,
     )
 
 
@@ -65,9 +70,45 @@ async def cancel_job(
     await queue.cancel(job.id)
     job = await queue.get(job.id)
     return JobOut(
-        id=str(job.id), state=job.state, kind=job.kind,
-        current_attempt=job.current_attempt, error_code=job.error_code, result=job.result,
+        id=str(job.id),
+        state=job.state,
+        kind=job.kind,
+        current_attempt=job.current_attempt,
+        error_code=job.error_code,
+        result=job.result,
     )
+
+
+@router.get("/{job_id}/asset")
+async def get_job_asset(
+    job_id: str,
+    index: int = 0,
+    queue: JobQueue = Depends(get_job_queue),
+    storage: ObjectStorage = Depends(get_storage),
+    user: User = Depends(get_current_user),
+) -> Response:
+    """Streams the raw bytes of one of the job's generated outputs, ownership-checked
+    via the same `_get_owned_job` path as GET /{job_id}. A dedicated
+    signed-URL-issuing endpoint (per the original architecture doc) is the production
+    path for a real S3/MinIO deployment; this direct-stream endpoint is the pragmatic
+    equivalent for the in-memory/dev storage adapter and works unchanged against
+    either -- the client never needs to know which one is behind it."""
+    job = await _get_owned_job(queue, job_id, user)
+    outputs = (job.result or {}).get("outputs") or []
+    if not (0 <= index < len(outputs)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
+
+    object_key = outputs[index].get("object_key")
+    mime_type = outputs[index].get("mime_type", "application/octet-stream")
+    if not object_key:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
+
+    try:
+        data = await storage.get_object(object_key)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
+
+    return Response(content=data, media_type=mime_type)
 
 
 @router.get("/{job_id}/events")
@@ -91,7 +132,11 @@ async def job_events(
             if current is None:
                 break
             if current.state != last_state:
-                data = {"id": str(current.id), "state": current.state, "error_code": current.error_code}
+                data = {
+                    "id": str(current.id),
+                    "state": current.state,
+                    "error_code": current.error_code,
+                }
                 yield f"event: state\ndata: {json.dumps(data)}\n\n"
                 last_state = current.state
             if current.state in terminal:

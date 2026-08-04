@@ -139,19 +139,32 @@ RUN_CAMPUS_PEAK=1 k6 run backend/load_tests/campus_peak.js
 docker compose --profile load-test run --rm k6 run /scripts/baseline.js
 ```
 
-## Mock vs. live ComfyUI
+## Mock vs. live ComfyUI vs. Gemini
 
-Controlled by `APP_COMFY_MODE` (`mock` | `live`, see `app/core/config.py`):
-- `mock` (default): `app.adapters.comfyui.MockComfyUIClient`, a deterministic in-process
-  fake -- every submit "completes" after `polls_to_complete` polls and produces a fake
-  asset keyed by a hash of the input payload (so identical inputs produce identical fake
-  outputs, useful for idempotency tests). No network calls, no GPU required.
+Controlled by `APP_COMFY_MODE` (`mock` | `live`, see `app/core/config.py`) **unless**
+`APP_GEMINI_API_KEY` is set, in which case Gemini takes over image generation entirely
+regardless of `APP_COMFY_MODE` (see `app/main.py::_build_state`):
+
+- `mock` (default, no Gemini key): `app.adapters.comfyui.MockComfyUIClient`, a
+  deterministic in-process fake -- every submit "completes" after `polls_to_complete`
+  polls and produces a fake asset keyed by a hash of the input payload (so identical
+  inputs produce identical fake outputs, useful for idempotency tests). No network
+  calls, no GPU required.
 - `live`: intended to talk to a real ComfyUI instance at `APP_COMFY_BASE_URL`. **The live
   HTTP adapter is not yet implemented** -- `app/main.py::_build_state` currently
   constructs `MockComfyUIClient` unconditionally with a `# Live ComfyUI HTTP adapter
   would be constructed here` comment marking the gap. Implementing
   `app.adapters.comfyui.ComfyUIClient` against ComfyUI's real HTTP API is the next
   concrete increment (see "Next safe increment" in the final task report).
+- **Gemini** (`APP_GEMINI_API_KEY` set): `app.adapters.gemini.GeminiImageComfyUIClient`
+  implements the same `ComfyUIClient` port using Google's Gemini API
+  (`APP_GEMINI_IMAGE_MODEL`, default `gemini-2.5-flash-image`) instead of ComfyUI --
+  the scheduler/reconciler/job-state-machine code is completely unaware of the swap.
+  Get a free-tier key at <https://aistudio.google.com/>. Also enables real text chat
+  replies via `POST /v1/conversations/{id}/assistant-reply` using
+  `app.adapters.gemini.GeminiTextClient` (`APP_GEMINI_TEXT_MODEL`, default
+  `gemini-2.0-flash`) -- without a key, that endpoint returns `503`. Generated images
+  are streamed back to the client via `GET /v1/jobs/{id}/asset` (ownership-checked).
 
 ## Capacity planning
 

@@ -43,6 +43,12 @@ def get_comfy_client(request: Request) -> ComfyUIClient:
     return request.app.state.comfy_client
 
 
+def get_gemini_text_client(request: Request):
+    """None when GEMINI_API_KEY isn't configured (see app/main.py:_build_state) --
+    callers must handle that case explicitly rather than assuming it's always wired."""
+    return getattr(request.app.state, "gemini_text_client", None)
+
+
 async def get_current_user(
     request: Request,
     session: AsyncSession = Depends(get_db_session),
@@ -59,9 +65,7 @@ async def get_current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="not authenticated")
 
     token_hash = hash_token(raw_token)
-    result = await session.execute(
-        select(AuthSession).where(AuthSession.token_hash == token_hash)
-    )
+    result = await session.execute(select(AuthSession).where(AuthSession.token_hash == token_hash))
     auth_session = result.scalar_one_or_none()
     if auth_session is None or not is_session_valid(
         auth_session.expires_at, auth_session.revoked_at

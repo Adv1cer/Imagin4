@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, get_db_session
+from app.api.deps import get_current_user, get_db_session, get_gemini_text_client
 from app.db.models import ChatMessage, Conversation, User
 from app.domain.conversations.pagination import Cursor, InvalidCursorError
 from app.domain.jobs.ownership import NotOwnerError, assert_owner
@@ -176,36 +176,26 @@ async def list_messages(
 _ALLOWED_ROLES = {"user", "assistant", "system", "tool"}
 
 
-@router.post(
-    "/{conversation_id}/messages",
-    response_model=MessageOut,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_message(
-    conversation_id: str,
-    payload: MessageCreate,
-    session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(get_current_user),
-) -> MessageOut:
-    if payload.role not in _ALLOWED_ROLES:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid role")
-
-    conv = await _get_owned_conversation(session, conversation_id, user)
-
-    # Replay of a client-generated id: return the existing row instead of erroring, so a
-    # retried POST (flaky network, double-click) is idempotent rather than duplicating a
-    # message or surfacing the unique-constraint violation to the client.
-    if payload.client_message_id:
+async def _append_message(
+    session: AsyncSession,
+    conv: Conversation,
+    role: str,
+    content: dict,
+    client_message_id: str | None,
+) -> ChatMessage:
+    """Shared by POST .../messages and POST .../assistant-reply. Handles idempotent
+    replay via client_message_id and safe concurrent sequence_no allocation."""
+    if client_message_id:
         existing = (
             await session.execute(
                 select(ChatMessage).where(
                     ChatMessage.conversation_id == conv.id,
-                    ChatMessage.client_message_id == payload.client_message_id,
+                    ChatMessage.client_message_id == client_message_id,
                 )
             )
         ).scalar_one_or_none()
         if existing is not None:
-            return MessageOut.from_model(existing)
+            return existing
 
     # Lock the conversation row so concurrent inserts for the same conversation
     # serialize on sequence_no allocation instead of racing on MAX(sequence_no)+1.
@@ -222,10 +212,10 @@ async def create_message(
 
     message = ChatMessage(
         conversation_id=conv.id,
-        role=payload.role,
+        role=role,
         sequence_no=next_seq,
-        client_message_id=payload.client_message_id,
-        content=payload.content,
+        client_message_id=client_message_id,
+        content=content,
         status="complete",
     )
     session.add(message)
@@ -237,18 +227,97 @@ async def create_message(
         # SQLite in unit tests, or a concurrent request slipped in) -- fall back to
         # returning the row that won rather than surfacing a 500.
         await session.rollback()
-        if payload.client_message_id:
+        if client_message_id:
             existing = (
                 await session.execute(
                     select(ChatMessage).where(
                         ChatMessage.conversation_id == conv.id,
-                        ChatMessage.client_message_id == payload.client_message_id,
+                        ChatMessage.client_message_id == client_message_id,
                     )
                 )
             ).scalar_one_or_none()
             if existing is not None:
-                return MessageOut.from_model(existing)
+                return existing
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="message conflict")
 
     await session.refresh(message)
+    return message
+
+
+@router.post(
+    "/{conversation_id}/messages",
+    response_model=MessageOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_message(
+    conversation_id: str,
+    payload: MessageCreate,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> MessageOut:
+    if payload.role not in _ALLOWED_ROLES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid role")
+
+    conv = await _get_owned_conversation(session, conversation_id, user)
+    message = await _append_message(
+        session, conv, payload.role, payload.content, payload.client_message_id
+    )
+    return MessageOut.from_model(message)
+
+
+@router.post(
+    "/{conversation_id}/assistant-reply",
+    response_model=MessageOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_assistant_reply(
+    conversation_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+    gemini=Depends(get_gemini_text_client),
+) -> MessageOut:
+    """Generates and persists a real assistant reply from the full message history so
+    far, using Gemini (see app/adapters/gemini.py). Synchronous (not queued through the
+    async job pipeline like image generation) because chat completions are short-lived
+    -- typically a few seconds -- unlike image generation jobs."""
+    if gemini is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="chat completion is not configured (APP_GEMINI_API_KEY unset)",
+        )
+
+    conv = await _get_owned_conversation(session, conversation_id, user)
+
+    history_rows = (
+        (
+            await session.execute(
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == conv.id)
+                .order_by(ChatMessage.sequence_no.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    history = [
+        {"role": m.role, "text": str(m.content.get("text", ""))}
+        for m in history_rows
+        if m.role in ("user", "assistant")
+    ]
+    if not history:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="conversation has no messages to reply to",
+        )
+
+    try:
+        reply_text = await gemini.complete(history)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="chat completion failed"
+        )
+
+    message = await _append_message(
+        session, conv, "assistant", {"text": reply_text}, client_message_id=None
+    )
     return MessageOut.from_model(message)
