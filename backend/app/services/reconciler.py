@@ -94,9 +94,9 @@ class Reconciler:
         if is_retryable(error_code, attempt_no, job.max_attempts):
             delay_s = compute_backoff_seconds(attempt_no, BackoffConfig(), rng=self.rng)
             if hasattr(self.job_queue, "mark_retry_wait"):
-                await self.job_queue.mark_retry_wait(job.id, error_code)
+                await self.job_queue.mark_retry_wait(job.id, error_code, detail)
             else:
-                await self.job_queue.mark_failed(job.id, error_code)
+                await self.job_queue.mark_failed(job.id, error_code, detail)
             self._emit_event(
                 job.id,
                 "job_retry_scheduled",
@@ -108,7 +108,7 @@ class Reconciler:
                 },
             )
         else:
-            await self.job_queue.mark_failed(job.id, error_code)
+            await self.job_queue.mark_failed(job.id, error_code, detail)
             self._emit_event(
                 job.id,
                 "job_failed",

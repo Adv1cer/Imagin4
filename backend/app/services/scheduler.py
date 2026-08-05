@@ -122,12 +122,13 @@ class Scheduler:
                 job.id,
                 submit_result.prompt_id,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("scheduler[%s]: dispatch failed for job=%s", self.owner_id, job.id)
+            detail = f"dispatch_error:{type(exc).__name__}"
             if hasattr(self.job_queue, "mark_retry_wait"):
-                await self.job_queue.mark_retry_wait(job.id, "worker_unreachable")
+                await self.job_queue.mark_retry_wait(job.id, "worker_unreachable", detail)
             else:
-                await self.job_queue.mark_failed(job.id, "worker_unreachable")
+                await self.job_queue.mark_failed(job.id, "worker_unreachable", detail)
 
     async def _tick(self) -> None:
         capacity = await self._reserve_capacity()

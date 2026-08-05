@@ -25,6 +25,12 @@ class JobOut(BaseModel):
     kind: str
     current_attempt: int
     error_code: str | None = None
+    # The underlying adapter's own sanitized error (e.g. "gemini_error:ClientError",
+    # "gemini_not_configured", "gemini_no_image_in_response") -- error_code is only the
+    # reconciler's coarse retry-classification bucket and is the same value ("comfy_transient")
+    # whether ComfyUI or Gemini actually failed, so this is the field that tells you which
+    # backend handled the job and why it failed without reading server logs.
+    error_detail: str | None = None
     result: dict | None = None
 
 
@@ -56,6 +62,7 @@ async def get_job(
         kind=job.kind,
         current_attempt=job.current_attempt,
         error_code=job.error_code,
+        error_detail=job.error_detail,
         result=job.result,
     )
 
@@ -75,6 +82,7 @@ async def cancel_job(
         kind=job.kind,
         current_attempt=job.current_attempt,
         error_code=job.error_code,
+        error_detail=job.error_detail,
         result=job.result,
     )
 
@@ -136,6 +144,7 @@ async def job_events(
                     "id": str(current.id),
                     "state": current.state,
                     "error_code": current.error_code,
+                    "error_detail": current.error_detail,
                 }
                 yield f"event: state\ndata: {json.dumps(data)}\n\n"
                 last_state = current.state

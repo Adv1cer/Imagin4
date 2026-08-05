@@ -28,6 +28,13 @@ class QueuedJob:
     max_attempts: int = 3
     assigned_worker_id: uuid.UUID | None = None
     error_code: str | None = None
+    # The adapter's own (already-sanitized) error string, e.g. "gemini_error:ClientError"
+    # or "gemini_no_image_in_response" -- error_code above is the reconciler's coarse
+    # retry-classification bucket (e.g. "comfy_transient"), which is the same value
+    # regardless of which backend (ComfyUI vs Gemini) actually failed. Without this field
+    # a user/developer has no way to tell which backend handled a failed job short of
+    # reading server logs. See app/services/reconciler.py:_fail_or_retry.
+    error_detail: str | None = None
     result: dict | None = None
     # Lease bookkeeping (used by the scheduler/reconciler; see claim_next_with_lease).
     lease_owner: str | None = None
@@ -59,9 +66,13 @@ class JobQueue(Protocol):
 
     async def mark_succeeded(self, job_id: uuid.UUID, result: dict) -> None: ...
 
-    async def mark_failed(self, job_id: uuid.UUID, error_code: str) -> None: ...
+    async def mark_failed(
+        self, job_id: uuid.UUID, error_code: str, error_detail: str | None = None
+    ) -> None: ...
 
-    async def mark_retry_wait(self, job_id: uuid.UUID, error_code: str) -> None: ...
+    async def mark_retry_wait(
+        self, job_id: uuid.UUID, error_code: str, error_detail: str | None = None
+    ) -> None: ...
 
     async def set_prompt_id(self, job_id: uuid.UUID, prompt_id: str) -> None: ...
 
@@ -120,19 +131,25 @@ class InMemoryJobQueue:
             job.lease_owner = None
             job.lease_expires_at = None
 
-    async def mark_failed(self, job_id: uuid.UUID, error_code: str) -> None:
+    async def mark_failed(
+        self, job_id: uuid.UUID, error_code: str, error_detail: str | None = None
+    ) -> None:
         if job_id in self._jobs:
             job = self._jobs[job_id]
             job.state = "failed"
             job.error_code = error_code
+            job.error_detail = error_detail
             job.lease_owner = None
             job.lease_expires_at = None
 
-    async def mark_retry_wait(self, job_id: uuid.UUID, error_code: str) -> None:
+    async def mark_retry_wait(
+        self, job_id: uuid.UUID, error_code: str, error_detail: str | None = None
+    ) -> None:
         if job_id in self._jobs:
             job = self._jobs[job_id]
             job.state = "retry_wait"
             job.error_code = error_code
+            job.error_detail = error_detail
             job.current_attempt += 1
             job.lease_owner = None
             job.lease_expires_at = None

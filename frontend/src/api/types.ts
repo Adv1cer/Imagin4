@@ -83,5 +83,10 @@ export interface JobOut {
   kind: string
   current_attempt: number
   error_code: string | null
+  // The underlying adapter's own sanitized error (e.g. "gemini_error:ClientError",
+  // "gemini_not_configured"). error_code alone is a generic retry-classification bucket
+  // ("comfy_transient") shared by every backend, so this is what actually tells you
+  // which backend handled the job and why it failed -- see backend/app/api/v1/jobs.py.
+  error_detail: string | null
   result: { outputs?: { object_key: string; mime_type: string }[] } | Record<string, unknown> | null
 }

@@ -93,6 +93,7 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
                     jobId: job.id,
                     state: job.state as 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled',
                     errorCode: job.error_code,
+                    errorDetail: job.error_detail,
                     objectKey:
                       (job.result as { outputs?: { object_key: string }[] } | null)?.outputs?.[0]
                         ?.object_key ?? null,

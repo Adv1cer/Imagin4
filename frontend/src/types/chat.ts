@@ -6,6 +6,11 @@ export interface ImageJobState {
   jobId: string
   state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
   errorCode?: string | null
+  // The actual backend-specific failure reason (e.g. "gemini_not_configured",
+  // "gemini_error:ClientError") -- errorCode alone is a generic bucket shared by every
+  // backend and won't tell you whether ComfyUI or Gemini handled the job. See
+  // backend/app/api/v1/jobs.py:JobOut.error_detail.
+  errorDetail?: string | null
   objectKey?: string | null
 }
 
