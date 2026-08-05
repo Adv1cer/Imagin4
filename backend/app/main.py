@@ -54,6 +54,11 @@ def _build_state(app: FastAPI) -> None:
             base_url=settings.comfy_base_url,
             storage=app.state.storage,
             checkpoint_name=settings.comfy_checkpoint_name,
+            model_family=settings.comfy_model_family,
+            diffusion_model_name=settings.comfy_diffusion_model_name,
+            clip_name=settings.comfy_clip_name,
+            vae_name=settings.comfy_vae_name,
+            model_sampling_shift=settings.comfy_model_sampling_shift,
             sampler_name=settings.comfy_sampler_name,
             scheduler=settings.comfy_scheduler,
             steps=settings.comfy_steps,
@@ -62,9 +67,12 @@ def _build_state(app: FastAPI) -> None:
             request_timeout_s=settings.comfy_request_timeout_s,
         )
         logger.info(
-            "comfyui: live mode, base_url=%s checkpoint=%s",
+            "comfyui: live mode, base_url=%s family=%s diffusion_model=%s",
             settings.comfy_base_url,
-            settings.comfy_checkpoint_name,
+            settings.comfy_model_family,
+            settings.comfy_diffusion_model_name
+            if settings.comfy_model_family == "qwen_image"
+            else settings.comfy_checkpoint_name,
         )
 
     if settings.gemini_api_key:

@@ -49,6 +49,64 @@ async def test_submit_posts_a_server_built_graph_never_a_client_graph() -> None:
 
 
 @pytest.mark.asyncio
+async def test_submit_qwen_image_family_builds_split_file_graph() -> None:
+    """Qwen-Image uses a structurally different graph (UNETLoader/CLIPLoader/VAELoader +
+    ModelSamplingAuraFlow, not CheckpointLoaderSimple) -- verified against the official
+    docs.comfy.org workflow template, not guessed. This asserts the graph our code
+    actually sends matches that structure node-for-node."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"prompt_id": "p1"})
+
+    client = LiveComfyUIClient(
+        base_url=BASE_URL,
+        storage=InMemoryObjectStorage(),
+        model_family="qwen_image",
+        diffusion_model_name="qwen_image_2512_fp8_e4m3fn.safetensors",
+        clip_name="qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        vae_name="qwen_image_vae.safetensors",
+        model_sampling_shift=3.1,
+        scheduler="simple",
+        cfg_scale=4.0,
+        transport=httpx.MockTransport(handler),
+    )
+    await client.submit({"prompt": "a poster", "aspect_ratio": "16:9", "resolution": "1K"})
+
+    graph = captured["body"]["prompt"]
+    assert graph["37"] == {
+        "class_type": "UNETLoader",
+        "inputs": {"unet_name": "qwen_image_2512_fp8_e4m3fn.safetensors", "weight_dtype": "default"},
+    }
+    assert graph["38"] == {
+        "class_type": "CLIPLoader",
+        "inputs": {
+            "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            "type": "qwen_image",
+            "device": "default",
+        },
+    }
+    assert graph["39"] == {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}}
+    assert graph["66"] == {
+        "class_type": "ModelSamplingAuraFlow",
+        "inputs": {"model": ["37", 0], "shift": 3.1},
+    }
+    # KSampler must read its model from the ModelSamplingAuraFlow output (node 66),
+    # NOT directly from UNETLoader (node 37) -- skipping it is a common mistake that
+    # produces wrong-looking (washed out/oversaturated) Qwen-Image output.
+    assert graph["3"]["inputs"]["model"] == ["66", 0]
+    assert graph["3"]["inputs"]["latent_image"] == ["58", 0]
+    assert graph["3"]["inputs"]["cfg"] == 4.0
+    assert graph["3"]["inputs"]["scheduler"] == "simple"
+    assert graph["6"]["inputs"] == {"text": "a poster", "clip": ["38", 0]}
+    assert graph["58"]["class_type"] == "EmptySD3LatentImage"
+    # 16:9 at 1K per Qwen-Image's own documented aspect-ratio table (1664x928).
+    assert (graph["58"]["inputs"]["width"], graph["58"]["inputs"]["height"]) == (1664, 928)
+    assert "CheckpointLoaderSimple" not in json.dumps(graph)
+
+
+@pytest.mark.asyncio
 async def test_empty_prompt_fails_without_a_network_call() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError("should not make an HTTP call for an empty prompt")
@@ -178,3 +236,14 @@ def test_resolve_dimensions_scales_with_resolution_and_stays_multiple_of_8() -> 
     # Unknown ratio/resolution falls back to sane defaults instead of raising.
     w, h = _resolve_dimensions("not-a-ratio", "not-a-res")
     assert (w, h) == _resolve_dimensions("1:1", "1K")
+
+
+def test_resolve_dimensions_qwen_image_family_uses_its_own_table() -> None:
+    # Qwen-Image's official 1:1 is 1328x1328, distinct from the generic checkpoint
+    # table's 1024x1024 -- confirms the family switch actually changes which table is
+    # consulted, not just that both happen to produce square output.
+    checkpoint_dims = _resolve_dimensions("1:1", "1K", family="checkpoint")
+    qwen_dims = _resolve_dimensions("1:1", "1K", family="qwen_image")
+    assert checkpoint_dims == (1024, 1024)
+    assert qwen_dims == (1328, 1328)
+    assert checkpoint_dims != qwen_dims

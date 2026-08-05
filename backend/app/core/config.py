@@ -63,15 +63,35 @@ class Settings(BaseSettings):
     comfy_mode: Literal["mock", "live"] = "mock"
     comfy_base_url: str = "http://localhost:8188"
     comfy_request_timeout_s: float = 10.0
-    # Only used when comfy_mode == "live" (see app/adapters/comfyui/live.py). The
-    # checkpoint filename MUST match exactly what's installed on the target ComfyUI
-    # instance (its models/checkpoints directory) -- there is no discovery/validation of
-    # this from our side, a wrong name fails the job with a ComfyUI-side graph error.
+    # Only used when comfy_mode == "live" (see app/adapters/comfyui/live.py). Filenames
+    # below MUST match exactly what's installed on the target ComfyUI instance -- there
+    # is no discovery/validation of this from our side, a wrong name fails the job with a
+    # ComfyUI-side graph error.
+    #
+    # "checkpoint" = a single-file model (CheckpointLoaderSimple) bundling UNet+CLIP+VAE
+    #   together, e.g. classic SDXL. Only comfy_checkpoint_name is used.
+    # "qwen_image" = Qwen-Image's split-file architecture (separate diffusion model, text
+    #   encoder, and VAE, loaded via UNETLoader/CLIPLoader/VAELoader, plus a required
+    #   ModelSamplingAuraFlow node) -- graph verified against the official workflow at
+    #   https://docs.comfy.org/tutorials/image/qwen/qwen-image (2026-08). Uses
+    #   comfy_diffusion_model_name/comfy_clip_name/comfy_vae_name/comfy_model_sampling_shift.
+    comfy_model_family: Literal["checkpoint", "qwen_image"] = "qwen_image"
     comfy_checkpoint_name: str = "sd_xl_base_1.0.safetensors"
+    comfy_diffusion_model_name: str = "qwen_image_2512_fp8_e4m3fn.safetensors"
+    comfy_clip_name: str = "qwen_2.5_vl_7b_fp8_scaled.safetensors"
+    comfy_vae_name: str = "qwen_image_vae.safetensors"
+    # ModelSamplingAuraFlow's "shift" widget -- Qwen-Image's official template ships 3.1;
+    # changing it shifts the noise schedule and is a quality/style tuning knob, not
+    # something to guess differently without reason.
+    comfy_model_sampling_shift: float = 3.1
     comfy_sampler_name: str = "euler"
-    comfy_scheduler: str = "normal"
+    # "simple" is Qwen-Image's official default scheduler; "normal" is the classic
+    # SDXL-era default -- kept as a single setting since only one family is active at a
+    # time, but worth remembering if you switch comfy_model_family later.
+    comfy_scheduler: str = "simple"
     comfy_steps: int = 20
-    comfy_cfg_scale: float = 7.0
+    # Qwen-Image's official template uses cfg=4.0 (vs the classic SDXL default of ~7.0).
+    comfy_cfg_scale: float = 4.0
     comfy_negative_prompt: str = ""
 
     # Gemini (Google AI Studio) -- when gemini_api_key is set, it replaces both the

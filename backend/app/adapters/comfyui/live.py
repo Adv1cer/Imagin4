@@ -40,9 +40,7 @@ from app.adapters.storage import ObjectStorage
 logger = logging.getLogger("imaginv.comfyui_live")
 
 # SDXL-friendly base sizes (multiples of 64, ~1024 long edge) per common aspect ratio,
-# scaled up for 2K/4K. These are reasonable defaults for a "1024-class" checkpoint;
-# if the configured checkpoint prefers different native resolutions, override via
-# workflow inputs later rather than hand-editing this table.
+# scaled up for 2K/4K. Used when comfy_model_family == "checkpoint".
 _BASE_DIMENSIONS_1K: dict[str, tuple[int, int]] = {
     "1:1": (1024, 1024),
     "9:16": (768, 1344),
@@ -55,12 +53,34 @@ _BASE_DIMENSIONS_1K: dict[str, tuple[int, int]] = {
     "16:9": (1344, 768),
     "21:9": (1536, 640),
 }
+# Qwen-Image's own recommended resolutions per aspect ratio, taken directly from the
+# official workflow template (docs.comfy.org/tutorials/image/qwen/qwen-image, "Aspect
+# Ratio Resolutions" table, 2026-08) rather than guessed -- Qwen-Image was trained at
+# these specific sizes and departing from them can degrade quality/composition more than
+# a typical SDXL checkpoint tolerates. Used when comfy_model_family == "qwen_image".
+_QWEN_IMAGE_BASE_DIMENSIONS_1K: dict[str, tuple[int, int]] = {
+    "1:1": (1328, 1328),
+    "16:9": (1664, 928),
+    "9:16": (928, 1664),
+    "4:3": (1472, 1140),
+    "3:4": (1140, 1472),
+    "3:2": (1584, 1056),
+    "2:3": (1056, 1584),
+    # Not in Qwen-Image's official table -- fall back to the closest documented ratio's
+    # proportions rather than omitting these entirely (frontend allows selecting them).
+    "5:4": (1472, 1140),
+    "4:5": (1140, 1472),
+    "21:9": (1664, 704),
+}
 _RESOLUTION_SCALE = {"1K": 1, "2K": 2, "4K": 4}
 _MAX_DIM = 4096
 
 
-def _resolve_dimensions(aspect_ratio: str | None, resolution: str | None) -> tuple[int, int]:
-    base = _BASE_DIMENSIONS_1K.get(aspect_ratio or "1:1", _BASE_DIMENSIONS_1K["1:1"])
+def _resolve_dimensions(
+    aspect_ratio: str | None, resolution: str | None, family: str = "checkpoint"
+) -> tuple[int, int]:
+    table = _QWEN_IMAGE_BASE_DIMENSIONS_1K if family == "qwen_image" else _BASE_DIMENSIONS_1K
+    base = table.get(aspect_ratio or "1:1", table["1:1"])
     scale = _RESOLUTION_SCALE.get(resolution or "1K", 1)
     width = min(base[0] * scale, _MAX_DIM)
     height = min(base[1] * scale, _MAX_DIM)
@@ -81,7 +101,12 @@ class LiveComfyUIClient:
         self,
         base_url: str,
         storage: ObjectStorage,
-        checkpoint_name: str,
+        checkpoint_name: str = "",
+        model_family: str = "checkpoint",
+        diffusion_model_name: str = "",
+        clip_name: str = "",
+        vae_name: str = "",
+        model_sampling_shift: float = 3.1,
         sampler_name: str = "euler",
         scheduler: str = "normal",
         steps: int = 20,
@@ -93,6 +118,11 @@ class LiveComfyUIClient:
         self._base_url = base_url.rstrip("/")
         self._storage = storage
         self._checkpoint_name = checkpoint_name
+        self._model_family = model_family
+        self._diffusion_model_name = diffusion_model_name
+        self._clip_name = clip_name
+        self._vae_name = vae_name
+        self._model_sampling_shift = model_sampling_shift
         self._sampler_name = sampler_name
         self._scheduler = scheduler
         self._steps = steps
@@ -112,13 +142,27 @@ class LiveComfyUIClient:
 
     def _build_prompt_graph(self, workflow_payload: dict) -> dict[str, Any]:
         """Builds a standard txt2img node graph from validated inputs only -- see module
-        docstring. Unknown/extra keys in workflow_payload are ignored, not forwarded."""
+        docstring. Unknown/extra keys in workflow_payload are ignored, not forwarded.
+        Branches on self._model_family since Qwen-Image's split-file architecture needs a
+        structurally different graph than a single-file checkpoint (see class docstring
+        and Settings.comfy_model_family)."""
         prompt_text = str(workflow_payload.get("prompt") or "").strip()
         width, height = _resolve_dimensions(
-            workflow_payload.get("aspect_ratio"), workflow_payload.get("resolution")
+            workflow_payload.get("aspect_ratio"),
+            workflow_payload.get("resolution"),
+            family=self._model_family,
         )
         seed = int(workflow_payload.get("seed") or uuid.uuid4().int % (2**32))
 
+        if self._model_family == "qwen_image":
+            return self._build_qwen_image_graph(prompt_text, width, height, seed)
+        return self._build_checkpoint_graph(prompt_text, width, height, seed)
+
+    def _build_checkpoint_graph(
+        self, prompt_text: str, width: int, height: int, seed: int
+    ) -> dict[str, Any]:
+        """Single-file checkpoint (e.g. classic SDXL) via CheckpointLoaderSimple, which
+        bundles MODEL+CLIP+VAE in one file/node."""
         return {
             "3": {
                 "class_type": "KSampler",
@@ -158,6 +202,77 @@ class LiveComfyUIClient:
             "9": {
                 "class_type": "SaveImage",
                 "inputs": {"filename_prefix": "imaginv", "images": ["8", 0]},
+            },
+        }
+
+    def _build_qwen_image_graph(
+        self, prompt_text: str, width: int, height: int, seed: int
+    ) -> dict[str, Any]:
+        """Qwen-Image's split-file architecture: separate diffusion model (UNETLoader),
+        text encoder (CLIPLoader with type="qwen_image"), and VAE (VAELoader), plus a
+        required ModelSamplingAuraFlow node between the loaded model and KSampler.
+
+        Graph structure verified node-for-node against the official Comfy-Org workflow
+        template (https://docs.comfy.org/tutorials/image/qwen/qwen-image, fetched
+        2026-08 -- not guessed): UNETLoader -> ModelSamplingAuraFlow -> KSampler, with
+        CLIPLoader feeding both CLIPTextEncode nodes and EmptySD3LatentImage (not the
+        generic EmptyLatentImage) providing the initial latent.
+        """
+        return {
+            "3": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": seed,
+                    "steps": self._steps,
+                    "cfg": self._cfg_scale,
+                    "sampler_name": self._sampler_name,
+                    "scheduler": self._scheduler,
+                    "denoise": 1.0,
+                    "model": ["66", 0],
+                    "positive": ["6", 0],
+                    "negative": ["7", 0],
+                    "latent_image": ["58", 0],
+                },
+            },
+            "6": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": prompt_text, "clip": ["38", 0]},
+            },
+            "7": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": self._negative_prompt, "clip": ["38", 0]},
+            },
+            "8": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["3", 0], "vae": ["39", 0]},
+            },
+            "9": {
+                "class_type": "SaveImage",
+                "inputs": {"filename_prefix": "imaginv", "images": ["8", 0]},
+            },
+            "37": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": self._diffusion_model_name, "weight_dtype": "default"},
+            },
+            "38": {
+                "class_type": "CLIPLoader",
+                "inputs": {
+                    "clip_name": self._clip_name,
+                    "type": "qwen_image",
+                    "device": "default",
+                },
+            },
+            "39": {
+                "class_type": "VAELoader",
+                "inputs": {"vae_name": self._vae_name},
+            },
+            "58": {
+                "class_type": "EmptySD3LatentImage",
+                "inputs": {"width": width, "height": height, "batch_size": 1},
+            },
+            "66": {
+                "class_type": "ModelSamplingAuraFlow",
+                "inputs": {"model": ["37", 0], "shift": self._model_sampling_shift},
             },
         }
 
