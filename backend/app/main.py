@@ -45,10 +45,12 @@ def _build_state(app: FastAPI) -> None:
     # ComfyUI adapter always exists (mock or, eventually, live) -- ordinary "Image"
     # generation always routes here regardless of whether Gemini is configured.
     if settings.comfy_mode == "mock":
-        comfyui_client = MockComfyUIClient()
+        # storage=app.state.storage so a "succeeded" mock job actually has a real (if
+        # trivial) image behind its object_key -- see MockComfyUIClient's docstring.
+        comfyui_client = MockComfyUIClient(storage=app.state.storage)
     else:
         # Live ComfyUI HTTP adapter would be constructed here from settings.comfy_base_url.
-        comfyui_client = MockComfyUIClient()
+        comfyui_client = MockComfyUIClient(storage=app.state.storage)
 
     if settings.gemini_api_key:
         # Gemini (Google AI Studio) powers "Poster / Infographic" generation

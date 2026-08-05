@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 
 from app.adapters.comfyui import MockComfyUIClient
+from app.adapters.storage import InMemoryObjectStorage
 
 
 @pytest.mark.asyncio
@@ -63,3 +64,31 @@ async def test_cancel_marks_failed() -> None:
 async def test_health_always_true() -> None:
     client = MockComfyUIClient()
     assert await client.health() is True
+
+
+@pytest.mark.asyncio
+async def test_without_storage_object_key_is_fabricated_only() -> None:
+    """Documents the previously-surprising default: with no storage wired in, the mock
+    adapter's outputs point at an object_key nothing ever wrote -- fine for tests that
+    only assert on job state, but GET /v1/jobs/{id}/asset would 404 against it."""
+    client = MockComfyUIClient(polls_to_complete=0)
+    result = await client.submit({"prompt": "no storage"})
+    status = await client.get_status(result.prompt_id)
+    assert status.state == "succeeded"
+    # No storage was given, so nothing to assert the key resolves against -- this test
+    # exists to document the distinction from the storage-wired case below.
+
+
+@pytest.mark.asyncio
+async def test_with_storage_succeeded_job_writes_real_bytes() -> None:
+    """When storage is wired in (as app/main.py now does), a succeeded job's object_key
+    is actually fetchable -- this is what makes GET /v1/jobs/{id}/asset work for ordinary
+    "Image" generation in local/dev mode without a live ComfyUI or GPU."""
+    storage = InMemoryObjectStorage()
+    client = MockComfyUIClient(polls_to_complete=0, storage=storage)
+    result = await client.submit({"prompt": "real bytes please"})
+    status = await client.get_status(result.prompt_id)
+    assert status.state == "succeeded"
+    object_key = status.outputs[0]["object_key"]
+    data = await storage.get_object(object_key)
+    assert data.startswith(b"\x89PNG")
