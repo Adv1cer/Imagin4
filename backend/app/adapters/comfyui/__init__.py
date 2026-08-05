@@ -22,7 +22,9 @@ class ComfyStatus:
 
 
 class ComfyUIClient(Protocol):
-    async def submit(self, workflow_payload: dict) -> ComfySubmitResult: ...
+    async def submit(
+        self, workflow_payload: dict, kind: str | None = None
+    ) -> ComfySubmitResult: ...
 
     async def get_status(self, prompt_id: str) -> ComfyStatus: ...
 
@@ -43,7 +45,7 @@ class MockComfyUIClient:
         self._payloads: dict[str, dict] = {}
         self._cancelled: set[str] = set()
 
-    async def submit(self, workflow_payload: dict) -> ComfySubmitResult:
+    async def submit(self, workflow_payload: dict, kind: str | None = None) -> ComfySubmitResult:
         prompt_id = str(uuid.uuid4())
         self._payloads[prompt_id] = workflow_payload
         self._poll_counts[prompt_id] = 0

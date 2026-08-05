@@ -113,7 +113,7 @@ class Scheduler:
         this method never silently swallows an error."""
         try:
             await self.job_queue.mark_running(job.id)
-            submit_result = await self.comfy_client.submit(job.input_payload)
+            submit_result = await self.comfy_client.submit(job.input_payload, kind=job.kind)
             if hasattr(self.job_queue, "set_prompt_id"):
                 await self.job_queue.set_prompt_id(job.id, submit_result.prompt_id)
             logger.info(

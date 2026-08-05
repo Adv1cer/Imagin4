@@ -122,7 +122,7 @@ class GeminiImageComfyUIClient:
                     return mime, inline.data
         raise RuntimeError("gemini_no_image_in_response")
 
-    async def submit(self, workflow_payload: dict) -> ComfySubmitResult:
+    async def submit(self, workflow_payload: dict, kind: str | None = None) -> ComfySubmitResult:
         prompt_id = str(uuid.uuid4())
         prompt_text = str(workflow_payload.get("prompt") or "").strip()
 

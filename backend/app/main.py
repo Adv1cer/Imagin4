@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.adapters.comfyui import MockComfyUIClient
 from app.adapters.queue import InMemoryJobQueue
+from app.adapters.routing_comfyui import CompositeComfyUIClient
 from app.adapters.storage import InMemoryObjectStorage
 from app.api.v1 import auth, conversations, generations, health, jobs, metrics
 from app.core.config import get_settings
@@ -41,14 +42,24 @@ def _build_state(app: FastAPI) -> None:
     app.state.job_queue = InMemoryJobQueue()
     app.state.storage = InMemoryObjectStorage()
 
+    # ComfyUI adapter always exists (mock or, eventually, live) -- ordinary "Image"
+    # generation always routes here regardless of whether Gemini is configured.
+    if settings.comfy_mode == "mock":
+        comfyui_client = MockComfyUIClient()
+    else:
+        # Live ComfyUI HTTP adapter would be constructed here from settings.comfy_base_url.
+        comfyui_client = MockComfyUIClient()
+
     if settings.gemini_api_key:
-        # Gemini (Google AI Studio) takes over as both the image-generation backend
-        # (implements the same ComfyUIClient port as MockComfyUIClient / a real
-        # ComfyUI adapter would, so the scheduler/reconciler need no changes) and as
-        # the text chat completion backend. Takes priority over `comfy_mode` when set.
+        # Gemini (Google AI Studio) powers "Poster / Infographic" generation
+        # specifically (see app/domain/jobs/workflow_registry.py's `backend` field and
+        # app/adapters/routing_comfyui.py:CompositeComfyUIClient) and real text chat
+        # replies. It does NOT replace ComfyUI for ordinary image generation -- both
+        # backends are wired simultaneously and CompositeComfyUIClient routes each job
+        # to the right one based on its workflow.
         from app.adapters.gemini import GeminiImageComfyUIClient, GeminiTextClient
 
-        app.state.comfy_client = GeminiImageComfyUIClient(
+        gemini_image_client = GeminiImageComfyUIClient(
             api_key=settings.gemini_api_key,
             model=settings.gemini_image_model,
             storage=app.state.storage,
@@ -60,23 +71,25 @@ def _build_state(app: FastAPI) -> None:
             timeout_s=settings.gemini_request_timeout_s,
         )
         logger.info(
-            "gemini: wired as image backend (model=%s) and chat backend (model=%s)",
+            "gemini: wired for poster/infographic generation (model=%s) and chat (model=%s); "
+            "ordinary image generation still uses %s",
             settings.gemini_image_model,
             settings.gemini_text_model,
-        )
-    else:
-        if settings.comfy_mode == "mock":
-            app.state.comfy_client = MockComfyUIClient()
-        else:
-            # Live ComfyUI HTTP adapter would be constructed here from
-            # settings.comfy_base_url.
-            app.state.comfy_client = MockComfyUIClient()
-        app.state.gemini_text_client = None
-        logger.info(
-            "gemini: APP_GEMINI_API_KEY not set -- image generation uses %s, "
-            "chat replies are unavailable (POST .../assistant-reply returns 503)",
             "mock ComfyUI" if settings.comfy_mode == "mock" else "ComfyUI",
         )
+    else:
+        gemini_image_client = None
+        app.state.gemini_text_client = None
+        logger.info(
+            "gemini: APP_GEMINI_API_KEY not set -- ordinary image generation uses %s, "
+            "poster/infographic generation and chat replies will fail clearly "
+            "(job failed / POST .../assistant-reply 503) instead of silently degrading",
+            "mock ComfyUI" if settings.comfy_mode == "mock" else "ComfyUI",
+        )
+
+    app.state.comfy_client = CompositeComfyUIClient(
+        comfyui_client=comfyui_client, gemini_client=gemini_image_client
+    )
 
 
 @asynccontextmanager
