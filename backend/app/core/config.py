@@ -66,11 +66,14 @@ class Settings(BaseSettings):
 
     # Gemini (Google AI Studio) -- when gemini_api_key is set, it replaces both the
     # image-generation backend (in place of ComfyUI) and powers real text chat
-    # replies. Free-tier defaults per Google AI Studio as of this writing:
-    # gemini-2.0-flash (text, 15 RPM/1500 RPD) and gemini-2.5-flash-image (image,
-    # 10 RPM/500 RPD, aka "Nano Banana"). Get a key at https://aistudio.google.com/.
+    # replies. Model names/quotas change over time (gemini-2.0-flash was retired by
+    # Google and had to be swapped for gemini-2.5-flash here) -- if generation starts
+    # failing with a 404 "no longer available" error, check
+    # https://ai.google.dev/gemini-api/docs/models for the current model list and
+    # update APP_GEMINI_TEXT_MODEL / APP_GEMINI_IMAGE_MODEL accordingly. Get a key at
+    # https://aistudio.google.com/.
     gemini_api_key: str | None = None
-    gemini_text_model: str = "gemini-2.0-flash"
+    gemini_text_model: str = "gemini-2.5-flash"
     gemini_image_model: str = "gemini-2.5-flash-image"
     gemini_request_timeout_s: float = 30.0
 

@@ -163,7 +163,9 @@ regardless of `APP_COMFY_MODE` (see `app/main.py::_build_state`):
   Get a free-tier key at <https://aistudio.google.com/>. Also enables real text chat
   replies via `POST /v1/conversations/{id}/assistant-reply` using
   `app.adapters.gemini.GeminiTextClient` (`APP_GEMINI_TEXT_MODEL`, default
-  `gemini-2.0-flash`) -- without a key, that endpoint returns `503`. Generated images
+  `gemini-2.5-flash`; Google periodically retires older model names, so if you see a
+  `404 ... no longer available` error, check https://ai.google.dev/gemini-api/docs/models
+  and update `APP_GEMINI_TEXT_MODEL`) -- without a key, that endpoint returns `503`. Generated images
   are streamed back to the client via `GET /v1/jobs/{id}/asset` (ownership-checked).
 
 ## Capacity planning
