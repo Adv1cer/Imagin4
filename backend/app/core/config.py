@@ -63,6 +63,16 @@ class Settings(BaseSettings):
     comfy_mode: Literal["mock", "live"] = "mock"
     comfy_base_url: str = "http://localhost:8188"
     comfy_request_timeout_s: float = 10.0
+    # Only used when comfy_mode == "live" (see app/adapters/comfyui/live.py). The
+    # checkpoint filename MUST match exactly what's installed on the target ComfyUI
+    # instance (its models/checkpoints directory) -- there is no discovery/validation of
+    # this from our side, a wrong name fails the job with a ComfyUI-side graph error.
+    comfy_checkpoint_name: str = "sd_xl_base_1.0.safetensors"
+    comfy_sampler_name: str = "euler"
+    comfy_scheduler: str = "normal"
+    comfy_steps: int = 20
+    comfy_cfg_scale: float = 7.0
+    comfy_negative_prompt: str = ""
 
     # Gemini (Google AI Studio) -- when gemini_api_key is set, it replaces both the
     # image-generation backend (in place of ComfyUI) and powers real text chat

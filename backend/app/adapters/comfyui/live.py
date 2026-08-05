@@ -1,0 +1,318 @@
+"""Live ComfyUI HTTP adapter: implements the same `ComfyUIClient` port as
+`MockComfyUIClient` / `app.adapters.gemini.GeminiImageComfyUIClient`, but talks to a real
+ComfyUI instance's HTTP API (POST /prompt, GET /history/{id}, GET /queue, GET /view,
+POST /interrupt, POST /queue).
+
+Security invariant (see project instructions / AGENTS-equivalent doc, "Client-supplied
+arbitrary ComfyUI workflows are forbidden"): this adapter NEVER accepts a raw ComfyUI
+graph from the caller. `submit()` only receives the already-validated `input_payload`
+dict admitted by POST /v1/generations (prompt text + a small allowlisted set of
+aspect_ratio/resolution/prompt_enhancer keys -- see app/api/v1/generations.py and
+frontend/src/types/imageGen.ts), and builds the actual node graph itself from a fixed
+server-side template (`_build_prompt_graph`) using settings for anything model-specific
+(checkpoint filename, sampler, steps, cfg). There is no code path that forwards
+client-supplied JSON into the graph.
+
+ComfyUI API reference used here (no official Python SDK; this is the documented HTTP
+surface -- see https://docs.comfy.org/):
+  - POST /prompt              {"prompt": <graph>, "client_id": <str>} -> {"prompt_id": ...}
+  - GET  /history/{prompt_id} -> {} while not yet finished, else {prompt_id: {...}}
+  - GET  /queue                -> {"queue_running": [...], "queue_pending": [...]}
+  - GET  /view?filename=&subfolder=&type= -> raw image bytes
+  - POST /interrupt            -> interrupts whatever is CURRENTLY executing (no target
+                                    id -- ComfyUI has no per-job "cancel this one if it's
+                                    already running" API; see cancel()'s docstring)
+  - POST /queue {"delete": [prompt_id]} -> removes a still-QUEUED (not yet running) item
+  - GET  /system_stats         -> used as a cheap health check
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from typing import Any
+
+import httpx
+
+from app.adapters.comfyui import ComfyStatus, ComfySubmitResult
+from app.adapters.storage import ObjectStorage
+
+logger = logging.getLogger("imaginv.comfyui_live")
+
+# SDXL-friendly base sizes (multiples of 64, ~1024 long edge) per common aspect ratio,
+# scaled up for 2K/4K. These are reasonable defaults for a "1024-class" checkpoint;
+# if the configured checkpoint prefers different native resolutions, override via
+# workflow inputs later rather than hand-editing this table.
+_BASE_DIMENSIONS_1K: dict[str, tuple[int, int]] = {
+    "1:1": (1024, 1024),
+    "9:16": (768, 1344),
+    "2:3": (832, 1216),
+    "3:4": (896, 1152),
+    "4:5": (896, 1088),
+    "5:4": (1088, 896),
+    "4:3": (1152, 896),
+    "3:2": (1216, 832),
+    "16:9": (1344, 768),
+    "21:9": (1536, 640),
+}
+_RESOLUTION_SCALE = {"1K": 1, "2K": 2, "4K": 4}
+_MAX_DIM = 4096
+
+
+def _resolve_dimensions(aspect_ratio: str | None, resolution: str | None) -> tuple[int, int]:
+    base = _BASE_DIMENSIONS_1K.get(aspect_ratio or "1:1", _BASE_DIMENSIONS_1K["1:1"])
+    scale = _RESOLUTION_SCALE.get(resolution or "1K", 1)
+    width = min(base[0] * scale, _MAX_DIM)
+    height = min(base[1] * scale, _MAX_DIM)
+    # KSampler/VAE require multiples of 8.
+    return (width // 8) * 8, (height // 8) * 8
+
+
+def _sanitized_error(exc: Exception) -> str:
+    """Mirrors app.adapters.gemini._sanitized_error: never echo raw exception text
+    (which can include request/response fragments) back to clients or job_events."""
+    return f"comfy_live_error:{type(exc).__name__}"
+
+
+class LiveComfyUIClient:
+    """`ComfyUIClient` implementation backed by a real ComfyUI HTTP server."""
+
+    def __init__(
+        self,
+        base_url: str,
+        storage: ObjectStorage,
+        checkpoint_name: str,
+        sampler_name: str = "euler",
+        scheduler: str = "normal",
+        steps: int = 20,
+        cfg_scale: float = 7.0,
+        negative_prompt: str = "",
+        request_timeout_s: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._storage = storage
+        self._checkpoint_name = checkpoint_name
+        self._sampler_name = sampler_name
+        self._scheduler = scheduler
+        self._steps = steps
+        self._cfg_scale = cfg_scale
+        self._negative_prompt = negative_prompt
+        self._timeout_s = request_timeout_s
+        # Only ever set in tests, to substitute a fake HTTP transport instead of making
+        # real network calls -- see tests/contract/test_live_comfyui_client.py.
+        self._transport = transport
+        self._client_id = f"imaginv-{uuid.uuid4().hex[:12]}"
+        # Cache of fully-resolved terminal outcomes so repeated get_status() polls for an
+        # already-succeeded/failed job don't re-fetch /history or re-download images.
+        self._resolved: dict[str, ComfyStatus] = {}
+
+    def _http_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(timeout=self._timeout_s, transport=self._transport)
+
+    def _build_prompt_graph(self, workflow_payload: dict) -> dict[str, Any]:
+        """Builds a standard txt2img node graph from validated inputs only -- see module
+        docstring. Unknown/extra keys in workflow_payload are ignored, not forwarded."""
+        prompt_text = str(workflow_payload.get("prompt") or "").strip()
+        width, height = _resolve_dimensions(
+            workflow_payload.get("aspect_ratio"), workflow_payload.get("resolution")
+        )
+        seed = int(workflow_payload.get("seed") or uuid.uuid4().int % (2**32))
+
+        return {
+            "3": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": seed,
+                    "steps": self._steps,
+                    "cfg": self._cfg_scale,
+                    "sampler_name": self._sampler_name,
+                    "scheduler": self._scheduler,
+                    "denoise": 1.0,
+                    "model": ["4", 0],
+                    "positive": ["6", 0],
+                    "negative": ["7", 0],
+                    "latent_image": ["5", 0],
+                },
+            },
+            "4": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": self._checkpoint_name},
+            },
+            "5": {
+                "class_type": "EmptyLatentImage",
+                "inputs": {"width": width, "height": height, "batch_size": 1},
+            },
+            "6": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": prompt_text, "clip": ["4", 1]},
+            },
+            "7": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": self._negative_prompt, "clip": ["4", 1]},
+            },
+            "8": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["3", 0], "vae": ["4", 2]},
+            },
+            "9": {
+                "class_type": "SaveImage",
+                "inputs": {"filename_prefix": "imaginv", "images": ["8", 0]},
+            },
+        }
+
+    async def submit(self, workflow_payload: dict, kind: str | None = None) -> ComfySubmitResult:
+        graph = self._build_prompt_graph(workflow_payload)
+        prompt_text = str(workflow_payload.get("prompt") or "").strip()
+        if not prompt_text:
+            prompt_id = str(uuid.uuid4())
+            self._resolved[prompt_id] = ComfyStatus(
+                prompt_id=prompt_id, state="failed", error="empty_prompt"
+            )
+            return ComfySubmitResult(prompt_id=prompt_id)
+
+        try:
+            async with self._http_client() as client:
+                resp = await client.post(
+                    f"{self._base_url}/prompt",
+                    json={"prompt": graph, "client_id": self._client_id},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            prompt_id = str(data["prompt_id"])
+            logger.info("comfyui_live: submitted prompt_id=%s kind=%s", prompt_id, kind)
+            return ComfySubmitResult(prompt_id=prompt_id)
+        except Exception as exc:
+            # Submission itself failed (ComfyUI unreachable, graph rejected, etc.) --
+            # ComfyUI never even queued this, so there's no real prompt_id. Mint a local
+            # one purely so the rest of the pipeline (which is keyed on prompt_id) has
+            # something to look up; get_status() below serves the cached failure for it.
+            logger.exception("comfyui_live: submit failed")
+            prompt_id = str(uuid.uuid4())
+            self._resolved[prompt_id] = ComfyStatus(
+                prompt_id=prompt_id, state="failed", error=_sanitized_error(exc)
+            )
+            return ComfySubmitResult(prompt_id=prompt_id)
+
+    async def _fetch_and_store_outputs(self, history_entry: dict) -> list[dict]:
+        outputs: list[dict] = []
+        node_outputs = history_entry.get("outputs") or {}
+        async with self._http_client() as client:
+            for node in node_outputs.values():
+                for image in node.get("images") or []:
+                    filename = image.get("filename")
+                    if not filename:
+                        continue
+                    params = {
+                        "filename": filename,
+                        "subfolder": image.get("subfolder", ""),
+                        "type": image.get("type", "output"),
+                    }
+                    resp = await client.get(f"{self._base_url}/view", params=params)
+                    resp.raise_for_status()
+                    data = resp.content
+                    ext = (filename.rsplit(".", 1)[-1] or "png").lower()
+                    mime = f"image/{'jpeg' if ext == 'jpg' else ext}"
+                    object_key = f"generated/{uuid.uuid4().hex}.{ext}"
+                    await self._storage.put_object(object_key, data, mime)
+                    outputs.append({"object_key": object_key, "mime_type": mime})
+        return outputs
+
+    async def get_status(self, prompt_id: str) -> ComfyStatus:
+        cached = self._resolved.get(prompt_id)
+        if cached is not None:
+            return cached
+
+        try:
+            async with self._http_client() as client:
+                history_resp = await client.get(f"{self._base_url}/history/{prompt_id}")
+                history_resp.raise_for_status()
+                history = history_resp.json()
+
+                if prompt_id in history:
+                    entry = history[prompt_id]
+                    status_info = entry.get("status") or {}
+                    if status_info.get("status_str") == "error":
+                        status = ComfyStatus(
+                            prompt_id=prompt_id, state="failed", error="comfy_execution_error"
+                        )
+                        self._resolved[prompt_id] = status
+                        return status
+                    outputs = await self._fetch_and_store_outputs(entry)
+                    if not outputs:
+                        status = ComfyStatus(
+                            prompt_id=prompt_id, state="failed", error="comfy_no_output_image"
+                        )
+                    else:
+                        status = ComfyStatus(prompt_id=prompt_id, state="succeeded", outputs=outputs)
+                    self._resolved[prompt_id] = status
+                    return status
+
+                # Not in history yet: check the queue to distinguish "still working" from
+                # "ComfyUI has no idea what this is" (e.g. it restarted and lost state).
+                queue_resp = await client.get(f"{self._base_url}/queue")
+                queue_resp.raise_for_status()
+                queue = queue_resp.json()
+                all_queued_ids = {
+                    entry[1]
+                    for entry in (queue.get("queue_running") or []) + (queue.get("queue_pending") or [])
+                }
+                if prompt_id in all_queued_ids:
+                    return ComfyStatus(prompt_id=prompt_id, state="running")
+                # Unknown to both history and queue -- treat as a transient miss (e.g. a
+                # request landed between submit() returning and ComfyUI registering the
+                # job) rather than a hard failure; the reconciler will poll again and,
+                # if this persists past the job's lease, eventually time it out via
+                # worker_lease_expired rather than us guessing wrong here.
+                return ComfyStatus(prompt_id=prompt_id, state="running")
+        except Exception as exc:
+            logger.exception("comfyui_live: get_status failed prompt_id=%s", prompt_id)
+            # A transport/HTTP failure while polling is treated as still-running rather
+            # than failed -- ComfyUI may be momentarily unreachable (network blip) while
+            # the job itself is fine; the reconciler's lease-expiry path is what should
+            # ultimately fail a job that never recovers, not a single flaky poll.
+            logger.warning(
+                "comfyui_live: treating poll failure as still-running (%s)", _sanitized_error(exc)
+            )
+            return ComfyStatus(prompt_id=prompt_id, state="running")
+
+    async def cancel(self, prompt_id: str) -> None:
+        """Best-effort cancellation. ComfyUI's HTTP API distinguishes "still queued"
+        (removable via POST /queue {"delete": [id]}) from "currently executing" (only
+        POST /interrupt, which has no target id and interrupts whatever ComfyUI happens
+        to be running right now -- there is no API to interrupt a *specific* prompt_id).
+        So: if it's still pending, this cancels precisely; if it's already running, this
+        may interrupt a *different* job if this ComfyUI instance is shared/concurrent.
+        Per project instructions: document the limitation rather than pretend precision
+        we don't have.
+        """
+        try:
+            async with self._http_client() as client:
+                queue_resp = await client.get(f"{self._base_url}/queue")
+                queue_resp.raise_for_status()
+                queue = queue_resp.json()
+                pending_ids = {entry[1] for entry in (queue.get("queue_pending") or [])}
+                running_ids = {entry[1] for entry in (queue.get("queue_running") or [])}
+
+                if prompt_id in pending_ids:
+                    await client.post(f"{self._base_url}/queue", json={"delete": [prompt_id]})
+                elif prompt_id in running_ids:
+                    logger.warning(
+                        "comfyui_live: cancel(%s) is currently RUNNING -- ComfyUI has no "
+                        "per-prompt interrupt, so POST /interrupt will stop whatever this "
+                        "instance is executing right now, which may not be this job if "
+                        "another one started concurrently",
+                        prompt_id,
+                    )
+                    await client.post(f"{self._base_url}/interrupt")
+        except Exception:
+            logger.exception("comfyui_live: cancel failed prompt_id=%s", prompt_id)
+        self._resolved.pop(prompt_id, None)
+
+    async def health(self) -> bool:
+        try:
+            async with self._http_client() as client:
+                resp = await client.get(f"{self._base_url}/system_stats")
+                return resp.status_code == 200
+        except Exception:
+            return False

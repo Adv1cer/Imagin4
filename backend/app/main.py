@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.adapters.comfyui import MockComfyUIClient
+from app.adapters.comfyui.live import LiveComfyUIClient
 from app.adapters.queue import InMemoryJobQueue
 from app.adapters.routing_comfyui import CompositeComfyUIClient
 from app.adapters.storage import InMemoryObjectStorage
@@ -49,8 +50,22 @@ def _build_state(app: FastAPI) -> None:
         # trivial) image behind its object_key -- see MockComfyUIClient's docstring.
         comfyui_client = MockComfyUIClient(storage=app.state.storage)
     else:
-        # Live ComfyUI HTTP adapter would be constructed here from settings.comfy_base_url.
-        comfyui_client = MockComfyUIClient(storage=app.state.storage)
+        comfyui_client = LiveComfyUIClient(
+            base_url=settings.comfy_base_url,
+            storage=app.state.storage,
+            checkpoint_name=settings.comfy_checkpoint_name,
+            sampler_name=settings.comfy_sampler_name,
+            scheduler=settings.comfy_scheduler,
+            steps=settings.comfy_steps,
+            cfg_scale=settings.comfy_cfg_scale,
+            negative_prompt=settings.comfy_negative_prompt,
+            request_timeout_s=settings.comfy_request_timeout_s,
+        )
+        logger.info(
+            "comfyui: live mode, base_url=%s checkpoint=%s",
+            settings.comfy_base_url,
+            settings.comfy_checkpoint_name,
+        )
 
     if settings.gemini_api_key:
         # Gemini (Google AI Studio) powers "Poster / Infographic" generation
