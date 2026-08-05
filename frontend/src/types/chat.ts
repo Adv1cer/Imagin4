@@ -1,9 +1,6 @@
-// Local-only chat message shape used by the UI. The backend has no endpoint to create
-// chat messages or to run a text/LLM completion (only GET .../messages exists, and there
-// is no chat-completion endpoint at all) -- see src/api/types.ts for the note on this
-// backend gap. So plain text turns exist only in this local state, never sent to or
-// fetched from the server. Image-generation turns are real: they carry a `job` that is
-// backed by POST /v1/generations + GET /v1/jobs/{id} polling.
+// Local UI message shape. Both text turns (persisted via POST .../messages and
+// .../assistant-reply) and image-generation turns (backed by POST /v1/generations +
+// GET /v1/jobs/{id} polling) are real -- see src/screens/ChatScreen.tsx.
 
 export interface ImageJobState {
   jobId: string

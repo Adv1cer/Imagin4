@@ -14,6 +14,8 @@ import {
 import { ApiError } from '../api/client'
 import type { MeResponse } from '../api/types'
 import type { UiMessage } from '../types/chat'
+import { DEFAULT_IMAGE_GEN_CONFIG, workflowNameFor } from '../types/imageGen'
+import type { ImageGenConfig } from '../types/imageGen'
 
 function uuidv4(): string {
   if ('randomUUID' in crypto) return crypto.randomUUID()
@@ -37,6 +39,7 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [sending, setSending] = useState(false)
   const [imageMode, setImageMode] = useState(false)
+  const [imageGenConfig, setImageGenConfig] = useState<ImageGenConfig>(DEFAULT_IMAGE_GEN_CONFIG)
   const [banner, setBanner] = useState<string | null>(null)
   const { toasts, showToast, dismissToast } = useToasts()
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -143,47 +146,66 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
 
       if (imageMode) {
         setImageMode(false)
-        const assistantMsgId = nextId()
+        const config = imageGenConfig
+        const workflowName = workflowNameFor(config.kind)
+        // config.variations spawns that many independent generation jobs (each with its
+        // own idempotency key), one bubble per job -- Leonardo-style "batch of N".
+        const count = config.variations
+        const jobEntries = Array.from({ length: count }, () => ({ msgId: nextId() }))
+
         setMessages((prev) => [
           ...prev,
-          {
-            id: assistantMsgId,
-            role: 'assistant',
-            text: `Generating image for: "${text}"`,
+          ...jobEntries.map(({ msgId }) => ({
+            id: msgId,
+            role: 'assistant' as const,
+            text:
+              count > 1
+                ? `Generating image ${jobEntries.findIndex((e) => e.msgId === msgId) + 1}/${count} for: "${text}"`
+                : `Generating image for: "${text}"`,
             createdAt: new Date().toISOString(),
-            imageJob: { jobId: '', state: 'queued' },
-          },
+            imageJob: { jobId: '', state: 'queued' as const },
+          })),
         ])
-        try {
-          const generation = await createGeneration(
-            {
-              workflow_name: 'txt2img_basic',
-              workflow_version: 'v1',
-              conversation_id: convId,
-              inputs: { prompt: text },
-            },
-            uuidv4(),
-          )
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantMsgId
-                ? { ...m, imageJob: { jobId: generation.id, state: 'queued' } }
-                : m,
-            ),
-          )
-          pollJob(generation.id, assistantMsgId)
-        } catch (err) {
-          const msg =
-            err instanceof ApiError ? err.message : 'Failed to start image generation.'
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantMsgId
-                ? { ...m, text: msg, imageJob: { jobId: '', state: 'failed' } }
-                : m,
-            ),
-          )
-          showToast(msg, 'error')
-        }
+
+        await Promise.all(
+          jobEntries.map(async ({ msgId }) => {
+            try {
+              const generation = await createGeneration(
+                {
+                  workflow_name: workflowName,
+                  workflow_version: 'v1',
+                  conversation_id: convId,
+                  inputs: {
+                    prompt: text,
+                    aspect_ratio: config.aspectRatio,
+                    resolution: config.resolution,
+                    prompt_enhancer: config.promptEnhancer,
+                  },
+                },
+                uuidv4(),
+              )
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === msgId
+                    ? { ...m, imageJob: { jobId: generation.id, state: 'queued' } }
+                    : m,
+                ),
+              )
+              pollJob(generation.id, msgId)
+            } catch (err) {
+              const msg =
+                err instanceof ApiError ? err.message : 'Failed to start image generation.'
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === msgId
+                    ? { ...m, text: msg, imageJob: { jobId: '', state: 'failed' } }
+                    : m,
+                ),
+              )
+              showToast(msg, 'error')
+            }
+          }),
+        )
       } else {
         // Real reply via Gemini (backend/app/adapters/gemini.py), using the full
         // persisted conversation history -- see POST .../assistant-reply. The backend
@@ -268,8 +290,10 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
         onSend={handleSend}
         onToast={showToast}
         imageMode={imageMode}
+        imageGenConfig={imageGenConfig}
         onEnterImageMode={() => setImageMode(true)}
         onExitImageMode={() => setImageMode(false)}
+        onImageGenConfigChange={setImageGenConfig}
         disabled={sending}
       />
 

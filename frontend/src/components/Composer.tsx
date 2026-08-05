@@ -2,29 +2,32 @@ import { useState } from 'react'
 import type { FormEvent } from 'react'
 import { ToolsMenu } from './ToolsMenu'
 import type { ToolItem } from './ToolsMenu'
-
-const MODELS = ['imaginv-chat-1', 'imaginv-chat-mini', 'imaginv-chat-pro']
+import { ImageGenPanel } from './ImageGenPanel'
+import type { ImageGenConfig } from '../types/imageGen'
 
 export function Composer({
   onSend,
   onToast,
   imageMode,
+  imageGenConfig,
   onEnterImageMode,
   onExitImageMode,
+  onImageGenConfigChange,
   disabled,
 }: {
   onSend: (text: string) => void
   onToast: (message: string) => void
   imageMode: boolean
+  imageGenConfig: ImageGenConfig
   onEnterImageMode: () => void
   onExitImageMode: () => void
+  onImageGenConfigChange: (config: ImageGenConfig) => void
   disabled: boolean
 }) {
   const [text, setText] = useState('')
   const [agentSkills, setAgentSkills] = useState(false)
   const [toolsOpen, setToolsOpen] = useState(false)
-  const [modelOpen, setModelOpen] = useState(false)
-  const [model, setModel] = useState(MODELS[0])
+  const [panelOpen, setPanelOpen] = useState(false)
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault()
@@ -38,6 +41,7 @@ export function Composer({
     setToolsOpen(false)
     if (tool.key === 'image_generation') {
       onEnterImageMode()
+      setPanelOpen(true)
       onToast('Image generation mode enabled — describe the image to create.')
       return
     }
@@ -92,36 +96,6 @@ export function Composer({
               </button>
               <span className="text-xs text-gray-500">Agent Skills</span>
             </label>
-
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => setModelOpen((v) => !v)}
-                className="flex items-center gap-1 rounded-full border border-gray-200 bg-gray-50 px-3 py-1 text-xs font-medium text-gray-700 hover:bg-gray-100"
-              >
-                {model}
-                <span className="text-[10px]">▾</span>
-              </button>
-              {modelOpen && (
-                <div className="absolute bottom-8 left-0 z-20 w-44 overflow-hidden rounded-lg border border-gray-200 bg-white py-1 shadow-lg">
-                  {MODELS.map((m) => (
-                    <button
-                      key={m}
-                      type="button"
-                      onClick={() => {
-                        setModel(m)
-                        setModelOpen(false)
-                      }}
-                      className={`block w-full px-3 py-1.5 text-left text-xs hover:bg-gray-50 ${
-                        m === model ? 'font-semibold text-gray-900' : 'text-gray-600'
-                      }`}
-                    >
-                      {m}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
           </div>
 
           <div className="flex items-center gap-1">
@@ -133,6 +107,30 @@ export function Composer({
             >
               📎
             </button>
+
+            {imageMode && (
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setPanelOpen((v) => !v)}
+                  title="Image generation options"
+                  className={`flex items-center gap-1 rounded-full border px-3 py-1 text-xs font-medium transition ${
+                    panelOpen
+                      ? 'border-purple-300 bg-purple-100 text-purple-800'
+                      : 'border-gray-200 bg-gray-50 text-gray-700 hover:bg-gray-100'
+                  }`}
+                >
+                  {imageGenConfig.kind === 'poster' ? 'Poster / Infographic' : 'Image'} · {imageGenConfig.aspectRatio}
+                  <span className="text-[10px]">▾</span>
+                </button>
+                <ImageGenPanel
+                  open={panelOpen}
+                  config={imageGenConfig}
+                  onChange={onImageGenConfigChange}
+                  onClose={() => setPanelOpen(false)}
+                />
+              </div>
+            )}
 
             <div className="relative">
               <button
