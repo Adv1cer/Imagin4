@@ -158,15 +158,18 @@ regardless of `APP_COMFY_MODE` (see `app/main.py::_build_state`):
   concrete increment (see "Next safe increment" in the final task report).
 - **Gemini** (`APP_GEMINI_API_KEY` set): `app.adapters.gemini.GeminiImageComfyUIClient`
   implements the same `ComfyUIClient` port using Google's Gemini API
-  (`APP_GEMINI_IMAGE_MODEL`, default `gemini-2.5-flash-image`) instead of ComfyUI --
-  the scheduler/reconciler/job-state-machine code is completely unaware of the swap.
-  Get a free-tier key at <https://aistudio.google.com/>. Also enables real text chat
-  replies via `POST /v1/conversations/{id}/assistant-reply` using
-  `app.adapters.gemini.GeminiTextClient` (`APP_GEMINI_TEXT_MODEL`, default
-  `gemini-2.5-flash`; Google periodically retires older model names, so if you see a
-  `404 ... no longer available` error, check https://ai.google.dev/gemini-api/docs/models
-  and update `APP_GEMINI_TEXT_MODEL`) -- without a key, that endpoint returns `503`. Generated images
-  are streamed back to the client via `GET /v1/jobs/{id}/asset` (ownership-checked).
+  (`APP_GEMINI_IMAGE_MODEL`, default `gemini-3.1-flash-image`, aka "Nano Banana 2")
+  instead of ComfyUI -- the scheduler/reconciler/job-state-machine code is completely
+  unaware of the swap. Get a free-tier key at <https://aistudio.google.com/>. Also
+  enables real text chat replies via `POST /v1/conversations/{id}/assistant-reply`
+  using `app.adapters.gemini.GeminiTextClient` (`APP_GEMINI_TEXT_MODEL`, default
+  `gemini-3.6-flash`) -- without a key, that endpoint returns `503`. **Google retires
+  model names periodically** (`gemini-2.0-flash` then `gemini-2.5-flash` both stopped
+  working for new API keys during development of this feature) -- if you see a `404
+  ... no longer available` error, check https://ai.google.dev/gemini-api/docs/models
+  for the current list and update `APP_GEMINI_TEXT_MODEL`/`APP_GEMINI_IMAGE_MODEL` in
+  your `.env`; this is expected maintenance, not a bug. Generated images are streamed
+  back to the client via `GET /v1/jobs/{id}/asset` (ownership-checked).
 
 ## Capacity planning
 

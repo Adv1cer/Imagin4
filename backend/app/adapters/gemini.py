@@ -10,11 +10,16 @@ Both use the `google-genai` SDK, which is synchronous, so calls are offloaded vi
 `asyncio.to_thread` to avoid blocking the event loop -- this is the same pattern a real
 network-bound ComfyUI HTTP client would use if it were sync.
 
-Free-tier notes (Google AI Studio, https://aistudio.google.com/, as of when this was
-written): gemini-2.0-flash for text (~15 RPM / 1500 RPD), gemini-2.5-flash-image for
-image generation aka "Nano Banana" (~10 RPM / 500 RPD). These are soft limits Google
-can change; if generation starts failing with rate-limit errors, that's expected
-behavior surfacing as a normal job `failed` state, not a bug in this adapter.
+Model names (see Settings.gemini_text_model / gemini_image_model, app/core/config.py)
+and free-tier quotas both drift over time -- Google retired gemini-2.0-flash and then
+gemini-2.5-flash for new API keys/projects while this adapter was being built (confirmed
+via live 404 "no longer available" responses, not assumed). As of 2026-08 the current
+generation is 3.x: gemini-3.6-flash for text, gemini-3.1-flash-image ("Nano Banana 2")
+for images -- see https://ai.google.dev/gemini-api/docs/models for the live list. If
+generation starts failing with a 404, that's a model-name-rotation issue to fix via env
+var, not a bug here. If it fails with 429 RESOURCE_EXHAUSTED, that's a genuine rate/quota
+limit -- both surface as a normal job `failed` state / 502 on the chat endpoint, not a
+crash.
 """
 
 from __future__ import annotations

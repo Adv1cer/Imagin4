@@ -66,15 +66,18 @@ class Settings(BaseSettings):
 
     # Gemini (Google AI Studio) -- when gemini_api_key is set, it replaces both the
     # image-generation backend (in place of ComfyUI) and powers real text chat
-    # replies. Model names/quotas change over time (gemini-2.0-flash was retired by
-    # Google and had to be swapped for gemini-2.5-flash here) -- if generation starts
-    # failing with a 404 "no longer available" error, check
-    # https://ai.google.dev/gemini-api/docs/models for the current model list and
-    # update APP_GEMINI_TEXT_MODEL / APP_GEMINI_IMAGE_MODEL accordingly. Get a key at
-    # https://aistudio.google.com/.
+    # replies. Model names/quotas change over time -- as of 2026-08, gemini-2.0-flash
+    # and gemini-2.5-flash were both retired for new API keys/projects (confirmed via
+    # live 404s from the API, not guessed), and the current generation is 3.x
+    # (gemini-3.6-flash for text, gemini-3.1-flash-image aka "Nano Banana 2" for
+    # image). If generation starts failing with a 404 "no longer available" error
+    # again, check https://ai.google.dev/gemini-api/docs/models for the current model
+    # list and update APP_GEMINI_TEXT_MODEL / APP_GEMINI_IMAGE_MODEL in your .env --
+    # this is expected to keep happening periodically as Google rotates models, it is
+    # not something to "fix" in code. Get a key at https://aistudio.google.com/.
     gemini_api_key: str | None = None
-    gemini_text_model: str = "gemini-2.5-flash"
-    gemini_image_model: str = "gemini-2.5-flash-image"
+    gemini_text_model: str = "gemini-3.6-flash"
+    gemini_image_model: str = "gemini-3.1-flash-image"
     gemini_request_timeout_s: float = 30.0
 
     # Rate limiting (requests per window per identity)
