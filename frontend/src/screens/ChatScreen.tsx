@@ -124,16 +124,22 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
     try {
       const convId = await ensureConversation()
 
-      // Persist the user's message for real. Non-fatal if it fails (e.g. transient
-      // network blip) -- the message still shows locally, it just won't survive a
-      // reload; we don't want a persistence hiccup to block the rest of the send flow.
-      createMessage(convId, {
-        role: 'user',
-        content: { text },
-        client_message_id: userMessage.id,
-      }).catch(() => {
+      // Persist the user's message for real, and WAIT for it to land before doing
+      // anything else. This must be awaited (previously wasn't, which was a real bug):
+      // POST .../assistant-reply reads message history straight from the database, so
+      // firing it before this insert commits raced and could return "conversation has
+      // no messages to reply to" even though the user's message was clearly sent.
+      // Still non-fatal on failure -- the message still shows locally, it just won't
+      // survive a reload -- but we no longer race the two requests against each other.
+      try {
+        await createMessage(convId, {
+          role: 'user',
+          content: { text },
+          client_message_id: userMessage.id,
+        })
+      } catch {
         showToast('Message sent, but failed to save to history.', 'error')
-      })
+      }
 
       if (imageMode) {
         setImageMode(false)
