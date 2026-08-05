@@ -78,7 +78,15 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     gemini_text_model: str = "gemini-3.6-flash"
     gemini_image_model: str = "gemini-3.1-flash-image"
+    # Text replies are short and fast; 30s is comfortable. Image generation -- especially
+    # a long, detail-heavy poster/infographic prompt asking for multiple rendered text
+    # elements and a specific layout -- routinely takes noticeably longer than a plain
+    # "draw a cat" prompt, and was observed hitting the shared 30s timeout in production
+    # use (asyncio.TimeoutError, confirmed via live logs, not guessed) even on the
+    # cheaper gemini-3.1-flash-image model, not just the pro tier. Split the two so a
+    # slow poster generation doesn't need to piggyback on the tight chat-latency budget.
     gemini_request_timeout_s: float = 30.0
+    gemini_image_request_timeout_s: float = 90.0
 
     # Rate limiting (requests per window per identity)
     rl_login_per_min: int = 10

@@ -65,7 +65,7 @@ def _build_state(app: FastAPI) -> None:
             api_key=settings.gemini_api_key,
             model=settings.gemini_image_model,
             storage=app.state.storage,
-            timeout_s=settings.gemini_request_timeout_s,
+            timeout_s=settings.gemini_image_request_timeout_s,
         )
         app.state.gemini_text_client = GeminiTextClient(
             api_key=settings.gemini_api_key,
