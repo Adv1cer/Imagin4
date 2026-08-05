@@ -25,10 +25,22 @@ interface RequestOptions {
   method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'
   body?: unknown
   headers?: Record<string, string>
+  timeoutMs?: number
 }
 
+// Plain fetch() has no timeout: if the backend accepts the TCP connection but never
+// responds (e.g. still warming up right after `docker compose up -d --build`, or a
+// container mid-restart), the promise just hangs forever -- observed as an infinite
+// loading spinner that only clears after mashing refresh a few times until a request
+// happens to land after the backend is actually ready. Bound every request so a slow
+// backend fails fast with a clear, retryable error instead.
+const DEFAULT_TIMEOUT_MS = 12_000
+
 export async function apiFetch<T>(path: string, opts: RequestOptions = {}): Promise<T> {
-  const { method = 'GET', body, headers = {} } = opts
+  const { method = 'GET', body, headers = {}, timeoutMs = DEFAULT_TIMEOUT_MS } = opts
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
 
   let response: Response
   try {
@@ -40,9 +52,18 @@ export async function apiFetch<T>(path: string, opts: RequestOptions = {}): Prom
         ...headers,
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
     })
-  } catch {
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new ApiError(
+        0,
+        'The server took too long to respond. It may still be starting up -- try again in a few seconds.',
+      )
+    }
     throw new ApiError(0, 'Network error: could not reach the server. Is the backend running?')
+  } finally {
+    clearTimeout(timer)
   }
 
   if (response.status === 204) {
