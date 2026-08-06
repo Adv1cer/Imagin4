@@ -117,6 +117,15 @@ class Settings(BaseSettings):
     # slow poster generation doesn't need to piggyback on the tight chat-latency budget.
     gemini_request_timeout_s: float = 30.0
     gemini_image_request_timeout_s: float = 90.0
+    # Grounded Google Search research call (app/domain/chat/routing.py's
+    # RESEARCH_SYSTEM_INSTRUCTION / GeminiTextClient.research_missing_fields) -- a
+    # SEPARATE, shorter budget from gemini_request_timeout_s. This call is best-effort
+    # (a POSTER/INFOGRAPHIC with missing_fields always falls back to asking the user if
+    # it fails or is slow -- see app/api/v1/chat_router.py:_research_augment), so it's
+    # capped tighter than a normal chat/classification call rather than sharing the
+    # full 30s, keeping the worst-case smart-message latency (classify + research +
+    # re-classify, three sequential calls) bounded to roughly 30+20+30=80s instead of 90s.
+    gemini_research_timeout_s: float = 20.0
 
     # Rate limiting (requests per window per identity)
     rl_login_per_min: int = 10

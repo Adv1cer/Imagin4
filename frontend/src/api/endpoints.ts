@@ -84,6 +84,16 @@ export function createAssistantReply(conversationId: string): Promise<MessageOut
 // persists the user's message itself (unlike createMessage, which callers use alongside
 // the manual image-gen flow) and classifies it into chat / an immediate local image job /
 // a pending paid action requiring explicit confirmation.
+// Longer than apiFetch's 12s default: a POSTER/INFOGRAPHIC classification with missing
+// fields can trigger up to 3 sequential Gemini calls on the backend (classify -> grounded
+// research -> re-classify -- see app/api/v1/chat_router.py:_research_augment), whose
+// worst-case budget is APP_GEMINI_REQUEST_TIMEOUT_S*2 + APP_GEMINI_RESEARCH_TIMEOUT_S
+// (default 30+30+20=80s server-side). 100s gives comfortable headroom above that so the
+// client doesn't abort a request the backend is still legitimately working on -- this was
+// observed in practice as a spurious "server took too long to respond" even though the
+// backend went on to finish and create the pending action successfully.
+const SMART_MESSAGE_TIMEOUT_MS = 100_000
+
 export function createSmartMessage(
   conversationId: string,
   payload: SmartMessageCreate,
@@ -91,6 +101,7 @@ export function createSmartMessage(
   return apiFetch<SmartMessageOut>(`/v1/conversations/${conversationId}/smart-message`, {
     method: 'POST',
     body: payload,
+    timeoutMs: SMART_MESSAGE_TIMEOUT_MS,
   })
 }
 

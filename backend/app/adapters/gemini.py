@@ -54,12 +54,21 @@ class GeminiTextClient:
     underlying model/client on purpose: "use the existing conversational LLM as the
     semantic router" per project instructions, rather than standing up a second model."""
 
-    def __init__(self, api_key: str, model: str, timeout_s: float = 30.0) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        timeout_s: float = 30.0,
+        research_timeout_s: float = 20.0,
+    ) -> None:
         from google import genai
 
         self._client = genai.Client(api_key=api_key)
         self._model = model
         self._timeout_s = timeout_s
+        # Separate, tighter budget for the best-effort grounded-search research call --
+        # see Settings.gemini_research_timeout_s for why this is its own knob.
+        self._research_timeout_s = research_timeout_s
 
     def _generate_sync(self, contents: list[dict]) -> str:
         response = self._client.models.generate_content(model=self._model, contents=contents)
@@ -183,7 +192,8 @@ class GeminiTextClient:
         )
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self._research_sync, contents), timeout=self._timeout_s
+                asyncio.to_thread(self._research_sync, contents),
+                timeout=self._research_timeout_s,
             )
         except Exception as exc:
             logger.warning("gemini research call failed: %s", type(exc).__name__)

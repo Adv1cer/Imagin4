@@ -364,7 +364,16 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
         const pendingId = nextId()
         setMessages((prev) => [
           ...prev,
-          { id: pendingId, role: 'assistant', text: '…', createdAt: new Date().toISOString() },
+          {
+            id: pendingId,
+            role: 'assistant',
+            // A POSTER/INFOGRAPHIC with missing details can trigger a background web
+            // search before replying (see createSmartMessage's comment on
+            // SMART_MESSAGE_TIMEOUT_MS) -- set expectations so a 20-60s wait doesn't
+            // look broken.
+            text: '… (อาจใช้เวลาถึง 1 นาทีถ้ามีการค้นหาข้อมูลเพิ่มเติมค่ะ)',
+            createdAt: new Date().toISOString(),
+          },
         ])
         try {
           const res = await createSmartMessage(convId, {

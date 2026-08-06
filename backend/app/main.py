@@ -94,6 +94,7 @@ def _build_state(app: FastAPI) -> None:
             api_key=settings.gemini_api_key,
             model=settings.gemini_text_model,
             timeout_s=settings.gemini_request_timeout_s,
+            research_timeout_s=settings.gemini_research_timeout_s,
         )
         logger.info(
             "gemini: wired for poster/infographic generation (model=%s) and chat (model=%s); "
