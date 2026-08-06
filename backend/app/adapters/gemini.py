@@ -85,30 +85,40 @@ class GeminiTextClient:
             raise RuntimeError(_sanitized_error(exc)) from exc
         return text or "(empty response)"
 
-    def _route_sync(self, contents: list[dict]) -> str:
+    def _route_sync(self, contents: list[dict], system_instruction: str) -> str:
         from google.genai import types
 
-        from app.domain.chat.routing import ROUTE_DECISION_JSON_SCHEMA, ROUTER_SYSTEM_INSTRUCTION
+        from app.domain.chat.routing import ROUTE_DECISION_JSON_SCHEMA
 
         response = self._client.models.generate_content(
             model=self._model,
             contents=contents,
             config=types.GenerateContentConfig(
-                system_instruction=ROUTER_SYSTEM_INSTRUCTION,
+                system_instruction=system_instruction,
                 response_mime_type="application/json",
                 response_schema=ROUTE_DECISION_JSON_SCHEMA,
             ),
         )
         return (getattr(response, "text", None) or "").strip()
 
-    async def route_intent(self, history: list[dict[str, str]]) -> dict:
+    async def route_intent(
+        self, history: list[dict[str, str]], extra_system_instruction: str | None = None
+    ) -> dict:
         """Classifies the latest turn in `history` (same chronological shape as
         complete()) into a raw dict the caller must validate via
         app.domain.chat.routing.parse_route_decision -- this method does NOT validate,
         it only gets Gemini's structured-output response back as parsed JSON. Raises on
         any failure (unreachable API, malformed JSON, timeout); callers must fail safe
         (fall back to CLARIFICATION), never treat an exception here as permission to
-        guess a tool -- see app/api/v1/chat_router.py."""
+        guess a tool -- see app/api/v1/chat_router.py.
+
+        `extra_system_instruction`, when given, REPLACES the default
+        ROUTER_SYSTEM_INSTRUCTION wholesale (callers pass the full instruction, e.g. via
+        app.domain.chat.routing.build_router_system_instruction_with_research) rather
+        than being appended here -- keeps this method dumb/pure plumbing and the actual
+        policy text auditable in one place (routing.py)."""
+        from app.domain.chat.routing import ROUTER_SYSTEM_INSTRUCTION
+
         contents = [
             {"role": _ROLE_TO_GEMINI[h["role"]], "parts": [{"text": h["text"]}]}
             for h in history
@@ -116,13 +126,67 @@ class GeminiTextClient:
         ]
         if not contents:
             raise RuntimeError("gemini_error:EmptyHistory")
+        system_instruction = extra_system_instruction or ROUTER_SYSTEM_INSTRUCTION
         try:
             raw_text = await asyncio.wait_for(
-                asyncio.to_thread(self._route_sync, contents), timeout=self._timeout_s
+                asyncio.to_thread(self._route_sync, contents, system_instruction),
+                timeout=self._timeout_s,
             )
             return json.loads(raw_text)
         except Exception as exc:
             logger.exception("gemini intent routing failed")
+            raise RuntimeError(_sanitized_error(exc)) from exc
+
+    def _research_sync(self, contents: list[dict]) -> str:
+        from google.genai import types
+
+        from app.domain.chat.routing import RESEARCH_SYSTEM_INSTRUCTION
+
+        # NOTE: response_schema/response_mime_type are deliberately NOT set here --
+        # Gemini's API rejects combining structured output with the google_search tool
+        # (verified against the Gemini API docs/forum, not assumed). This call returns
+        # free text; the caller re-classifies via a SEPARATE structured route_intent()
+        # call using build_router_system_instruction_with_research().
+        response = self._client.models.generate_content(
+            model=self._model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=RESEARCH_SYSTEM_INSTRUCTION,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            ),
+        )
+        return (getattr(response, "text", None) or "").strip()
+
+    async def research_missing_fields(
+        self, history: list[dict[str, str]], missing_fields: list[str]
+    ) -> str:
+        """Best-effort grounded web search for POSTER/INFOGRAPHIC missing_fields (e.g.
+        an event date the user didn't give but is publicly announced). Raises on any
+        failure -- callers MUST treat this as optional/non-fatal and fall back to asking
+        the user normally (see app/api/v1/chat_router.py), never block or fail the whole
+        request just because research didn't work. This never fills in facts on its
+        own -- it only returns findings text; a second, separately-validated
+        route_intent() call decides whether those findings actually resolve any
+        missing_fields."""
+        from app.domain.chat.routing import build_research_query
+
+        contents = [
+            {"role": _ROLE_TO_GEMINI[h["role"]], "parts": [{"text": h["text"]}]}
+            for h in history
+            if h["role"] in _ROLE_TO_GEMINI and h["text"].strip()
+        ]
+        contents.append(
+            {
+                "role": "user",
+                "parts": [{"text": build_research_query(history, missing_fields)}],
+            }
+        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._research_sync, contents), timeout=self._timeout_s
+            )
+        except Exception as exc:
+            logger.warning("gemini research call failed: %s", type(exc).__name__)
             raise RuntimeError(_sanitized_error(exc)) from exc
 
 

@@ -8,9 +8,12 @@ from __future__ import annotations
 import pytest
 
 from app.domain.chat.routing import (
+    ROUTER_SYSTEM_INSTRUCTION,
     Intent,
     ReasonCode,
     RouteDecisionError,
+    build_research_query,
+    build_router_system_instruction_with_research,
     compute_params_fingerprint,
     derive_billing_category,
     parse_route_decision,
@@ -101,3 +104,32 @@ def test_params_fingerprint_changes_with_content():
     a = compute_params_fingerprint({"prompt": "x"})
     b = compute_params_fingerprint({"prompt": "y"})
     assert a != b
+
+
+# --- Research-augmentation helpers (see app/api/v1/chat_router.py:_research_augment) ---
+
+
+def test_build_research_query_includes_latest_user_text_and_missing_fields():
+    history = [
+        {"role": "user", "text": "ทำโปสเตอร์ Open House"},
+        {"role": "assistant", "text": "ต้องการวันและสถานที่อะไรคะ?"},
+        {"role": "user", "text": "งาน Open House ของ UTCC"},
+    ]
+    query = build_research_query(history, ["event date", "location"])
+    assert "งาน Open House ของ UTCC" in query
+    assert "event date" in query
+    assert "location" in query
+
+
+def test_build_research_query_handles_empty_history():
+    query = build_research_query([], ["event date"])
+    assert "event date" in query
+
+
+def test_research_augmented_instruction_includes_original_rules_and_findings():
+    findings = "event date: 20 August 2026\nlocation: not found"
+    instruction = build_router_system_instruction_with_research(findings)
+    assert ROUTER_SYSTEM_INSTRUCTION in instruction
+    assert findings in instruction
+    # Must explicitly scope the findings as reference-only, not license to invent.
+    assert "never invent" in instruction.lower()

@@ -13,6 +13,8 @@ export function Composer({
   onEnterImageMode,
   onExitImageMode,
   onImageGenConfigChange,
+  agentSkills,
+  onAgentSkillsChange,
   disabled,
 }: {
   onSend: (text: string) => void
@@ -22,10 +24,15 @@ export function Composer({
   onEnterImageMode: () => void
   onExitImageMode: () => void
   onImageGenConfigChange: (config: ImageGenConfig) => void
+  // Controlled by ChatScreen (not local state) because handleSend needs to know which
+  // flow to use: ON routes plain text through the agentic router
+  // (POST .../smart-message); OFF falls back to the old direct chat-completion flow
+  // (POST .../messages + POST .../assistant-reply, no intent classification at all).
+  agentSkills: boolean
+  onAgentSkillsChange: (value: boolean) => void
   disabled: boolean
 }) {
   const [text, setText] = useState('')
-  const [agentSkills, setAgentSkills] = useState(false)
   const [toolsOpen, setToolsOpen] = useState(false)
   const [panelOpen, setPanelOpen] = useState(false)
 
@@ -83,7 +90,7 @@ export function Composer({
                 type="button"
                 role="switch"
                 aria-checked={agentSkills}
-                onClick={() => setAgentSkills((v) => !v)}
+                onClick={() => onAgentSkillsChange(!agentSkills)}
                 className={`relative h-5 w-9 rounded-full transition ${
                   agentSkills ? 'bg-gray-900' : 'bg-gray-300'
                 }`}
@@ -94,7 +101,16 @@ export function Composer({
                   }`}
                 />
               </button>
-              <span className="text-xs text-gray-500">Agent Skills</span>
+              <span
+                className="text-xs text-gray-500"
+                title={
+                  agentSkills
+                    ? 'On: messages are classified (chat / image / poster / infographic) and paid requests ask for confirmation.'
+                    : 'Off: messages go straight to the assistant with no classification or paid confirmation step.'
+                }
+              >
+                Agent Skills
+              </span>
             </label>
           </div>
 

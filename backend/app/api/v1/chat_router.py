@@ -56,6 +56,7 @@ from app.domain.chat.routing import (
     ReasonCode,
     RouteDecision,
     RouteDecisionError,
+    build_router_system_instruction_with_research,
     compute_params_fingerprint,
     parse_route_decision,
 )
@@ -153,6 +154,66 @@ async def _load_history(session: AsyncSession, conversation_id) -> list[dict[str
     ]
 
 
+async def _research_augment(
+    gemini, history: list[dict[str, str]], decision: RouteDecision, conv_id, user_id
+) -> RouteDecision:
+    """Best-effort: when a POSTER/INFOGRAPHIC classification has missing_fields, try a
+    grounded Google Search call to fill them in with REAL facts before falling back to
+    asking the user (per project instructions: "if information complete, do it; if not,
+    ask; then generate" -- this is the "try to complete it first" step). Two separate
+    Gemini calls are required here, not one, because the API rejects combining
+    response_schema with the google_search tool -- see routing.py's
+    RESEARCH_SYSTEM_INSTRUCTION docstring.
+
+    Never fatal: any failure in either call (unreachable API, timeout, malformed JSON)
+    just returns the original decision unchanged so the caller falls back to the normal
+    missing_fields -> clarification path exactly as if research had never been
+    attempted. Also refuses to accept a re-classification that changed `intent` -- the
+    research step may only ever narrow missing_fields for the SAME intent, never be the
+    mechanism that decides intent or billing category (that stays solely the job of the
+    original classification call)."""
+    if decision.intent not in (Intent.POSTER, Intent.INFOGRAPHIC) or not decision.missing_fields:
+        return decision
+    try:
+        findings = await gemini.research_missing_fields(history, decision.missing_fields)
+    except Exception as exc:
+        logger.info(
+            "chat_router: research call failed conv=%s user=%s error=%s (falling back to asking)",
+            conv_id,
+            user_id,
+            type(exc).__name__,
+        )
+        return decision
+    try:
+        instruction = build_router_system_instruction_with_research(findings)
+        raw = await gemini.route_intent(history, extra_system_instruction=instruction)
+        refined = parse_route_decision(raw)
+    except Exception as exc:
+        logger.info(
+            "chat_router: research re-classification failed conv=%s user=%s error=%s",
+            conv_id,
+            user_id,
+            type(exc).__name__,
+        )
+        return decision
+    if refined.intent != decision.intent:
+        logger.warning(
+            "chat_router: research step changed intent (%s -> %s) for conv=%s -- ignoring, "
+            "keeping original classification",
+            decision.intent.value,
+            refined.intent.value,
+            conv_id,
+        )
+        return decision
+    logger.info(
+        "chat_router: research reduced missing_fields %s -> %s for conv=%s",
+        decision.missing_fields,
+        refined.missing_fields,
+        conv_id,
+    )
+    return refined
+
+
 @router.post(
     "/conversations/{conversation_id}/smart-message",
     response_model=SmartMessageOut,
@@ -201,6 +262,8 @@ async def smart_message(
             type(exc).__name__,
         )
         decision = _fallback_clarification("llm_call_failed")
+
+    decision = await _research_augment(gemini, history, decision, conv.id, user.id)
 
     step = decide_next_step(decision)
     logger.info(

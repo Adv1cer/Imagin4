@@ -84,3 +84,69 @@ async def test_route_intent_raises_on_malformed_json(monkeypatch):
 
     with pytest.raises(RuntimeError):
         await client.route_intent([{"role": "user", "text": "hi"}])
+
+
+@pytest.mark.asyncio
+async def test_route_intent_uses_extra_system_instruction_when_given(monkeypatch):
+    captured: dict = {}
+
+    def fake_generate_content(*, model, contents, config):
+        captured["system_instruction"] = config.system_instruction
+        return SimpleNamespace(
+            text=(
+                '{"intent": "POSTER", "normalized_prompt": "x", "exact_text": [], '
+                '"missing_fields": [], "clarification_question": null, '
+                '"reason_code": "structured_promotional_layout"}'
+            )
+        )
+
+    client = _make_client()
+    monkeypatch.setattr(client._client.models, "generate_content", fake_generate_content)
+
+    await client.route_intent(
+        [{"role": "user", "text": "hi"}],
+        extra_system_instruction="CUSTOM INSTRUCTION WITH RESEARCH FINDINGS",
+    )
+    assert captured["system_instruction"] == "CUSTOM INSTRUCTION WITH RESEARCH FINDINGS"
+
+
+@pytest.mark.asyncio
+async def test_research_missing_fields_uses_google_search_tool_without_response_schema(
+    monkeypatch,
+):
+    """Gemini's API rejects combining response_schema with the google_search tool, so
+    this call must NOT set response_mime_type/response_schema -- only verified via the
+    Gemini API docs/forum, not assumed (see routing.py's RESEARCH_SYSTEM_INSTRUCTION
+    docstring)."""
+    captured: dict = {}
+
+    def fake_generate_content(*, model, contents, config):
+        captured["config"] = config
+        captured["contents"] = contents
+        return SimpleNamespace(text="event date: 20 August 2026\nlocation: not found")
+
+    client = _make_client()
+    monkeypatch.setattr(client._client.models, "generate_content", fake_generate_content)
+
+    result = await client.research_missing_fields(
+        [{"role": "user", "text": "ทำโปสเตอร์ Open House"}], ["event date", "location"]
+    )
+
+    assert "20 August 2026" in result
+    assert captured["config"].response_schema is None
+    assert captured["config"].response_mime_type is None
+    assert captured["config"].tools is not None
+    assert captured["config"].tools[0].google_search is not None
+
+
+@pytest.mark.asyncio
+async def test_research_missing_fields_raises_sanitized_error_on_failure(monkeypatch):
+    def fake_generate_content(*, model, contents, config):
+        raise RuntimeError("raw internal detail")
+
+    client = _make_client()
+    monkeypatch.setattr(client._client.models, "generate_content", fake_generate_content)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await client.research_missing_fields([{"role": "user", "text": "hi"}], ["event date"])
+    assert str(exc_info.value) == "gemini_error:RuntimeError"

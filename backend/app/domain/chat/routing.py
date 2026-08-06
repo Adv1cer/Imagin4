@@ -165,6 +165,64 @@ unsafe.
 """
 
 
+# Used for the optional best-effort research step (see
+# GeminiTextClient.research_missing_fields in app/adapters/gemini.py and
+# app/api/v1/chat_router.py): when a POSTER/INFOGRAPHIC has missing_fields, we first try
+# a real Google Search grounded call to find the facts before asking the user.
+#
+# NOTE: Gemini's API does not allow response_schema (structured output) and the
+# google_search tool in the same call (confirmed via the Gemini API docs/forum -- "Search
+# Grounding can't be used with JSON/YAML/XML mode"), so this has to be two separate calls:
+# 1) a free-text grounded search call using this instruction, then
+# 2) a second structured route_intent() call with the findings injected into the system
+#    instruction (see build_router_system_instruction_with_research below) to
+#    re-classify with the same strict schema.
+RESEARCH_SYSTEM_INSTRUCTION = """\
+You are a fact-finding assistant for a university image-generation chat tool. The user \
+asked for a POSTER or INFOGRAPHIC, but some required factual fields are still unknown. \
+Use Google Search to try to find REAL, CURRENT, VERIFIABLE facts for the missing fields \
+listed below, based on the conversation so far.
+
+Rules:
+- Only report facts you actually found via search, with enough specificity to be useful \
+(e.g. an exact date, not "sometime this year"). Never guess, estimate, or infer a fact \
+that search did not actually surface.
+- If you cannot find a confident, current answer for a field, say so explicitly for that \
+field instead of guessing.
+- Keep the answer short and factual: one line per missing field, in the format \
+"<field>: <finding or 'not found'>". Do not add commentary, opinions, or extra formatting.
+"""
+
+
+def build_research_query(history: list[dict[str, str]], missing_fields: list[str]) -> str:
+    """Builds the user-turn text for the research call from the missing_fields list --
+    kept as a pure function (no I/O) so it's unit-testable independently of the actual
+    Gemini call in app/adapters/gemini.py."""
+    latest_user_texts = [h["text"] for h in history if h.get("role") == "user"]
+    latest = latest_user_texts[-1] if latest_user_texts else ""
+    fields = "\n".join(f"- {f}" for f in missing_fields)
+    return (
+        f"Conversation context (latest user request): {latest}\n\n"
+        f"Missing fields to research:\n{fields}"
+    )
+
+
+def build_router_system_instruction_with_research(research_findings: str) -> str:
+    """Appends grounded research findings to the router's system instruction for a
+    re-classification call. The findings are clearly scoped as reference material the
+    model may use to fill previously-missing fields -- never as license to invent
+    anything beyond what's stated here."""
+    return (
+        ROUTER_SYSTEM_INSTRUCTION
+        + "\n\nVerified research findings (from a real Google Search call made for this "
+        "conversation -- use ONLY these to fill in previously-missing fields if they "
+        "directly answer them; if a finding says 'not found' or doesn't clearly answer "
+        "a field, keep that field in missing_fields; never invent beyond what's written "
+        "here):\n"
+        + research_findings
+    )
+
+
 def compute_params_fingerprint(params: dict) -> str:
     """Deterministic hash of a pending action's normalized parameters, used to detect
     "parameters changed since this confirmation was issued" (see PendingAction.
