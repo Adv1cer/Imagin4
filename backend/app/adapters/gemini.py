@@ -25,6 +25,7 @@ crash.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 
@@ -47,7 +48,11 @@ def _sanitized_error(exc: Exception) -> str:
 
 
 class GeminiTextClient:
-    """Real chat-completion backend for POST /v1/conversations/{id}/assistant-reply."""
+    """Real chat-completion backend for POST /v1/conversations/{id}/assistant-reply, and
+    (via route_intent) the semantic router for the agentic chat intent layer -- see
+    app/domain/chat/routing.py and app/api/v1/chat_router.py. Both use the same
+    underlying model/client on purpose: "use the existing conversational LLM as the
+    semantic router" per project instructions, rather than standing up a second model."""
 
     def __init__(self, api_key: str, model: str, timeout_s: float = 30.0) -> None:
         from google import genai
@@ -79,6 +84,46 @@ class GeminiTextClient:
             logger.exception("gemini text completion failed")
             raise RuntimeError(_sanitized_error(exc)) from exc
         return text or "(empty response)"
+
+    def _route_sync(self, contents: list[dict]) -> str:
+        from google.genai import types
+
+        from app.domain.chat.routing import ROUTE_DECISION_JSON_SCHEMA, ROUTER_SYSTEM_INSTRUCTION
+
+        response = self._client.models.generate_content(
+            model=self._model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=ROUTER_SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                response_schema=ROUTE_DECISION_JSON_SCHEMA,
+            ),
+        )
+        return (getattr(response, "text", None) or "").strip()
+
+    async def route_intent(self, history: list[dict[str, str]]) -> dict:
+        """Classifies the latest turn in `history` (same chronological shape as
+        complete()) into a raw dict the caller must validate via
+        app.domain.chat.routing.parse_route_decision -- this method does NOT validate,
+        it only gets Gemini's structured-output response back as parsed JSON. Raises on
+        any failure (unreachable API, malformed JSON, timeout); callers must fail safe
+        (fall back to CLARIFICATION), never treat an exception here as permission to
+        guess a tool -- see app/api/v1/chat_router.py."""
+        contents = [
+            {"role": _ROLE_TO_GEMINI[h["role"]], "parts": [{"text": h["text"]}]}
+            for h in history
+            if h["role"] in _ROLE_TO_GEMINI and h["text"].strip()
+        ]
+        if not contents:
+            raise RuntimeError("gemini_error:EmptyHistory")
+        try:
+            raw_text = await asyncio.wait_for(
+                asyncio.to_thread(self._route_sync, contents), timeout=self._timeout_s
+            )
+            return json.loads(raw_text)
+        except Exception as exc:
+            logger.exception("gemini intent routing failed")
+            raise RuntimeError(_sanitized_error(exc)) from exc
 
 
 class GeminiImageComfyUIClient:

@@ -11,7 +11,10 @@ import type {
   MessageCreate,
   MessageOut,
   MessagePage,
+  PendingActionOut,
   RegisterRequest,
+  SmartMessageCreate,
+  SmartMessageOut,
 } from './types'
 
 export function login(payload: LoginRequest): Promise<LoginResponse> {
@@ -73,6 +76,32 @@ export function createMessage(
 
 export function createAssistantReply(conversationId: string): Promise<MessageOut> {
   return apiFetch<MessageOut>(`/v1/conversations/${conversationId}/assistant-reply`, {
+    method: 'POST',
+  })
+}
+
+// Agentic intent-routing endpoints (backend/app/api/v1/chat_router.py). smart-message
+// persists the user's message itself (unlike createMessage, which callers use alongside
+// the manual image-gen flow) and classifies it into chat / an immediate local image job /
+// a pending paid action requiring explicit confirmation.
+export function createSmartMessage(
+  conversationId: string,
+  payload: SmartMessageCreate,
+): Promise<SmartMessageOut> {
+  return apiFetch<SmartMessageOut>(`/v1/conversations/${conversationId}/smart-message`, {
+    method: 'POST',
+    body: payload,
+  })
+}
+
+export function confirmPendingAction(pendingActionId: string): Promise<SmartMessageOut> {
+  return apiFetch<SmartMessageOut>(`/v1/pending-actions/${pendingActionId}/confirm`, {
+    method: 'POST',
+  })
+}
+
+export function cancelPendingAction(pendingActionId: string): Promise<PendingActionOut> {
+  return apiFetch<PendingActionOut>(`/v1/pending-actions/${pendingActionId}/cancel`, {
     method: 'POST',
   })
 }

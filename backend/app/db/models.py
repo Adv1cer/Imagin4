@@ -293,6 +293,71 @@ class Asset(Base):
     __table_args__ = (Index("ix_assets_owner", "owner_user_id", text("created_at desc")),)
 
 
+class PendingAction(Base):
+    """Server-side pending paid-action record for the agentic chat intent router (see
+    app/domain/chat/routing.py, app/api/v1/chat_router.py). POSTER/INFOGRAPHIC requests
+    never call the paid Gemini image API directly off an LLM routing decision -- they
+    create a row here first (status="pending") and only actually enqueue a generation
+    job once the authenticated owner confirms via POST /v1/pending-actions/{id}/confirm,
+    which does a conditional UPDATE ... WHERE status='pending' AND expires_at > now()
+    (see confirm_pending_action) so the transition is atomic: two concurrent confirm
+    clicks/retries can only ever have one winner, and job admission itself is additionally
+    idempotency-keyed off this row's id as defense in depth."""
+
+    __tablename__ = "pending_actions"
+
+    id: Mapped[uuid.UUID] = UUID_PK()
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
+    )
+    # "poster" | "infographic" -- display/audit distinction only; both currently execute
+    # through the same allowlisted "poster_infographic" workflow (backend=gemini) since
+    # that's the one real pipeline this repo has for paid image generation today. See
+    # app/domain/jobs/workflow_registry.py.
+    action_type: Mapped[str] = mapped_column(String, nullable=False)
+    # Always "paid" today (derived server-side by
+    # app.domain.chat.routing.derive_billing_category, never trusted from the LLM) --
+    # stored explicitly so it's visible in an audit query without re-deriving it, and so
+    # a future local-billing pending-action type doesn't require a schema change.
+    billing_category: Mapped[str] = mapped_column(String, nullable=False, server_default="paid")
+    normalized_params: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # sha256 of normalized_params (see compute_params_fingerprint) -- confirm() re-derives
+    # this from the row's own stored params, so this column is mostly a defensive
+    # assertion aid / audit trail rather than load-bearing on its own.
+    params_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, server_default="pending")
+    expires_at: Mapped[datetime] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = TS()
+    consumed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    # The in-memory JobQueue's job id once execution actually starts (see
+    # app/domain/jobs/admission.py) -- plain string, not a FK, because the in-memory
+    # queue's job ids are not currently backed by rows in `generation_jobs` (that table
+    # exists for the future Postgres-backed queue; see README "Known limitations").
+    # Populated atomically alongside status="confirmed" so a replayed confirm() request
+    # can return the same job instead of erroring or double-enqueueing.
+    resulting_job_id: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "action_type in ('poster','infographic')", name="ck_pending_actions_action_type"
+        ),
+        CheckConstraint("billing_category in ('local','paid')", name="ck_pending_actions_billing"),
+        CheckConstraint(
+            "status in ('pending','confirmed','cancelled','expired')",
+            name="ck_pending_actions_status",
+        ),
+        Index("ix_pending_actions_user_status", "user_id", "status"),
+        Index(
+            "ix_pending_actions_conversation_pending",
+            "conversation_id",
+            postgresql_where=text("status = 'pending'"),
+        ),
+    )
+
+
 class SchedulerLease(Base):
     """Small fairness/coordination table so multiple scheduler replicas can safely
     round-robin admission without a distributed lock service."""

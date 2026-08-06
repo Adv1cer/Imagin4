@@ -4,16 +4,18 @@ import { MessageBubble } from '../components/MessageBubble'
 import { Toasts } from '../components/Toasts'
 import { useToasts } from '../hooks/useToasts'
 import {
-  createAssistantReply,
+  cancelPendingAction,
+  confirmPendingAction,
   createConversation,
   createGeneration,
   createMessage,
+  createSmartMessage,
   getJob,
   listMessages,
 } from '../api/endpoints'
 import { ApiError } from '../api/client'
 import type { MeResponse } from '../api/types'
-import type { UiMessage } from '../types/chat'
+import type { PendingActionState, UiMessage } from '../types/chat'
 import { DEFAULT_IMAGE_GEN_CONFIG, workflowNameFor } from '../types/imageGen'
 import type { ImageGenConfig } from '../types/imageGen'
 
@@ -114,6 +116,106 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
     pollTimers.current[jobId] = setTimeout(tick, 1500)
   }, [showToast])
 
+  const handleConfirmPendingAction = useCallback(
+    async (messageId: string, pendingActionId: string) => {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === messageId && m.pendingAction
+            ? { ...m, pendingAction: { ...m.pendingAction, busy: true, errorMessage: null } }
+            : m,
+        ),
+      )
+      try {
+        const res = await confirmPendingAction(pendingActionId)
+        if (res.type === 'image_job' && res.job) {
+          const job = res.job
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === messageId
+                ? {
+                    ...m,
+                    text: 'กำลังสร้างภาพ…',
+                    pendingAction: m.pendingAction
+                      ? { ...m.pendingAction, status: 'confirmed', busy: false }
+                      : m.pendingAction,
+                    imageJob: { jobId: job.id, state: 'queued' },
+                  }
+                : m,
+            ),
+          )
+          pollJob(job.id, messageId)
+        } else {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === messageId && m.pendingAction
+                ? {
+                    ...m,
+                    pendingAction: {
+                      ...m.pendingAction,
+                      busy: false,
+                      errorMessage: 'Unexpected response from server.',
+                    },
+                  }
+                : m,
+            ),
+          )
+        }
+      } catch (err) {
+        const msg =
+          err instanceof ApiError ? err.message : 'Failed to confirm — please try again.'
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === messageId && m.pendingAction
+              ? { ...m, pendingAction: { ...m.pendingAction, busy: false, errorMessage: msg } }
+              : m,
+          ),
+        )
+        showToast(msg, 'error')
+      }
+    },
+    [pollJob, showToast],
+  )
+
+  const handleCancelPendingAction = useCallback(
+    async (messageId: string, pendingActionId: string) => {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === messageId && m.pendingAction
+            ? { ...m, pendingAction: { ...m.pendingAction, busy: true, errorMessage: null } }
+            : m,
+        ),
+      )
+      try {
+        const pa = await cancelPendingAction(pendingActionId)
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === messageId && m.pendingAction
+              ? {
+                  ...m,
+                  pendingAction: {
+                    ...m.pendingAction,
+                    status: pa.status as PendingActionState['status'],
+                    busy: false,
+                  },
+                }
+              : m,
+          ),
+        )
+      } catch (err) {
+        const msg = err instanceof ApiError ? err.message : 'Failed to cancel — please try again.'
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === messageId && m.pendingAction
+              ? { ...m, pendingAction: { ...m.pendingAction, busy: false, errorMessage: msg } }
+              : m,
+          ),
+        )
+        showToast(msg, 'error')
+      }
+    },
+    [showToast],
+  )
+
   async function handleSend(text: string) {
     setBanner(null)
     const userMessage: UiMessage = {
@@ -128,24 +230,22 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
     try {
       const convId = await ensureConversation()
 
-      // Persist the user's message for real, and WAIT for it to land before doing
-      // anything else. This must be awaited (previously wasn't, which was a real bug):
-      // POST .../assistant-reply reads message history straight from the database, so
-      // firing it before this insert commits raced and could return "conversation has
-      // no messages to reply to" even though the user's message was clearly sent.
-      // Still non-fatal on failure -- the message still shows locally, it just won't
-      // survive a reload -- but we no longer race the two requests against each other.
-      try {
-        await createMessage(convId, {
-          role: 'user',
-          content: { text },
-          client_message_id: userMessage.id,
-        })
-      } catch {
-        showToast('Message sent, but failed to save to history.', 'error')
-      }
-
       if (imageMode) {
+        // Manual "Tools > Image generation" flow: persist the user's message for real
+        // and WAIT for it to land before doing anything else (POST /v1/generations
+        // doesn't touch chat history, but keeping this ordering avoids surprises if the
+        // conversation is reloaded mid-flight). Still non-fatal on failure -- the
+        // message still shows locally, it just won't survive a reload.
+        try {
+          await createMessage(convId, {
+            role: 'user',
+            content: { text },
+            client_message_id: userMessage.id,
+          })
+        } catch {
+          showToast('Message sent, but failed to save to history.', 'error')
+        }
+
         setImageMode(false)
         const config = imageGenConfig
         const workflowName = workflowNameFor(config.kind)
@@ -208,22 +308,78 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
           }),
         )
       } else {
-        // Real reply via Gemini (backend/app/adapters/gemini.py), using the full
-        // persisted conversation history -- see POST .../assistant-reply. The backend
-        // both generates AND persists this message itself, so we don't call
-        // createMessage() again here (that would double-save it).
+        // Agentic routing (backend/app/api/v1/chat_router.py): the backend persists the
+        // user's message itself, classifies intent via the same Gemini model, and
+        // returns exactly one of a chat reply, an immediately-enqueued local image job
+        // (GENERAL_IMAGE), or a paid PendingAction awaiting explicit confirmation
+        // (POSTER/INFOGRAPHIC). We must NOT also call createMessage() here -- the
+        // backend already persisted it (that would double-save it).
         const pendingId = nextId()
         setMessages((prev) => [
           ...prev,
           { id: pendingId, role: 'assistant', text: '…', createdAt: new Date().toISOString() },
         ])
         try {
-          const reply = await createAssistantReply(convId)
-          const replyText =
-            typeof reply.content?.text === 'string' ? reply.content.text : '(empty response)'
-          setMessages((prev) =>
-            prev.map((m) => (m.id === pendingId ? { ...m, id: reply.id, text: replyText } : m)),
-          )
+          const res = await createSmartMessage(convId, {
+            text,
+            client_message_id: userMessage.id,
+          })
+          if (res.type === 'chat') {
+            const replyText =
+              res.assistant_message && typeof res.assistant_message.content?.text === 'string'
+                ? (res.assistant_message.content.text as string)
+                : '(empty response)'
+            const replyId = res.assistant_message?.id ?? pendingId
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === pendingId ? { ...m, id: replyId, text: replyText } : m,
+              ),
+            )
+          } else if (res.type === 'image_job' && res.job) {
+            const job = res.job
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === pendingId
+                  ? {
+                      ...m,
+                      text: `Generating image for: "${text}"`,
+                      imageJob: { jobId: job.id, state: 'queued' },
+                    }
+                  : m,
+              ),
+            )
+            pollJob(job.id, pendingId)
+          } else if (res.type === 'confirmation_required' && res.pending_action) {
+            const pa = res.pending_action
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === pendingId
+                  ? {
+                      ...m,
+                      text:
+                        pa.action_type === 'poster'
+                          ? 'ต้องการยืนยันก่อนสร้างโปสเตอร์นี้ค่ะ (มีค่าใช้จ่าย)'
+                          : 'ต้องการยืนยันก่อนสร้างอินโฟกราฟิกนี้ค่ะ (มีค่าใช้จ่าย)',
+                      pendingAction: {
+                        id: pa.id,
+                        actionType: pa.action_type,
+                        billingCategory: pa.billing_category,
+                        normalizedPrompt: pa.normalized_prompt,
+                        exactText: pa.exact_text,
+                        status: pa.status,
+                        expiresAt: pa.expires_at,
+                      },
+                    }
+                  : m,
+              ),
+            )
+          } else {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === pendingId ? { ...m, text: 'Unexpected response from server.' } : m,
+              ),
+            )
+          }
         } catch (err) {
           const msg =
             err instanceof ApiError && err.status === 503
@@ -281,7 +437,12 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
         ) : (
           <div className="mx-auto flex max-w-3xl flex-col gap-3">
             {messages.map((m) => (
-              <MessageBubble key={m.id} message={m} />
+              <MessageBubble
+                key={m.id}
+                message={m}
+                onConfirmPendingAction={handleConfirmPendingAction}
+                onCancelPendingAction={handleCancelPendingAction}
+              />
             ))}
           </div>
         )}

@@ -1,0 +1,103 @@
+"""Unit tests for app/domain/chat/routing.py: the strict RouteDecision schema, its
+validation, billing derivation, and params-fingerprinting. No LLM call, no DB -- purely
+tests that malformed/untrusted LLM output is rejected the way the backend-authoritative
+design requires."""
+
+from __future__ import annotations
+
+import pytest
+
+from app.domain.chat.routing import (
+    Intent,
+    ReasonCode,
+    RouteDecisionError,
+    compute_params_fingerprint,
+    derive_billing_category,
+    parse_route_decision,
+)
+
+VALID_RAW = {
+    "intent": "GENERAL_IMAGE",
+    "normalized_prompt": "a cat wearing a spacesuit",
+    "exact_text": [],
+    "missing_fields": [],
+    "clarification_question": None,
+    "reason_code": "general_visual_request",
+}
+
+
+def test_parse_valid_decision():
+    decision = parse_route_decision(VALID_RAW)
+    assert decision.intent == Intent.GENERAL_IMAGE
+    assert decision.reason_code == ReasonCode.GENERAL_VISUAL_REQUEST
+
+
+def test_parse_rejects_non_dict():
+    with pytest.raises(RouteDecisionError):
+        parse_route_decision("not a dict")
+    with pytest.raises(RouteDecisionError):
+        parse_route_decision(["a", "list"])
+    with pytest.raises(RouteDecisionError):
+        parse_route_decision(None)
+
+
+def test_parse_rejects_unknown_intent():
+    bad = {**VALID_RAW, "intent": "DELETE_ALL_USERS"}
+    with pytest.raises(RouteDecisionError):
+        parse_route_decision(bad)
+
+
+def test_parse_rejects_unknown_reason_code():
+    bad = {**VALID_RAW, "reason_code": "the model felt like it"}
+    with pytest.raises(RouteDecisionError):
+        parse_route_decision(bad)
+
+
+def test_parse_rejects_missing_required_field():
+    bad = dict(VALID_RAW)
+    del bad["normalized_prompt"]
+    with pytest.raises(RouteDecisionError):
+        parse_route_decision(bad)
+
+
+def test_parse_rejects_extra_fields_like_hidden_reasoning():
+    """Guards against the model (or a prompt-injected message) smuggling extra keys such
+    as a free-form "reasoning" or "chain_of_thought" field -- the schema must not
+    request or store that (see project instructions)."""
+    bad = {**VALID_RAW, "chain_of_thought": "step 1: the user probably wants..."}
+    with pytest.raises(RouteDecisionError):
+        parse_route_decision(bad)
+
+
+def test_parse_rejects_wrong_type_for_list_field():
+    bad = {**VALID_RAW, "exact_text": "should be a list not a string"}
+    with pytest.raises(RouteDecisionError):
+        parse_route_decision(bad)
+
+
+@pytest.mark.parametrize(
+    "intent,expected",
+    [
+        (Intent.CHAT, "local"),
+        (Intent.CLARIFICATION, "local"),
+        (Intent.GENERAL_IMAGE, "local"),
+        (Intent.POSTER, "paid"),
+        (Intent.INFOGRAPHIC, "paid"),
+    ],
+)
+def test_derive_billing_category_is_server_owned_not_model_reported(intent, expected):
+    """The whole point: billing must be a pure function of the validated intent, never
+    read off anything the model said about cost/confidence."""
+    assert derive_billing_category(intent) == expected
+
+
+def test_params_fingerprint_deterministic_and_order_independent():
+    a = compute_params_fingerprint({"prompt": "x", "exact_text": ["A", "B"]})
+    b = compute_params_fingerprint({"exact_text": ["A", "B"], "prompt": "x"})
+    assert a == b
+
+
+def test_params_fingerprint_changes_with_content():
+    a = compute_params_fingerprint({"prompt": "x"})
+    b = compute_params_fingerprint({"prompt": "y"})
+    assert a != b

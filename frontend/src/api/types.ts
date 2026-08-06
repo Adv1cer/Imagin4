@@ -77,6 +77,33 @@ export interface GenerationOut {
   kind: string
 }
 
+export interface SmartMessageCreate {
+  text: string
+  client_message_id?: string | null
+}
+
+export interface PendingActionOut {
+  id: string
+  action_type: string
+  billing_category: string
+  normalized_prompt: string
+  exact_text: string[]
+  status: 'pending' | 'confirmed' | 'cancelled' | 'expired' | string
+  expires_at: string
+}
+
+// Discriminated by `type`: "chat" carries assistant_message, "image_job" carries job,
+// "confirmation_required" carries pending_action. Mirrors backend
+// app/api/v1/chat_router.py:SmartMessageOut exactly (including the flat-not-a-union
+// shape, kept consistent with GenerationOut/JobOut/MessageOut elsewhere in this file).
+export interface SmartMessageOut {
+  type: 'chat' | 'image_job' | 'confirmation_required' | string
+  user_message: MessageOut
+  assistant_message?: MessageOut | null
+  job?: GenerationOut | null
+  pending_action?: PendingActionOut | null
+}
+
 export interface JobOut {
   id: string
   state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | string

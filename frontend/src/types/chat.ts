@@ -14,10 +14,29 @@ export interface ImageJobState {
   objectKey?: string | null
 }
 
+// A POSTER/INFOGRAPHIC request the agentic router classified but has NOT executed yet --
+// the backend created a server-side PendingAction (paid, user-bound, expiring,
+// single-use) and is waiting for an explicit Confirm click before calling the paid API.
+// See backend/app/api/v1/chat_router.py and src/components/PendingActionCard.tsx.
+export interface PendingActionState {
+  id: string
+  actionType: string
+  billingCategory: string
+  normalizedPrompt: string
+  exactText: string[]
+  status: 'pending' | 'confirmed' | 'cancelled' | 'expired' | string
+  expiresAt: string
+  // Client-only UI state -- never sent to the backend. `busy` guards against
+  // double-submission while a confirm/cancel request is in flight.
+  busy?: boolean
+  errorMessage?: string | null
+}
+
 export interface UiMessage {
   id: string
   role: 'user' | 'assistant' | 'system'
   text: string
   createdAt: string
   imageJob?: ImageJobState
+  pendingAction?: PendingActionState
 }

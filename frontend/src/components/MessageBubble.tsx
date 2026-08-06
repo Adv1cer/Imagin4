@@ -1,4 +1,5 @@
 import { API_BASE_URL } from '../api/client'
+import { PendingActionCard } from './PendingActionCard'
 import type { UiMessage } from '../types/chat'
 
 function ImageJobStatus({ job }: { job: NonNullable<UiMessage['imageJob']> }) {
@@ -41,7 +42,15 @@ function ImageJobStatus({ job }: { job: NonNullable<UiMessage['imageJob']> }) {
   return null
 }
 
-export function MessageBubble({ message }: { message: UiMessage }) {
+export function MessageBubble({
+  message,
+  onConfirmPendingAction,
+  onCancelPendingAction,
+}: {
+  message: UiMessage
+  onConfirmPendingAction?: (messageId: string, pendingActionId: string) => void
+  onCancelPendingAction?: (messageId: string, pendingActionId: string) => void
+}) {
   const isUser = message.role === 'user'
   return (
     <div className={`flex w-full ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -56,6 +65,13 @@ export function MessageBubble({ message }: { message: UiMessage }) {
       >
         <div className="whitespace-pre-wrap">{message.text}</div>
         {message.imageJob && <ImageJobStatus job={message.imageJob} />}
+        {message.pendingAction && !message.imageJob && (
+          <PendingActionCard
+            pendingAction={message.pendingAction}
+            onConfirm={() => onConfirmPendingAction?.(message.id, message.pendingAction!.id)}
+            onCancel={() => onCancelPendingAction?.(message.id, message.pendingAction!.id)}
+          />
+        )}
       </div>
     </div>
   )

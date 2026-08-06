@@ -22,7 +22,7 @@ from app.adapters.comfyui.live import LiveComfyUIClient
 from app.adapters.queue import InMemoryJobQueue
 from app.adapters.routing_comfyui import CompositeComfyUIClient
 from app.adapters.storage import InMemoryObjectStorage
-from app.api.v1 import auth, conversations, generations, health, jobs, metrics
+from app.api.v1 import auth, chat_router, conversations, generations, health, jobs, metrics
 from app.core.config import get_settings
 from app.db.base import get_engine
 from app.services.reconciler import Reconciler
@@ -165,6 +165,7 @@ def create_app() -> FastAPI:
     app.include_router(conversations.router, prefix="/v1")
     app.include_router(generations.router, prefix="/v1")
     app.include_router(jobs.router, prefix="/v1")
+    app.include_router(chat_router.router, prefix="/v1")
     app.include_router(metrics.router)  # unprefixed: GET /metrics
 
     return app
