@@ -489,6 +489,13 @@ async def confirm_pending_action(
             inputs={
                 "prompt": row.normalized_params.get("prompt", ""),
                 "exact_text": row.normalized_params.get("exact_text", []),
+                # Distinct from the job's own "kind" (== workflow_name, always
+                # "poster_infographic" for both action types since they share one
+                # workflow -- see _WORKFLOW_FOR_ACTION_TYPE). Lets
+                # GeminiImageComfyUIClient.submit()'s prompt-design step phrase its
+                # instruction as "a poster"/"an infographic" instead of the generic
+                # workflow name.
+                "action_type": row.action_type,
             },
             # Idempotency key derived from the pending action's OWN id (not a
             # client-supplied header) -- this is what makes the endpoint idempotent

@@ -12,6 +12,8 @@ from app.domain.chat.routing import (
     Intent,
     ReasonCode,
     RouteDecisionError,
+    build_prompt_design_instruction,
+    build_prompt_design_user_message,
     build_research_query,
     build_router_system_instruction_with_research,
     compute_params_fingerprint,
@@ -133,3 +135,28 @@ def test_research_augmented_instruction_includes_original_rules_and_findings():
     assert findings in instruction
     # Must explicitly scope the findings as reference-only, not license to invent.
     assert "never invent" in instruction.lower()
+
+
+# --- Prompt-design helpers (see GeminiTextClient.design_image_prompt) ---
+
+
+def test_prompt_design_instruction_mentions_the_kind_and_forbids_inventing_facts():
+    instruction = build_prompt_design_instruction("infographic")
+    assert "infographic" in instruction
+    assert "verbatim" in instruction.lower()
+    assert "invent" in instruction.lower()
+
+
+def test_prompt_design_user_message_includes_prompt_and_exact_text():
+    message = build_prompt_design_user_message(
+        "Open House poster", ["เด็ก 69 START UP", "แจกฟรี iPad"]
+    )
+    assert "Open House poster" in message
+    assert "เด็ก 69 START UP" in message
+    assert "แจกฟรี iPad" in message
+
+
+def test_prompt_design_user_message_handles_no_exact_text():
+    message = build_prompt_design_user_message("just a prompt", [])
+    assert "just a prompt" in message
+    assert "(none)" in message

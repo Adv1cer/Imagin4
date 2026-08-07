@@ -223,6 +223,49 @@ def build_router_system_instruction_with_research(research_findings: str) -> str
     )
 
 
+# Used by GeminiTextClient.design_image_prompt (app/adapters/gemini.py), a best-effort
+# step that runs before the actual image-generation call: have the text model act as a
+# prompt engineer and write a detailed, well-composed image-generation prompt (layout,
+# color, typography direction) instead of sending the router's short normalized_prompt
+# straight to the image model as-is. Never a source of new facts -- explicitly forbidden
+# from inventing anything beyond what it's given, and required to preserve exact_text
+# verbatim, same invariant as the router itself.
+PROMPT_DESIGN_SYSTEM_INSTRUCTION_TEMPLATE = """\
+You are an expert prompt engineer for an AI image generation model that creates {kind}s. \
+Given a content brief and a list of text that MUST appear verbatim in the final image, \
+write a single, detailed image-generation prompt that will produce a visually excellent, \
+professional result.
+
+Your prompt must:
+- Describe a clear layout and visual hierarchy appropriate for a {kind} (headline \
+placement, supporting text, imagery, logo/QR placement as relevant).
+- Specify a coherent color palette, typography style, and overall visual mood that fits \
+the subject matter.
+- Explicitly instruct that the given text must be rendered exactly as provided, \
+verbatim, without translation, paraphrasing, or alteration.
+- NOT invent any factual content (dates, prices, names, statistics, organizations) \
+beyond what is given to you -- only add visual/design direction, never new facts.
+- Be written as plain natural-language prompt text (a paragraph or a few short \
+paragraphs) -- not a list, not JSON, not markdown -- since it is sent directly to the \
+image model.
+
+Respond with ONLY the final image-generation prompt text. No preamble, no explanation, \
+no surrounding quotation marks.
+"""
+
+
+def build_prompt_design_instruction(kind: str) -> str:
+    return PROMPT_DESIGN_SYSTEM_INSTRUCTION_TEMPLATE.format(kind=kind)
+
+
+def build_prompt_design_user_message(prompt: str, exact_text: list[str]) -> str:
+    exact_lines = "\n".join(f"- {t}" for t in exact_text) if exact_text else "(none)"
+    return (
+        f"Content brief: {prompt}\n\n"
+        f"Text that must appear verbatim in the image:\n{exact_lines}"
+    )
+
+
 def compute_params_fingerprint(params: dict) -> str:
     """Deterministic hash of a pending action's normalized parameters, used to detect
     "parameters changed since this confirmation was issued" (see PendingAction.

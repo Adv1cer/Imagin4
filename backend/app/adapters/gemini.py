@@ -47,6 +47,42 @@ def _sanitized_error(exc: Exception) -> str:
     return f"gemini_error:{type(exc).__name__}"
 
 
+def _exact_text_block(exact_text: list[str]) -> str:
+    """The verbatim-rendering instruction block appended to whatever base prompt is
+    used, whether that's the plain normalized_prompt (_build_image_prompt) or a
+    designed prompt from GeminiTextClient.design_image_prompt. Deliberately applied
+    BOTH places (belt-and-suspenders): the design step's own system instruction already
+    asks it to preserve exact_text, but appending this explicit block again afterward
+    guarantees the literal text survives even if that instruction-following slips --
+    exactly the class of bug this function exists to prevent from recurring."""
+    if not exact_text:
+        return ""
+    exact_lines = "\n".join(f"- {t}" for t in exact_text)
+    return (
+        "\n\nThe generated image MUST render the following text exactly as written, "
+        "verbatim -- do not translate, paraphrase, omit, or alter it in any way:\n"
+        f"{exact_lines}"
+    )
+
+
+def _build_image_prompt(workflow_payload: dict) -> str:
+    """Builds the actual text sent to Gemini's image model from a job's input_payload.
+
+    BUG FIXED HERE: this previously only read workflow_payload["prompt"] and silently
+    dropped "exact_text" entirely -- so a POSTER/INFOGRAPHIC's literal copy (campaign
+    name, offer details, dates, contact info -- exactly the fields the chat router's
+    RouteDecision.exact_text and the research step exist to get right, see
+    app/domain/chat/routing.py) never actually reached the image generation call. The
+    model then had nothing to go on but a generic normalized_prompt and produced a
+    generic, factually-wrong poster even when routing correctly extracted the real
+    details. Pure function (no I/O) so this is unit-testable without hitting the SDK."""
+    prompt = str(workflow_payload.get("prompt") or "").strip()
+    exact_text = [
+        t.strip() for t in (workflow_payload.get("exact_text") or []) if isinstance(t, str) and t.strip()
+    ]
+    return prompt + _exact_text_block(exact_text)
+
+
 class GeminiTextClient:
     """Real chat-completion backend for POST /v1/conversations/{id}/assistant-reply, and
     (via route_intent) the semantic router for the agentic chat intent layer -- see
@@ -199,6 +235,49 @@ class GeminiTextClient:
             logger.warning("gemini research call failed: %s", type(exc).__name__)
             raise RuntimeError(_sanitized_error(exc)) from exc
 
+    def _design_prompt_sync(self, contents: list[dict], kind: str) -> str:
+        from google.genai import types
+
+        from app.domain.chat.routing import build_prompt_design_instruction
+
+        # Plain text, no schema, no tools -- fast, ordinary generate_content call.
+        response = self._client.models.generate_content(
+            model=self._model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=build_prompt_design_instruction(kind)
+            ),
+        )
+        return (getattr(response, "text", None) or "").strip()
+
+    async def design_image_prompt(
+        self, prompt: str, exact_text: list[str], kind: str = "poster"
+    ) -> str:
+        """Best-effort: have the text model act as a prompt engineer and write a
+        detailed, well-composed image-generation prompt (layout, color, typography
+        direction) before the actual image call, instead of sending the router's short
+        normalized_prompt straight through. See
+        app.adapters.gemini.GeminiImageComfyUIClient.submit(), which calls this and
+        falls back to the plain _build_image_prompt() on any failure -- this step is
+        purely a quality enhancement, never a hard dependency, and never a source of new
+        facts (the system instruction explicitly forbids inventing content)."""
+        from app.domain.chat.routing import build_prompt_design_user_message
+
+        contents = [
+            {
+                "role": "user",
+                "parts": [{"text": build_prompt_design_user_message(prompt, exact_text)}],
+            }
+        ]
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._design_prompt_sync, contents, kind),
+                timeout=self._timeout_s,
+            )
+        except Exception as exc:
+            logger.warning("gemini prompt-design call failed: %s", type(exc).__name__)
+            raise RuntimeError(_sanitized_error(exc)) from exc
+
 
 class GeminiImageComfyUIClient:
     """Drop-in replacement for MockComfyUIClient/a real ComfyUI adapter: implements the
@@ -213,7 +292,12 @@ class GeminiImageComfyUIClient:
     """
 
     def __init__(
-        self, api_key: str, model: str, storage: ObjectStorage, timeout_s: float = 30.0
+        self,
+        api_key: str,
+        model: str,
+        storage: ObjectStorage,
+        timeout_s: float = 30.0,
+        prompt_designer=None,
     ) -> None:
         from google import genai
 
@@ -222,6 +306,13 @@ class GeminiImageComfyUIClient:
         self._storage = storage
         self._timeout_s = timeout_s
         self._results: dict[str, ComfyStatus] = {}
+        # Optional async callable (prompt: str, exact_text: list[str], kind: str) -> str
+        # -- normally GeminiTextClient.design_image_prompt, wired from app/main.py. Runs
+        # before every generation to turn the router's short prompt into a detailed,
+        # well-composed image-generation prompt. Best-effort: submit() falls back to
+        # _build_image_prompt() (which still preserves exact_text) if this is None, or
+        # if the call fails for any reason.
+        self._prompt_designer = prompt_designer
 
     def _generate_sync(self, prompt_text: str) -> tuple[str, bytes]:
         from google.genai import types
@@ -243,13 +334,43 @@ class GeminiImageComfyUIClient:
 
     async def submit(self, workflow_payload: dict, kind: str | None = None) -> ComfySubmitResult:
         prompt_id = str(uuid.uuid4())
-        prompt_text = str(workflow_payload.get("prompt") or "").strip()
+        base_prompt = str(workflow_payload.get("prompt") or "").strip()
+        exact_text = [
+            t.strip() for t in (workflow_payload.get("exact_text") or []) if isinstance(t, str) and t.strip()
+        ]
 
-        if not prompt_text:
+        if not base_prompt and not exact_text:
             self._results[prompt_id] = ComfyStatus(
                 prompt_id=prompt_id, state="failed", error="empty_prompt"
             )
             return ComfySubmitResult(prompt_id=prompt_id)
+
+        # "kind" (== job.kind == workflow_name, e.g. "poster_infographic") is a workflow
+        # identifier, not a natural-language label -- prefer the job's own
+        # "action_type" input ("poster"/"infographic") for phrasing the design
+        # instruction, falling back to "poster" if genuinely absent (e.g. an older job
+        # enqueued before this field existed).
+        design_kind = str(workflow_payload.get("action_type") or "poster")
+
+        # Baseline: prompt + a verbatim-text instruction block (always preserves
+        # exact_text even if the design step below is unavailable or fails).
+        prompt_text = base_prompt
+        if self._prompt_designer is not None:
+            try:
+                designed = await self._prompt_designer(base_prompt, exact_text, design_kind)
+                if designed and designed.strip():
+                    prompt_text = designed.strip()
+            except Exception as exc:
+                logger.info(
+                    "gemini image: prompt-design step failed (%s), using baseline prompt "
+                    "prompt_id=%s",
+                    type(exc).__name__,
+                    prompt_id,
+                )
+        # Applied unconditionally (whether or not the design step ran) -- see
+        # _exact_text_block's docstring for why this is deliberately redundant with what
+        # the design step is separately instructed to do.
+        prompt_text = prompt_text + _exact_text_block(exact_text)
 
         try:
             mime, data = await asyncio.wait_for(

@@ -84,17 +84,24 @@ def _build_state(app: FastAPI) -> None:
         # to the right one based on its workflow.
         from app.adapters.gemini import GeminiImageComfyUIClient, GeminiTextClient
 
-        gemini_image_client = GeminiImageComfyUIClient(
-            api_key=settings.gemini_api_key,
-            model=settings.gemini_image_model,
-            storage=app.state.storage,
-            timeout_s=settings.gemini_image_request_timeout_s,
-        )
+        # Text client constructed first: the image client uses its design_image_prompt
+        # method as a best-effort "prompt engineer" step (see
+        # GeminiImageComfyUIClient.__init__'s prompt_designer param) that runs before
+        # every generation to turn the router's short prompt into a detailed,
+        # well-composed image-generation prompt instead of sending it to the image
+        # model as-is.
         app.state.gemini_text_client = GeminiTextClient(
             api_key=settings.gemini_api_key,
             model=settings.gemini_text_model,
             timeout_s=settings.gemini_request_timeout_s,
             research_timeout_s=settings.gemini_research_timeout_s,
+        )
+        gemini_image_client = GeminiImageComfyUIClient(
+            api_key=settings.gemini_api_key,
+            model=settings.gemini_image_model,
+            storage=app.state.storage,
+            timeout_s=settings.gemini_image_request_timeout_s,
+            prompt_designer=app.state.gemini_text_client.design_image_prompt,
         )
         logger.info(
             "gemini: wired for poster/infographic generation (model=%s) and chat (model=%s); "
