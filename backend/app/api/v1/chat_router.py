@@ -5,16 +5,22 @@ message (reusing conversations.py's `_append_message`), asks the existing conver
 Gemini model to classify intent via structured output (GeminiTextClient.route_intent),
 validates that output strictly, and maps it through the pure decision layer
 (app/domain/chat/decision_service.py) to exactly one of: a normal chat/clarification
-reply, an immediate local ComfyUI generation (GENERAL_IMAGE), or a server-side
-PendingAction requiring explicit confirmation before any paid API is called (POSTER /
-INFOGRAPHIC).
+reply, an immediate local ComfyUI generation (GENERAL_IMAGE), or an immediate Gemini
+image generation (POSTER / INFOGRAPHIC).
 
-POST /pending-actions/{id}/confirm and /cancel implement that confirmation: confirm()
-does a conditional `UPDATE ... WHERE status='pending' AND expires_at > now()` (same
-compare-and-set style already used for job state transitions elsewhere in this codebase)
-so the transition is atomic, then admits the actual generation job with an idempotency
-key derived from the pending action's own id -- so even a crash between "marked
-confirmed" and "job enqueued" can't be exploited into a duplicate paid job by retrying.
+PRODUCT DECISION (2026-08): POSTER/INFOGRAPHIC generation used to require a chat
+clarification round-trip when RouteDecision.missing_fields was non-empty, and a separate
+POST /pending-actions/{id}/confirm click before the paid Gemini call happened at all.
+Both were removed by explicit request from the project owner (after being warned this
+trades away the "never spend money without an explicit confirm" invariant the original
+architecture spec called for): once the router confidently classifies a message as
+POSTER/INFOGRAPHIC, it enqueues the paid generation immediately. The best-effort
+grounded-research step (_research_augment below) and the prompt-design step
+(GeminiTextClient.design_image_prompt, called from GeminiImageComfyUIClient.submit())
+still run to fill in facts and produce a better prompt -- they just no longer gate
+execution. The PendingAction DB model, migration, and POST /pending-actions/{id}/confirm
+/cancel endpoints are kept in place (nothing currently creates new rows through them) so
+a future confirmation requirement can be reinstated without another migration.
 
 This is additive: POST /v1/generations, POST /v1/conversations/{id}/messages, and POST
 /v1/conversations/{id}/assistant-reply are all unchanged and still work exactly as
@@ -26,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -39,8 +45,8 @@ from app.api.v1.conversations import MessageOut, _append_message, _get_owned_con
 from app.api.v1.generations import GenerationOut
 from app.db.models import ChatMessage, PendingAction, User
 from app.domain.chat.decision_service import (
-    CreatePendingAction,
     EnqueueGeneralImage,
+    EnqueuePaidImage,
     RespondChat,
     RespondClarification,
     decide_next_step,
@@ -57,7 +63,6 @@ from app.domain.chat.routing import (
     RouteDecision,
     RouteDecisionError,
     build_router_system_instruction_with_research,
-    compute_params_fingerprint,
     parse_route_decision,
 )
 from app.domain.jobs.admission import IdempotencyConflictError, UnknownWorkflowError, admit_generation_job
@@ -66,7 +71,12 @@ logger = logging.getLogger("imaginv.chat_router")
 
 router = APIRouter(tags=["chat-router"])
 
-PENDING_ACTION_TTL_MINUTES = 10
+# PENDING_ACTION_TTL_MINUTES / compute_params_fingerprint()-based PendingAction creation
+# were removed from smart_message() (see module docstring: POSTER/INFOGRAPHIC now
+# enqueue immediately, no confirmation gate). POST /pending-actions/{id}/confirm and
+# /cancel below are kept functional for any PendingAction rows that already exist, and
+# as dormant infrastructure if a confirmation requirement is reinstated later, but
+# nothing currently creates new rows.
 
 # Both POSTER and INFOGRAPHIC currently execute through the one real paid-image pipeline
 # this repo has (backend=gemini) -- see app/domain/jobs/workflow_registry.py. action_type
@@ -329,33 +339,47 @@ async def smart_message(
             job=GenerationOut(id=result.id, state=result.state, kind=result.kind),
         )
 
-    # CreatePendingAction -- POSTER or INFOGRAPHIC, no unresolved missing_fields.
-    assert isinstance(step, CreatePendingAction)
-    normalized_params = {"prompt": step.prompt, "exact_text": step.exact_text}
-    pending = PendingAction(
-        user_id=user.id,
-        conversation_id=conv.id,
-        action_type=step.action_type,
-        billing_category=step.billing_category,
-        normalized_params=normalized_params,
-        params_fingerprint=compute_params_fingerprint(normalized_params),
-        status="pending",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=PENDING_ACTION_TTL_MINUTES),
-    )
-    session.add(pending)
-    await session.commit()
-    await session.refresh(pending)
+    # EnqueuePaidImage -- POSTER or INFOGRAPHIC. Enqueued immediately, no chat
+    # clarification and no confirmation click (see this module's docstring for the
+    # product decision behind removing that gate).
+    assert isinstance(step, EnqueuePaidImage)
+    workflow_name = _WORKFLOW_FOR_ACTION_TYPE[step.action_type]
+    try:
+        result = await admit_generation_job(
+            queue=queue,
+            user_id=user.id,
+            workflow_name=workflow_name,
+            workflow_version="v1",
+            inputs={
+                "prompt": step.prompt,
+                "exact_text": step.exact_text,
+                "action_type": step.action_type,
+            },
+            # Deterministic per user message: a client retrying the same HTTP call
+            # (e.g. after a dropped response) replays the same job instead of
+            # enqueueing (and billing) a second one for what was really one user action.
+            idempotency_key=f"router-paid-image-{user_msg.id}",
+        )
+    except (UnknownWorkflowError, IdempotencyConflictError):
+        logger.error(
+            "chat_router: %s admission failed unexpectedly conv=%s", workflow_name, conv.id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="failed to start image generation",
+        )
     logger.info(
-        "chat_router: pending_action created id=%s conv=%s action_type=%s billing=%s",
-        pending.id,
+        "chat_router: paid image enqueued conv=%s user=%s action_type=%s billing=%s job=%s",
         conv.id,
-        pending.action_type,
-        pending.billing_category,
+        user.id,
+        step.action_type,
+        step.billing_category,
+        result.id,
     )
     return SmartMessageOut(
-        type="confirmation_required",
+        type="image_job",
         user_message=MessageOut.from_model(user_msg),
-        pending_action=PendingActionOut.from_model(pending),
+        job=GenerationOut(id=result.id, state=result.state, kind=result.kind),
     )
 
 

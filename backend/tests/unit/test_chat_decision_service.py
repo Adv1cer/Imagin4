@@ -8,15 +8,21 @@ then assert the DOWNSTREAM decision/execution behavior is correct and safe. Test
 whether Gemini itself classifies Thai/English natural language correctly is not something
 a deterministic, offline unit test can do -- that would require a live model call and
 would be flaky by nature; the strict schema + this pure decision layer is what's
-unit-testable, and it is exactly the layer that enforces every safety invariant the spec
-cares about (never start a paid job without confirmation, chat never starts a job, etc).
-"""
+unit-testable.
+
+PRODUCT DECISION (2026-08): POSTER/INFOGRAPHIC used to downgrade to RespondClarification
+when missing_fields was non-empty, and otherwise produce a CreatePendingAction requiring
+a separate confirm click before any paid call. Both were removed by explicit request --
+POSTER/INFOGRAPHIC now always produces EnqueuePaidImage (immediate enqueue), regardless
+of missing_fields. See EnqueuePaidImage's docstring in decision_service.py for the full
+rationale. These tests were updated accordingly rather than left asserting the old
+behavior."""
 
 from __future__ import annotations
 
 from app.domain.chat.decision_service import (
-    CreatePendingAction,
     EnqueueGeneralImage,
+    EnqueuePaidImage,
     RespondChat,
     RespondClarification,
     decide_next_step,
@@ -79,9 +85,9 @@ def test_general_image_background_for_poster_is_still_local():
     assert isinstance(step, EnqueueGeneralImage)
 
 
-def test_poster_with_all_fields_creates_pending_action_not_direct_execution():
-    """'ทำโปสเตอร์ Open House พร้อมวันเวลาและ QR' -> POSTER, complete -> pending action,
-    NEVER a direct paid call."""
+def test_poster_with_all_fields_enqueues_immediately():
+    """'ทำโปสเตอร์ Open House พร้อมวันเวลาและ QR' -> POSTER, complete -> enqueued
+    immediately as a paid job (no confirmation step per the 2026-08 product decision)."""
     step = decide_next_step(
         _decision(
             Intent.POSTER,
@@ -89,25 +95,27 @@ def test_poster_with_all_fields_creates_pending_action_not_direct_execution():
             reason_code=ReasonCode.STRUCTURED_PROMOTIONAL_LAYOUT,
         )
     )
-    assert isinstance(step, CreatePendingAction)
+    assert isinstance(step, EnqueuePaidImage)
     assert step.action_type == "poster"
     assert step.billing_category == "paid"
 
 
-def test_infographic_with_all_fields_creates_pending_action():
-    """'ทำอินโฟกราฟิกขั้นตอนสมัครเรียนห้าขั้นตอน' -> INFOGRAPHIC, complete -> pending
-    action."""
+def test_infographic_with_all_fields_enqueues_immediately():
+    """'ทำอินโฟกราฟิกขั้นตอนสมัครเรียนห้าขั้นตอน' -> INFOGRAPHIC, complete -> enqueued
+    immediately."""
     step = decide_next_step(
         _decision(Intent.INFOGRAPHIC, reason_code=ReasonCode.STRUCTURED_INFORMATION_DESIGN)
     )
-    assert isinstance(step, CreatePendingAction)
+    assert isinstance(step, EnqueuePaidImage)
     assert step.action_type == "infographic"
     assert step.billing_category == "paid"
 
 
 def test_ambiguous_promotional_image_request_asks_for_clarification():
     """'ทำภาพโปรโมต Open House ให้หน่อย' -- ambiguous whether GENERAL_IMAGE or POSTER,
-    and choosing wrong would change billing -> CLARIFICATION, no job of any kind."""
+    and choosing wrong would change billing -> CLARIFICATION, no job of any kind. This is
+    the LLM's OWN classification choice (Intent.CLARIFICATION), not the removed
+    missing_fields safety net -- genuinely ambiguous deliverable type still asks."""
     step = decide_next_step(
         _decision(
             Intent.CLARIFICATION,
@@ -121,12 +129,12 @@ def test_ambiguous_promotional_image_request_asks_for_clarification():
     assert step.question
 
 
-def test_english_poster_with_venue_and_cta_creates_pending_action():
-    """'Generate an event poster with venue and CTA' -> POSTER -> pending action."""
+def test_english_poster_with_venue_and_cta_enqueues_immediately():
+    """'Generate an event poster with venue and CTA' -> POSTER -> enqueued immediately."""
     step = decide_next_step(
         _decision(Intent.POSTER, reason_code=ReasonCode.STRUCTURED_PROMOTIONAL_LAYOUT)
     )
-    assert isinstance(step, CreatePendingAction) and step.action_type == "poster"
+    assert isinstance(step, EnqueuePaidImage) and step.action_type == "poster"
 
 
 def test_english_illustrated_background_uses_local_path():
@@ -153,28 +161,31 @@ def test_explain_what_an_infographic_is_stays_chat():
 def test_chat_and_clarification_never_produce_any_generation_step():
     for intent in (Intent.CHAT, Intent.CLARIFICATION):
         step = decide_next_step(_decision(intent))
-        assert not isinstance(step, (EnqueueGeneralImage, CreatePendingAction))
+        assert not isinstance(step, (EnqueueGeneralImage, EnqueuePaidImage))
 
 
-def test_general_image_never_produces_a_pending_paid_action():
+def test_general_image_never_produces_a_paid_step():
     step = decide_next_step(_decision(Intent.GENERAL_IMAGE))
-    assert not isinstance(step, CreatePendingAction)
+    assert not isinstance(step, EnqueuePaidImage)
 
 
 def test_poster_or_infographic_never_produce_direct_local_enqueue():
-    """Backend must never "downgrade" a poster/infographic straight into a free local
-    generation to dodge cost, nor execute the paid path without a confirmation step."""
+    """Backend must never "downgrade" a poster/infographic into a free local
+    generation to dodge cost -- it must always be billed as "paid", even though it now
+    enqueues immediately rather than waiting for a confirm click."""
     for intent in (Intent.POSTER, Intent.INFOGRAPHIC):
         step = decide_next_step(_decision(intent))
         assert not isinstance(step, EnqueueGeneralImage)
-        # And it must be a *pending* action, never anything that looks executed.
-        assert isinstance(step, (CreatePendingAction, RespondClarification))
+        assert isinstance(step, EnqueuePaidImage)
+        assert step.billing_category == "paid"
 
 
-def test_poster_with_missing_critical_fields_does_not_create_pending_action():
-    """'ทำโปสเตอร์ Open House' (no date/location) -- backend safety net: even if the LLM
-    says POSTER, non-empty missing_fields must downgrade to CLARIFICATION so a confirm
-    click can never spend money on a request known to be incomplete."""
+def test_poster_with_missing_fields_still_enqueues_immediately():
+    """2026-08 product decision: even with non-empty missing_fields, POSTER/INFOGRAPHIC
+    no longer downgrades to a chat clarification -- it enqueues immediately. The
+    best-effort research step (app/api/v1/chat_router.py:_research_augment) is what's
+    responsible for trying to fill missing_fields with real facts BEFORE
+    decide_next_step ever runs; decide_next_step itself no longer gates on the outcome."""
     step = decide_next_step(
         _decision(
             Intent.POSTER,
@@ -182,11 +193,11 @@ def test_poster_with_missing_critical_fields_does_not_create_pending_action():
             reason_code=ReasonCode.STRUCTURED_PROMOTIONAL_LAYOUT,
         )
     )
-    assert isinstance(step, RespondClarification)
-    assert "event date" in step.question or "location" in step.question
+    assert isinstance(step, EnqueuePaidImage)
+    assert step.action_type == "poster"
 
 
-def test_infographic_with_missing_critical_fields_does_not_create_pending_action():
+def test_infographic_with_missing_fields_still_enqueues_immediately():
     step = decide_next_step(
         _decision(
             Intent.INFOGRAPHIC,
@@ -194,38 +205,7 @@ def test_infographic_with_missing_critical_fields_does_not_create_pending_action
             reason_code=ReasonCode.STRUCTURED_INFORMATION_DESIGN,
         )
     )
-    assert isinstance(step, RespondClarification)
-
-
-def test_followup_turn_with_fields_now_supplied_creates_pending_action():
-    """Models the two-turn example from the spec:
-        User: ทำโปสเตอร์ Open House
-        Assistant: ต้องการใส่วันและสถานที่อะไร?
-        User: วันที่ 20 สิงหาคม ที่หอประชุม
-    Turn 1 (missing_fields non-empty) downgrades to clarification; turn 2, once the
-    router incorporates the user's answer (missing_fields now empty), must resolve to a
-    real pending action -- this is how "conversation follow-ups preserve the pending
-    intent" actually manifests through this pure function, without any separate
-    session-state bookkeeping (the full chat history is what carries the context)."""
-    turn1 = decide_next_step(
-        _decision(
-            Intent.POSTER,
-            missing_fields=["date", "location"],
-            clarification_question="ต้องการใส่วันและสถานที่อะไร?",
-        )
-    )
-    assert isinstance(turn1, RespondClarification)
-
-    turn2 = decide_next_step(
-        _decision(
-            Intent.POSTER,
-            normalized_prompt="Open House poster, 20 August at the auditorium",
-            exact_text=["Open House", "20 สิงหาคม", "หอประชุม"],
-            missing_fields=[],
-        )
-    )
-    assert isinstance(turn2, CreatePendingAction)
-    assert turn2.action_type == "poster"
+    assert isinstance(step, EnqueuePaidImage)
 
 
 def test_clarification_falls_back_to_default_question_when_llm_omits_one():
