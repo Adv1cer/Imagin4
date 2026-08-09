@@ -1,0 +1,392 @@
+{
+  "info": {
+    "name": "Imaginv4 Backend",
+    "description": "Auth + conversations + agentic chat routing (smart-message) + generations/jobs. Import into Postman directly (File > Import), or import backend/docs/openapi.json for the raw OpenAPI schema instead/as well.\n\nAuth: login/register return `session_token`. Every other request needs it either as a cookie or, easier for Postman, the `X-Session-Token` header -- both are accepted (see app/api/deps.py:get_current_user). The Login request below has a test script that auto-saves it into the `session_token` collection variable, so every other request just references {{session_token}}.\n\nTypical flow to test end-to-end:\n1. Register (or Login if the user already exists)\n2. Create Conversation\n3. Smart Message -- send plain text; backend classifies intent and either replies as chat, enqueues a local ComfyUI job (GENERAL_IMAGE), or enqueues a paid Gemini job (POSTER/INFOGRAPHIC) immediately (no confirmation step as of 2026-08)\n4. Get Job (poll until state is succeeded/failed/cancelled)\n5. Get Job Asset -- the generated image bytes, once succeeded\n\nPOST /pending-actions/{id}/confirm and /cancel are DORMANT as of 2026-08 -- smart-message no longer creates PendingAction rows, so nothing will currently exist to confirm/cancel. Kept in the collection for completeness / in case the confirmation flow is reinstated.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8000", "type": "string" },
+    { "key": "session_token", "value": "", "type": "string" },
+    { "key": "conversation_id", "value": "", "type": "string" },
+    { "key": "job_id", "value": "", "type": "string" },
+    { "key": "pending_action_id", "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Liveness",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/health/live"
+          }
+        },
+        {
+          "name": "Readiness",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/health/ready"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/v1/auth/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"tester1111@example.com\",\n  \"password\": \"correct-horse-battery-staple\",\n  \"display_name\": \"tester1111\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "  pm.collectionVariables.set('session_token', body.session_token);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/v1/auth/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"tester1111@example.com\",\n  \"password\": \"correct-horse-battery-staple\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "  pm.collectionVariables.set('session_token', body.session_token);",
+                  "  console.log('session_token saved:', body.session_token);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Me",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/auth/me"
+          }
+        },
+        {
+          "name": "Refresh",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/auth/refresh"
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/auth/logout"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Conversations",
+      "item": [
+        {
+          "name": "Create Conversation",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Session-Token", "value": "{{session_token}}" }
+            ],
+            "url": "{{base_url}}/v1/conversations",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"title\": \"Postman test conversation\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  const body = pm.response.json();",
+                  "  pm.collectionVariables.set('conversation_id', body.id);",
+                  "  console.log('conversation_id saved:', body.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List Conversations",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/conversations"
+          }
+        },
+        {
+          "name": "Get Conversation",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/conversations/{{conversation_id}}"
+          }
+        },
+        {
+          "name": "List Messages",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/conversations/{{conversation_id}}/messages"
+          }
+        },
+        {
+          "name": "Create Message (manual, no routing)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Session-Token", "value": "{{session_token}}" }
+            ],
+            "url": "{{base_url}}/v1/conversations/{{conversation_id}}/messages",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"role\": \"user\",\n  \"content\": { \"text\": \"สวัสดีครับ\" },\n  \"client_message_id\": \"postman-msg-1\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Assistant Reply (legacy, no routing)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/conversations/{{conversation_id}}/assistant-reply",
+            "description": "Plain Gemini chat completion over the conversation's persisted history. No intent classification -- use Smart Message below for that. Requires APP_GEMINI_API_KEY, else 503."
+          }
+        },
+        {
+          "name": "Delete Conversation",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/conversations/{{conversation_id}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Agentic Chat (Smart Message)",
+      "item": [
+        {
+          "name": "Smart Message -- plain chat example",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Session-Token", "value": "{{session_token}}" }
+            ],
+            "url": "{{base_url}}/v1/conversations/{{conversation_id}}/smart-message",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"อธิบายหน่อยว่า infographic คืออะไร\",\n  \"client_message_id\": \"postman-smart-1\"\n}"
+            },
+            "description": "Classifies to CHAT -> response.type == \"chat\", assistant_message populated, no job."
+          }
+        },
+        {
+          "name": "Smart Message -- general image example",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Session-Token", "value": "{{session_token}}" }
+            ],
+            "url": "{{base_url}}/v1/conversations/{{conversation_id}}/smart-message",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"สร้างภาพแมวนั่งในยานอวกาศ\",\n  \"client_message_id\": \"postman-smart-2\"\n}"
+            },
+            "description": "Classifies to GENERAL_IMAGE -> response.type == \"image_job\", job populated (workflow_name=image_basic, ComfyUI backend, free/local). Copy response.job.id into {{job_id}} and poll Get Job."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 202) {",
+                  "  const body = pm.response.json();",
+                  "  if (body.job) { pm.collectionVariables.set('job_id', body.job.id); console.log('job_id saved:', body.job.id); }",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Smart Message -- poster example (paid, enqueues immediately)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Session-Token", "value": "{{session_token}}" }
+            ],
+            "url": "{{base_url}}/v1/conversations/{{conversation_id}}/smart-message",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"ทำโปสเตอร์ Open House มหาวิทยาลัยหอการค้าไทย วันที่ 20 สิงหาคม ที่หอประชุม\",\n  \"client_message_id\": \"postman-smart-3\"\n}"
+            },
+            "description": "Classifies to POSTER -> a best-effort grounded-research call may run to fill missing facts, then a Gemini prompt-design call, then enqueues the paid Gemini image generation immediately. response.type == \"image_job\" (workflow_name=poster_infographic, Gemini backend, PAID -- real API cost). No confirmation step as of 2026-08 (see app/api/v1/chat_router.py module docstring). This call can take longer than a plain chat message (up to ~80s worst case if research runs) -- Postman's default request timeout may need raising for this one."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 202) {",
+                  "  const body = pm.response.json();",
+                  "  if (body.job) { pm.collectionVariables.set('job_id', body.job.id); console.log('job_id saved:', body.job.id); }",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Confirm Pending Action (dormant)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/pending-actions/{{pending_action_id}}/confirm",
+            "description": "As of 2026-08, smart-message never creates a PendingAction anymore, so this will 404 in normal use. Left in place in case the confirm-before-paid-generation flow is reinstated -- see PendingAction model in app/db/models.py."
+          }
+        },
+        {
+          "name": "Cancel Pending Action (dormant)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/pending-actions/{{pending_action_id}}/cancel"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Generations & Jobs (manual, no routing)",
+      "item": [
+        {
+          "name": "Create Generation -- image_basic",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Session-Token", "value": "{{session_token}}" },
+              { "key": "Idempotency-Key", "value": "postman-gen-{{$guid}}" }
+            ],
+            "url": "{{base_url}}/v1/generations",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"workflow_name\": \"image_basic\",\n  \"workflow_version\": \"v1\",\n  \"conversation_id\": \"{{conversation_id}}\",\n  \"inputs\": {\n    \"prompt\": \"a cat sitting in a spaceship\",\n    \"aspect_ratio\": \"1:1\",\n    \"resolution\": \"1k\"\n  }\n}"
+            },
+            "description": "Bypasses intent routing entirely -- this is what the frontend's manual 'Tools > Image generation' panel calls. Idempotency-Key header is REQUIRED (any unique string per logical request; a retry with the same key + same body replays the same job instead of creating a duplicate)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 202 || pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "  pm.collectionVariables.set('job_id', body.id);",
+                  "  console.log('job_id saved:', body.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create Generation -- poster_infographic",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Session-Token", "value": "{{session_token}}" },
+              { "key": "Idempotency-Key", "value": "postman-gen-{{$guid}}" }
+            ],
+            "url": "{{base_url}}/v1/generations",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"workflow_name\": \"poster_infographic\",\n  \"workflow_version\": \"v1\",\n  \"conversation_id\": \"{{conversation_id}}\",\n  \"inputs\": {\n    \"prompt\": \"Open House poster for a Thai university\",\n    \"exact_text\": [\"Open House\", \"20 สิงหาคม\", \"หอประชุม\"],\n    \"action_type\": \"poster\"\n  }\n}"
+            },
+            "description": "PAID -- routes to Gemini, real API cost. exact_text entries are rendered verbatim in the image; action_type feeds the prompt-design step's phrasing (\"poster\" vs \"infographic\")."
+          }
+        },
+        {
+          "name": "Get Job",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/jobs/{{job_id}}",
+            "description": "Poll this until state is one of succeeded/failed/cancelled. On success, result.outputs[0].object_key is set and Get Job Asset will return the image bytes."
+          }
+        },
+        {
+          "name": "Get Job Events (SSE)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Session-Token", "value": "{{session_token}}" },
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "url": "{{base_url}}/v1/jobs/{{job_id}}/events",
+            "description": "Server-Sent Events stream -- Postman can show the raw stream but doesn't parse SSE natively; for real testing use curl -N or the frontend."
+          }
+        },
+        {
+          "name": "Get Job Asset",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/jobs/{{job_id}}/asset",
+            "description": "Returns the generated image bytes directly (only valid once the job has succeeded). In Postman, use 'Send and Download' to save it, or switch the response view to 'Preview' for images."
+          }
+        },
+        {
+          "name": "Cancel Job",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-Session-Token", "value": "{{session_token}}" }],
+            "url": "{{base_url}}/v1/jobs/{{job_id}}/cancel"
+          }
+        }
+      ]
+    }
+  ]
+}
