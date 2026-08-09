@@ -8,10 +8,12 @@ from __future__ import annotations
 import pytest
 
 from app.domain.chat.routing import (
+    COMFY_PROMPT_DESIGN_SYSTEM_INSTRUCTION,
     ROUTER_SYSTEM_INSTRUCTION,
     Intent,
     ReasonCode,
     RouteDecisionError,
+    build_comfy_prompt_design_user_message,
     build_prompt_design_instruction,
     build_prompt_design_user_message,
     build_research_query,
@@ -160,3 +162,30 @@ def test_prompt_design_user_message_handles_no_exact_text():
     message = build_prompt_design_user_message("just a prompt", [])
     assert "just a prompt" in message
     assert "(none)" in message
+
+
+# --- ComfyUI-specific prompt-design helpers (design_comfyui_prompt) ---
+
+
+def test_comfy_prompt_design_instruction_avoids_verbatim_text_rendering():
+    """The ComfyUI instruction must explicitly tell the model NOT to rely on rendering
+    in-image text verbatim (SDXL-style diffusion models can't reliably do it) -- the
+    opposite requirement from the Gemini/poster instruction, which demands verbatim
+    text. Must not contain the poster instruction's positive "must render ... verbatim"
+    phrasing."""
+    lowered = COMFY_PROMPT_DESIGN_SYSTEM_INSTRUCTION.lower()
+    assert "not instruct the model to render" in lowered
+    assert "must render" not in lowered
+    assert "invent" in lowered
+
+
+def test_comfy_prompt_design_user_message_with_exact_text():
+    message = build_comfy_prompt_design_user_message("a cat in a spacesuit", ["Open House"])
+    assert "a cat in a spacesuit" in message
+    assert "Open House" in message
+    assert "not to be rendered" in message
+
+
+def test_comfy_prompt_design_user_message_without_exact_text_omits_context_section():
+    message = build_comfy_prompt_design_user_message("a cat in a spacesuit", [])
+    assert message == "Content brief: a cat in a spacesuit"

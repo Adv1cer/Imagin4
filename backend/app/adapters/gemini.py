@@ -278,6 +278,48 @@ class GeminiTextClient:
             logger.warning("gemini prompt-design call failed: %s", type(exc).__name__)
             raise RuntimeError(_sanitized_error(exc)) from exc
 
+    def _design_comfy_prompt_sync(self, contents: list[dict]) -> str:
+        from google.genai import types
+
+        from app.domain.chat.routing import COMFY_PROMPT_DESIGN_SYSTEM_INSTRUCTION
+
+        response = self._client.models.generate_content(
+            model=self._model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=COMFY_PROMPT_DESIGN_SYSTEM_INSTRUCTION
+            ),
+        )
+        return (getattr(response, "text", None) or "").strip()
+
+    async def design_comfyui_prompt(self, prompt: str, exact_text: list[str]) -> str:
+        """Best-effort refinement for the ORDINARY image path (GENERAL_IMAGE, ComfyUI
+        backend) -- the equivalent of design_image_prompt above but with a distinct
+        instruction tailored to diffusion-model prompt style (dense descriptive
+        keywords, not narrative prose; no verbatim-text-rendering instruction, since
+        ComfyUI/SDXL-style models can't reliably render in-image text -- see
+        app.domain.chat.routing.COMFY_PROMPT_DESIGN_SYSTEM_INSTRUCTION). Called from
+        app.adapters.routing_comfyui.CompositeComfyUIClient.submit() before delegating
+        to the ComfyUI adapter; callers MUST treat this as optional and fall back to the
+        original prompt on any failure, same fail-safe pattern as every other
+        best-effort Gemini step in this module."""
+        from app.domain.chat.routing import build_comfy_prompt_design_user_message
+
+        contents = [
+            {
+                "role": "user",
+                "parts": [{"text": build_comfy_prompt_design_user_message(prompt, exact_text)}],
+            }
+        ]
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._design_comfy_prompt_sync, contents),
+                timeout=self._timeout_s,
+            )
+        except Exception as exc:
+            logger.warning("gemini comfy prompt-design call failed: %s", type(exc).__name__)
+            raise RuntimeError(_sanitized_error(exc)) from exc
+
 
 class GeminiImageComfyUIClient:
     """Drop-in replacement for MockComfyUIClient/a real ComfyUI adapter: implements the

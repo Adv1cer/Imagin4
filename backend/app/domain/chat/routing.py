@@ -224,12 +224,13 @@ def build_router_system_instruction_with_research(research_findings: str) -> str
 
 
 # Used by GeminiTextClient.design_image_prompt (app/adapters/gemini.py), a best-effort
-# step that runs before the actual image-generation call: have the text model act as a
-# prompt engineer and write a detailed, well-composed image-generation prompt (layout,
-# color, typography direction) instead of sending the router's short normalized_prompt
-# straight to the image model as-is. Never a source of new facts -- explicitly forbidden
-# from inventing anything beyond what it's given, and required to preserve exact_text
-# verbatim, same invariant as the router itself.
+# step that runs before the actual Gemini image-generation call (POSTER/INFOGRAPHIC --
+# workflow "poster_infographic", backend="gemini" in workflow_registry.py): have the
+# text model act as a prompt engineer and write a detailed, well-composed
+# image-generation prompt (layout, color, typography direction) instead of sending the
+# router's short normalized_prompt straight to the image model as-is. Never a source of
+# new facts -- explicitly forbidden from inventing anything beyond what it's given, and
+# required to preserve exact_text verbatim, same invariant as the router itself.
 PROMPT_DESIGN_SYSTEM_INSTRUCTION_TEMPLATE = """\
 You are an expert prompt engineer for an AI image generation model that creates {kind}s. \
 Given a content brief and a list of text that MUST appear verbatim in the final image, \
@@ -263,6 +264,50 @@ def build_prompt_design_user_message(prompt: str, exact_text: list[str]) -> str:
     return (
         f"Content brief: {prompt}\n\n"
         f"Text that must appear verbatim in the image:\n{exact_lines}"
+    )
+
+
+# Used by GeminiTextClient.design_comfyui_prompt, the equivalent best-effort refinement
+# step for the ORDINARY image path (GENERAL_IMAGE -- workflow "image_basic",
+# backend="comfyui"). Deliberately a SEPARATE instruction from
+# PROMPT_DESIGN_SYSTEM_INSTRUCTION_TEMPLATE above, not a shared one with a flag: ComfyUI
+# diffusion models (SDXL / Qwen-Image, see app/adapters/comfyui/live.py) respond well to
+# dense, comma-separated descriptive/style keywords and are unreliable at rendering
+# in-image text at all -- asking for the poster instruction's "render this text
+# verbatim" framing would be actively counterproductive here, unlike for Gemini's image
+# model. GENERAL_IMAGE requests also rarely carry exact_text in the first place (see
+# routing rules: "a visual asset without structured information"), so this treats it as
+# optional supporting context rather than something requiring verbatim rendering.
+COMFY_PROMPT_DESIGN_SYSTEM_INSTRUCTION = """\
+You are an expert prompt engineer for a diffusion-based AI image generation model \
+(similar to Stable Diffusion / SDXL). Given a content brief, write a single, detailed \
+positive prompt that will produce a visually excellent result.
+
+Your prompt must:
+- Be a dense, comma-separated list of descriptive phrases and keywords: subject, \
+setting, composition, lighting, color palette, art style/medium, mood, and relevant \
+quality modifiers (e.g. "highly detailed", "sharp focus") -- this is the format \
+diffusion models respond best to, NOT a narrative paragraph.
+- Stay faithful to the content brief's actual subject and intent -- do not change what \
+the image is of.
+- NOT invent specific factual content (dates, names, statistics, real organizations) --
+only add visual/style/composition direction.
+- NOT instruct the model to render specific in-image text verbatim -- this generation \
+backend is unreliable at rendering readable text, so avoid relying on it; if the brief \
+mentions text or wording, treat it only as thematic context, not text to render.
+
+Respond with ONLY the final positive prompt text (comma-separated keywords/phrases). No \
+preamble, no explanation, no surrounding quotation marks.
+"""
+
+
+def build_comfy_prompt_design_user_message(prompt: str, exact_text: list[str]) -> str:
+    if not exact_text:
+        return f"Content brief: {prompt}"
+    context_lines = "\n".join(f"- {t}" for t in exact_text)
+    return (
+        f"Content brief: {prompt}\n\n"
+        f"Related thematic context (not to be rendered as text):\n{context_lines}"
     )
 
 

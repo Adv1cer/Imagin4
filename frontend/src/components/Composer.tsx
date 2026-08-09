@@ -13,8 +13,6 @@ export function Composer({
   onEnterImageMode,
   onExitImageMode,
   onImageGenConfigChange,
-  agentSkills,
-  onAgentSkillsChange,
   disabled,
 }: {
   onSend: (text: string) => void
@@ -24,12 +22,6 @@ export function Composer({
   onEnterImageMode: () => void
   onExitImageMode: () => void
   onImageGenConfigChange: (config: ImageGenConfig) => void
-  // Controlled by ChatScreen (not local state) because handleSend needs to know which
-  // flow to use: ON routes plain text through the agentic router
-  // (POST .../smart-message); OFF falls back to the old direct chat-completion flow
-  // (POST .../messages + POST .../assistant-reply, no intent classification at all).
-  agentSkills: boolean
-  onAgentSkillsChange: (value: boolean) => void
   disabled: boolean
 }) {
   const [text, setText] = useState('')
@@ -83,37 +75,7 @@ export function Composer({
           className="w-full resize-none border-none px-2 py-1.5 text-sm text-gray-900 outline-none placeholder:text-gray-400"
         />
 
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <label className="flex items-center gap-2">
-              <button
-                type="button"
-                role="switch"
-                aria-checked={agentSkills}
-                onClick={() => onAgentSkillsChange(!agentSkills)}
-                className={`relative h-5 w-9 rounded-full transition ${
-                  agentSkills ? 'bg-gray-900' : 'bg-gray-300'
-                }`}
-              >
-                <span
-                  className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition ${
-                    agentSkills ? 'left-4.5 translate-x-0.5' : 'left-0.5'
-                  }`}
-                />
-              </button>
-              <span
-                className="text-xs text-gray-500"
-                title={
-                  agentSkills
-                    ? 'On: messages are classified (chat / image / poster / infographic) and paid requests ask for confirmation.'
-                    : 'Off: messages go straight to the assistant with no classification or paid confirmation step.'
-                }
-              >
-                Agent Skills
-              </span>
-            </label>
-          </div>
-
+        <div className="flex items-center justify-end">
           <div className="flex items-center gap-1">
             <button
               type="button"

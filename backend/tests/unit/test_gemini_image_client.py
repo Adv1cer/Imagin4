@@ -252,3 +252,46 @@ async def test_design_image_prompt_raises_sanitized_error_on_failure(monkeypatch
     with pytest.raises(RuntimeError) as exc_info:
         await client.design_image_prompt("x", [], kind="poster")
     assert str(exc_info.value) == "gemini_error:RuntimeError"
+
+
+# --- design_comfyui_prompt: the ComfyUI-path equivalent (see
+# CompositeComfyUIClient.submit() in app/adapters/routing_comfyui.py for the wiring). ---
+
+
+@pytest.mark.asyncio
+async def test_design_comfyui_prompt_sends_content_brief_and_uses_comfy_instruction(
+    monkeypatch,
+):
+    from app.adapters.gemini import GeminiTextClient
+    from app.domain.chat.routing import COMFY_PROMPT_DESIGN_SYSTEM_INSTRUCTION
+
+    captured: dict = {}
+
+    def fake_generate_content(*, model, contents, config):
+        captured["contents"] = contents
+        captured["system_instruction"] = config.system_instruction
+        return SimpleNamespace(text="highly detailed, cinematic lighting, a cat in a spacesuit")
+
+    client = GeminiTextClient(api_key="fake-test-key", model="gemini-3.6-flash", timeout_s=5.0)
+    monkeypatch.setattr(client._client.models, "generate_content", fake_generate_content)
+
+    result = await client.design_comfyui_prompt("a cat in a spacesuit", [])
+    assert result == "highly detailed, cinematic lighting, a cat in a spacesuit"
+    assert "a cat in a spacesuit" in captured["contents"][0]["parts"][0]["text"]
+    # Uses the distinct ComfyUI instruction, not the poster/infographic one.
+    assert captured["system_instruction"] == COMFY_PROMPT_DESIGN_SYSTEM_INSTRUCTION
+
+
+@pytest.mark.asyncio
+async def test_design_comfyui_prompt_raises_sanitized_error_on_failure(monkeypatch):
+    from app.adapters.gemini import GeminiTextClient
+
+    def fake_generate_content(*, model, contents, config):
+        raise RuntimeError("raw internal detail")
+
+    client = GeminiTextClient(api_key="fake-test-key", model="gemini-3.6-flash", timeout_s=5.0)
+    monkeypatch.setattr(client._client.models, "generate_content", fake_generate_content)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await client.design_comfyui_prompt("x", [])
+    assert str(exc_info.value) == "gemini_error:RuntimeError"

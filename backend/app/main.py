@@ -121,7 +121,17 @@ def _build_state(app: FastAPI) -> None:
         )
 
     app.state.comfy_client = CompositeComfyUIClient(
-        comfyui_client=comfyui_client, gemini_client=gemini_image_client
+        comfyui_client=comfyui_client,
+        gemini_client=gemini_image_client,
+        # Same best-effort "design a good prompt first" step as the Gemini image path,
+        # applied to ordinary ComfyUI (GENERAL_IMAGE) generation -- None when Gemini
+        # isn't configured, in which case CompositeComfyUIClient just uses the router's
+        # prompt unmodified (unchanged from before this existed).
+        comfy_prompt_designer=(
+            app.state.gemini_text_client.design_comfyui_prompt
+            if app.state.gemini_text_client is not None
+            else None
+        ),
     )
 
 

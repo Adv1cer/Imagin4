@@ -6,7 +6,6 @@ import { useToasts } from '../hooks/useToasts'
 import {
   cancelPendingAction,
   confirmPendingAction,
-  createAssistantReply,
   createConversation,
   createGeneration,
   createMessage,
@@ -43,12 +42,6 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
   const [sending, setSending] = useState(false)
   const [imageMode, setImageMode] = useState(false)
   const [imageGenConfig, setImageGenConfig] = useState<ImageGenConfig>(DEFAULT_IMAGE_GEN_CONFIG)
-  // Agent Skills toggle (Composer): ON routes plain text through the agentic router
-  // (POST .../smart-message -- intent classification + paid confirmation flow). OFF
-  // falls back to the old behavior: persist the message, then get a plain chat
-  // completion with no classification and no confirmation step at all. Defaults ON to
-  // match the already-shipped/tested default behavior.
-  const [agentSkillsEnabled, setAgentSkillsEnabled] = useState(true)
   const [banner, setBanner] = useState<string | null>(null)
   const { toasts, showToast, dismissToast } = useToasts()
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -314,49 +307,12 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
             }
           }),
         )
-      } else if (!agentSkillsEnabled) {
-        // Agent Skills OFF: the old direct flow -- persist the message, then get a
-        // plain chat completion with no intent classification and no paid-confirmation
-        // step. This must be awaited before the reply call (previously wasn't, which
-        // was a real bug): POST .../assistant-reply reads history straight from the
-        // database, so firing it before this insert commits could race and return
-        // "conversation has no messages to reply to" even though the message was sent.
-        try {
-          await createMessage(convId, {
-            role: 'user',
-            content: { text },
-            client_message_id: userMessage.id,
-          })
-        } catch {
-          showToast('Message sent, but failed to save to history.', 'error')
-        }
-
-        const pendingId = nextId()
-        setMessages((prev) => [
-          ...prev,
-          { id: pendingId, role: 'assistant', text: '…', createdAt: new Date().toISOString() },
-        ])
-        try {
-          const reply = await createAssistantReply(convId)
-          const replyText =
-            typeof reply.content?.text === 'string' ? reply.content.text : '(empty response)'
-          setMessages((prev) =>
-            prev.map((m) => (m.id === pendingId ? { ...m, id: reply.id, text: replyText } : m)),
-          )
-        } catch (err) {
-          const msg =
-            err instanceof ApiError && err.status === 503
-              ? "Chat isn't configured on the backend yet (no Gemini API key set)."
-              : err instanceof ApiError
-                ? err.message
-                : 'Failed to get a reply.'
-          setMessages((prev) => prev.map((m) => (m.id === pendingId ? { ...m, text: msg } : m)))
-          showToast(msg, 'error')
-        }
       } else {
-        // Agent Skills ON (default): agentic routing (backend/app/api/v1/chat_router.py)
-        // -- the backend persists the user's message itself, classifies intent via the
-        // same Gemini model, and returns exactly one of a chat reply, an
+        // Agentic routing (backend/app/api/v1/chat_router.py) -- the only path for
+        // plain-text messages now (the old direct chat-completion flow and its manual
+        // Agent Skills toggle were removed; every message is always classified). The
+        // backend persists the user's message itself, classifies intent via the same
+        // Gemini model, and returns exactly one of a chat reply, an
         // immediately-enqueued local image job (GENERAL_IMAGE), or a paid PendingAction
         // awaiting explicit confirmation (POSTER/INFOGRAPHIC). We must NOT also call
         // createMessage() here -- the backend already persisted it (that would
@@ -512,8 +468,6 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
         onEnterImageMode={() => setImageMode(true)}
         onExitImageMode={() => setImageMode(false)}
         onImageGenConfigChange={setImageGenConfig}
-        agentSkills={agentSkillsEnabled}
-        onAgentSkillsChange={setAgentSkillsEnabled}
         disabled={sending}
       />
 

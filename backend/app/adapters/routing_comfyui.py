@@ -32,9 +32,16 @@ class CompositeComfyUIClient:
         self,
         comfyui_client: ComfyUIClient,
         gemini_client: ComfyUIClient | None,
+        comfy_prompt_designer=None,
     ) -> None:
         self._comfyui = comfyui_client
         self._gemini = gemini_client
+        # Optional async callable (prompt: str, exact_text: list[str]) -> str -- normally
+        # GeminiTextClient.design_comfyui_prompt, wired from app/main.py. Best-effort
+        # refinement of the ComfyUI-bound prompt before delegating to the underlying
+        # adapter; see submit() below. None when Gemini isn't configured, in which case
+        # the original prompt is used unmodified (same as before this existed).
+        self._comfy_prompt_designer = comfy_prompt_designer
         # Tracks which underlying adapter owns each prompt_id so get_status/cancel can
         # be routed consistently without re-deriving the workflow's backend later.
         self._owner: dict[str, ComfyUIClient] = {}
@@ -75,7 +82,28 @@ class CompositeComfyUIClient:
             )
             return ComfySubmitResult(prompt_id=prompt_id)
 
-        result = await adapter.submit(workflow_payload, kind=kind)
+        payload = workflow_payload
+        if backend_name == "comfyui" and self._comfy_prompt_designer is not None:
+            base_prompt = str(workflow_payload.get("prompt") or "").strip()
+            exact_text = [
+                t.strip()
+                for t in (workflow_payload.get("exact_text") or [])
+                if isinstance(t, str) and t.strip()
+            ]
+            if base_prompt or exact_text:
+                try:
+                    designed = await self._comfy_prompt_designer(base_prompt, exact_text)
+                    if designed and designed.strip():
+                        payload = {**workflow_payload, "prompt": designed.strip()}
+                except Exception as exc:
+                    logger.info(
+                        "routing_comfyui: prompt-design step failed (%s), using original "
+                        "prompt kind=%s",
+                        type(exc).__name__,
+                        kind,
+                    )
+
+        result = await adapter.submit(payload, kind=kind)
         self._owner[result.prompt_id] = adapter
         logger.info(
             "routing_comfyui: kind=%s routed to backend=%s prompt_id=%s",
