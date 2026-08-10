@@ -323,11 +323,8 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
           {
             id: pendingId,
             role: 'assistant',
-            // A POSTER/INFOGRAPHIC with missing details can trigger a background web
-            // search before replying (see createSmartMessage's comment on
-            // SMART_MESSAGE_TIMEOUT_MS) -- set expectations so a 20-60s wait doesn't
-            // look broken.
-            text: '… (อาจใช้เวลาถึง 1 นาทีถ้ามีการค้นหาข้อมูลเพิ่มเติมค่ะ)',
+            text: '',
+            thinking: true,
             createdAt: new Date().toISOString(),
           },
         ])
@@ -344,7 +341,9 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
             const replyId = res.assistant_message?.id ?? pendingId
             setMessages((prev) =>
               prev.map((m) =>
-                m.id === pendingId ? { ...m, id: replyId, text: replyText } : m,
+                m.id === pendingId
+                  ? { ...m, id: replyId, text: replyText, thinking: false }
+                  : m,
               ),
             )
           } else if (res.type === 'image_job' && res.job) {
@@ -355,6 +354,7 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
                   ? {
                       ...m,
                       text: `Generating image for: "${text}"`,
+                      thinking: false,
                       imageJob: { jobId: job.id, state: 'queued' },
                     }
                   : m,
@@ -368,6 +368,7 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
                 m.id === pendingId
                   ? {
                       ...m,
+                      thinking: false,
                       text:
                         pa.action_type === 'poster'
                           ? 'ต้องการยืนยันก่อนสร้างโปสเตอร์นี้ค่ะ (มีค่าใช้จ่าย)'
@@ -388,7 +389,9 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
           } else {
             setMessages((prev) =>
               prev.map((m) =>
-                m.id === pendingId ? { ...m, text: 'Unexpected response from server.' } : m,
+                m.id === pendingId
+                  ? { ...m, thinking: false, text: 'Unexpected response from server.' }
+                  : m,
               ),
             )
           }
@@ -400,7 +403,7 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
                 ? err.message
                 : 'Failed to get a reply.'
           setMessages((prev) =>
-            prev.map((m) => (m.id === pendingId ? { ...m, text: msg } : m)),
+            prev.map((m) => (m.id === pendingId ? { ...m, thinking: false, text: msg } : m)),
           )
           showToast(msg, 'error')
         }

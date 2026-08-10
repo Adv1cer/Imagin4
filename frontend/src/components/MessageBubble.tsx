@@ -1,5 +1,6 @@
 import { API_BASE_URL } from '../api/client'
 import { PendingActionCard } from './PendingActionCard'
+import { ThinkingIndicator } from './ThinkingIndicator'
 import type { UiMessage } from '../types/chat'
 
 function ImageJobStatus({ job }: { job: NonNullable<UiMessage['imageJob']> }) {
@@ -52,6 +53,19 @@ export function MessageBubble({
   onCancelPendingAction?: (messageId: string, pendingActionId: string) => void
 }) {
   const isUser = message.role === 'user'
+
+  // Thinking placeholder: no bubble chrome at all, just the rotating status text +
+  // animated dots, left-aligned like a normal assistant turn would be.
+  if (message.thinking) {
+    return (
+      <div className="flex w-full justify-start">
+        <div className="max-w-[75%] px-1">
+          <ThinkingIndicator />
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className={`flex w-full ${isUser ? 'justify-end' : 'justify-start'}`}>
       <div

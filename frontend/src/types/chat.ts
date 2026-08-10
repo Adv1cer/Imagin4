@@ -39,4 +39,9 @@ export interface UiMessage {
   createdAt: string
   imageJob?: ImageJobState
   pendingAction?: PendingActionState
+  // True only for the transient placeholder bubble shown while awaiting the
+  // smart-message response -- rendered without the normal chat-bubble background/border,
+  // just a rotating status phrase + animated dots (see ThinkingIndicator.tsx). Always
+  // replaced with a real message (this flag cleared) once the response arrives.
+  thinking?: boolean
 }
