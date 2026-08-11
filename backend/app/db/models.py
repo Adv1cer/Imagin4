@@ -82,6 +82,34 @@ class AuthSession(Base):
     )
 
 
+class ApiKey(Base):
+    """Machine-to-machine bearer credential, separate from AuthSession (which is for a
+    human logged in through the FE and expires/rotates on that browser's schedule). An
+    ApiKey is long-lived by design -- it's meant to sit statically configured inside an
+    external caller (e.g. a university workflow-automation platform's HTTP Request node)
+    -- but is still only ever stored/compared as a hash (see app/domain/auth/api_keys.py),
+    scoped to one `user_id` (a dedicated service account, not a real person's login), and
+    independently revocable via `revoked_at` without touching that user's own sessions.
+    See app/api/deps.py:get_current_user for the Authorization: Bearer lookup path."""
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[uuid.UUID] = UUID_PK()
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    key_hash: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    label: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = TS()
+    last_used_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+    __table_args__ = (
+        Index("ix_api_keys_user", "user_id"),
+        Index("ix_api_keys_active", "key_hash", postgresql_where=text("revoked_at is null")),
+    )
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
@@ -91,6 +119,13 @@ class Conversation(Base):
     )
     title: Mapped[str] = mapped_column(String, nullable=False, server_default="New conversation")
     status: Mapped[str] = mapped_column(String, nullable=False, server_default="active")
+    # Set only for conversations created via POST /v1/agent/message (see
+    # app/api/v1/agent_router.py) -- an opaque identifier the CALLING system uses to mean
+    # "this is the same end user/thread as last time", so one shared API key can still
+    # keep many different real people's chat history/context separate from each other.
+    # NULL for every conversation created through the normal session-authenticated FE
+    # flow. Unique per (user_id, external_ref) -- see migration 0003.
+    external_ref: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = TS()
     updated_at: Mapped[datetime] = mapped_column(
         server_default=text("now()"), onupdate=text("now()")
@@ -107,6 +142,13 @@ class Conversation(Base):
             "user_id",
             text("updated_at desc"),
             postgresql_where=text("deleted_at is null"),
+        ),
+        Index(
+            "uq_conversations_user_external_ref",
+            "user_id",
+            "external_ref",
+            unique=True,
+            postgresql_where=text("external_ref is not null"),
         ),
     )
 

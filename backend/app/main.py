@@ -22,7 +22,16 @@ from app.adapters.comfyui.live import LiveComfyUIClient
 from app.adapters.queue import InMemoryJobQueue
 from app.adapters.routing_comfyui import CompositeComfyUIClient
 from app.adapters.storage import InMemoryObjectStorage
-from app.api.v1 import auth, chat_router, conversations, generations, health, jobs, metrics
+from app.api.v1 import (
+    agent_router,
+    auth,
+    chat_router,
+    conversations,
+    generations,
+    health,
+    jobs,
+    metrics,
+)
 from app.core.config import get_settings
 from app.db.base import get_engine
 from app.services.reconciler import Reconciler
@@ -70,9 +79,11 @@ def _build_state(app: FastAPI) -> None:
             "comfyui: live mode, base_url=%s family=%s diffusion_model=%s",
             settings.comfy_base_url,
             settings.comfy_model_family,
-            settings.comfy_diffusion_model_name
-            if settings.comfy_model_family == "qwen_image"
-            else settings.comfy_checkpoint_name,
+            (
+                settings.comfy_diffusion_model_name
+                if settings.comfy_model_family == "qwen_image"
+                else settings.comfy_checkpoint_name
+            ),
         )
 
     if settings.gemini_api_key:
@@ -184,6 +195,7 @@ def create_app() -> FastAPI:
     app.include_router(generations.router, prefix="/v1")
     app.include_router(jobs.router, prefix="/v1")
     app.include_router(chat_router.router, prefix="/v1")
+    app.include_router(agent_router.router, prefix="/v1")
     app.include_router(metrics.router)  # unprefixed: GET /metrics
 
     return app

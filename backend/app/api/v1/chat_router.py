@@ -26,6 +26,12 @@ This is additive: POST /v1/generations, POST /v1/conversations/{id}/messages, an
 /v1/conversations/{id}/assistant-reply are all unchanged and still work exactly as
 before -- the existing manual "pick a tool, fill in the panel, submit" UI flow remains a
 fully supported fallback alongside this one.
+
+The actual classify/research/decide/enqueue pipeline lives in `process_routed_message`
+below, factored out so POST /v1/agent/message (app/api/v1/agent_router.py) -- the
+API-key-authenticated machine-to-machine entry point added 2026-08 for external systems
+(e.g. a university chatbot workflow) that just want to forward raw user text and get back
+a chat reply or an enqueued job -- can reuse it without duplicating this logic.
 """
 
 from __future__ import annotations
@@ -65,7 +71,11 @@ from app.domain.chat.routing import (
     build_router_system_instruction_with_research,
     parse_route_decision,
 )
-from app.domain.jobs.admission import IdempotencyConflictError, UnknownWorkflowError, admit_generation_job
+from app.domain.jobs.admission import (
+    IdempotencyConflictError,
+    UnknownWorkflowError,
+    admit_generation_job,
+)
 
 logger = logging.getLogger("imaginv.chat_router")
 
@@ -224,30 +234,28 @@ async def _research_augment(
     return refined
 
 
-@router.post(
-    "/conversations/{conversation_id}/smart-message",
-    response_model=SmartMessageOut,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def smart_message(
-    conversation_id: str,
-    payload: SmartMessageCreate,
-    session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(get_current_user),
-    queue: JobQueue = Depends(get_job_queue),
-    gemini=Depends(get_gemini_text_client),
+async def process_routed_message(
+    session: AsyncSession,
+    conv,
+    user: User,
+    queue: JobQueue,
+    gemini,
+    user_msg: ChatMessage,
 ) -> SmartMessageOut:
-    if gemini is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="chat routing is not configured (APP_GEMINI_API_KEY unset)",
-        )
+    """The actual routing pipeline: classify intent, best-effort research, map through
+    the pure decision layer, then respond/enqueue. Shared by both entry points that can
+    produce a user ChatMessage needing this treatment:
 
-    conv = await _get_owned_conversation(session, conversation_id, user)
-    user_msg = await _append_message(
-        session, conv, "user", {"text": payload.text}, payload.client_message_id
-    )
+    - POST /conversations/{id}/smart-message (below) -- the session-authenticated FE
+      chat flow, one conversation per browser thread.
+    - POST /v1/agent/message (app/api/v1/agent_router.py) -- the API-key-authenticated
+      machine-to-machine flow (e.g. a university chatbot workflow forwarding real user
+      messages through one shared service account), which resolves/creates its own
+      Conversation via `external_ref` before calling this.
 
+    Callers are responsible for auth, resolving/creating `conv`, and persisting
+    `user_msg` (via _append_message) before calling this -- this function only takes it
+    from there. `gemini` must already be confirmed non-None by the caller."""
     history = await _load_history(session, conv.id)
 
     validation_outcome = "ok"
@@ -326,9 +334,7 @@ async def smart_message(
                 idempotency_key=f"router-general-image-{user_msg.id}",
             )
         except (UnknownWorkflowError, IdempotencyConflictError):
-            logger.error(
-                "chat_router: image_basic admission failed unexpectedly conv=%s", conv.id
-            )
+            logger.error("chat_router: image_basic admission failed unexpectedly conv=%s", conv.id)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="failed to start image generation",
@@ -381,6 +387,32 @@ async def smart_message(
         user_message=MessageOut.from_model(user_msg),
         job=GenerationOut(id=result.id, state=result.state, kind=result.kind),
     )
+
+
+@router.post(
+    "/conversations/{conversation_id}/smart-message",
+    response_model=SmartMessageOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def smart_message(
+    conversation_id: str,
+    payload: SmartMessageCreate,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+    queue: JobQueue = Depends(get_job_queue),
+    gemini=Depends(get_gemini_text_client),
+) -> SmartMessageOut:
+    if gemini is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="chat routing is not configured (APP_GEMINI_API_KEY unset)",
+        )
+
+    conv = await _get_owned_conversation(session, conversation_id, user)
+    user_msg = await _append_message(
+        session, conv, "user", {"text": payload.text}, payload.client_message_id
+    )
+    return await process_routed_message(session, conv, user, queue, gemini, user_msg)
 
 
 async def _get_pending_action_snapshot(
@@ -444,7 +476,11 @@ async def confirm_pending_action(
         return SmartMessageOut(
             type="image_job",
             user_message=MessageOut(  # confirm has no "user message" of its own; echo n/a
-                id=str(row.id), role="system", sequence_no=0, content={}, status="complete",
+                id=str(row.id),
+                role="system",
+                sequence_no=0,
+                content={},
+                status="complete",
                 created_at=row.created_at,
             ),
             job=GenerationOut(
@@ -489,7 +525,11 @@ async def confirm_pending_action(
             return SmartMessageOut(
                 type="image_job",
                 user_message=MessageOut(
-                    id=str(row.id), role="system", sequence_no=0, content={}, status="complete",
+                    id=str(row.id),
+                    role="system",
+                    sequence_no=0,
+                    content={},
+                    status="complete",
                     created_at=row.created_at,
                 ),
                 job=GenerationOut(
@@ -546,7 +586,11 @@ async def confirm_pending_action(
     return SmartMessageOut(
         type="image_job",
         user_message=MessageOut(
-            id=str(row.id), role="system", sequence_no=0, content={}, status="complete",
+            id=str(row.id),
+            role="system",
+            sequence_no=0,
+            content={},
+            status="complete",
             created_at=row.created_at,
         ),
         job=GenerationOut(id=admission.id, state=admission.state, kind=admission.kind),
@@ -564,7 +608,9 @@ async def cancel_pending_action(
     outcome = evaluate_cancellation(snapshot, str(user.id))
 
     if outcome == ConfirmOutcome.NOT_FOUND or outcome == ConfirmOutcome.WRONG_OWNER:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pending action not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="pending action not found"
+        )
     if outcome == ConfirmOutcome.ALREADY_CONFIRMED:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

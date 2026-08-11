@@ -2,7 +2,9 @@
 
 Base URL: `http://localhost:8000`
 
-Auth header (all endpoints except Health/Auth-Login/Register): `X-Session-Token: <token>` (get token from Login/Register response)
+Auth (all endpoints except Health/Auth-Login/Register) — two options:
+- `X-Session-Token: <token>` (get token from Login/Register response) — human/FE auth
+- `Authorization: Bearer imgn_...` — machine-to-machine API key (see `POST /v1/agent/message` below), minted via `scripts/create_api_key.py`, not tied to any login
 
 ---
 
@@ -62,6 +64,29 @@ Main agentic endpoint — AI classifies intent (chat / general image / poster / 
 }
 ```
 **Response `type` values:** `"chat"` (assistant_message set), `"image_job"` (job set — poll via GET /v1/jobs/{id})
+
+---
+
+## POST /v1/agent/message
+Machine-to-machine entry point into the same routing pipeline as smart-message, for
+external systems (e.g. a university chatbot workflow) that just forward raw text and
+don't want to manage this system's own conversation_id.
+
+**Auth:** `Authorization: Bearer imgn_...` (or `X-Session-Token`)
+**Body:**
+```json
+{
+  "external_conversation_id": "utcc-student-2142",
+  "text": "ทำโปสเตอร์ Open House มหาวิทยาลัยหอการค้าไทย วันที่ 20 สิงหาคม",
+  "client_message_id": "optional-string"
+}
+```
+`external_conversation_id` is whatever the caller already uses to mean "this end
+user/thread" — required, non-blank. The first message for a given
+`(api key's user, external_conversation_id)` pair creates a new conversation; every
+later message with the same id reuses it, keeping different real end users' history
+separate even though they all authenticate as the same service account. Response shape
+is identical to smart-message's (`type`: `"chat"` or `"image_job"`).
 
 ---
 
