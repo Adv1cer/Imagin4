@@ -16,6 +16,7 @@ Requires-Dist: structlog>=24.1
 Requires-Dist: prometheus-client>=0.20
 Requires-Dist: email-validator>=2.1
 Requires-Dist: python-multipart>=0.0.9
+Requires-Dist: google-genai>=0.3.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
