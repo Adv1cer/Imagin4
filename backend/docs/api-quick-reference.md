@@ -78,9 +78,21 @@ don't want to manage this system's own conversation_id.
 {
   "external_conversation_id": "utcc-student-2142",
   "text": "ทำโปสเตอร์ Open House มหาวิทยาลัยหอการค้าไทย วันที่ 20 สิงหาคม",
-  "client_message_id": "optional-string"
+  "client_message_id": "optional-string",
+  "wait": false,
+  "wait_timeout_s": 100
 }
 ```
+`wait` (default `false`): when `true` and the routed result is an image job, the
+request blocks server-side until the job reaches a terminal state (`succeeded` /
+`failed` / `cancelled`) or `wait_timeout_s` elapses (default 100s, clamped 5-170s),
+instead of responding immediately with `state="queued"`. Built for callers with no
+client-side retry/polling capability of their own — one call gets you the final job
+state directly in `job.state` (plus `job.error_code`/`job.error_detail` if it failed),
+so you can go straight to `GET /v1/jobs/{id}/asset` next with no loop needed. Every
+other caller (the FE, `POST /v1/generations`) is unaffected — this only applies here
+and only when explicitly requested.
+
 `external_conversation_id` is whatever the caller already uses to mean "this end
 user/thread" — required, non-blank. The first message for a given
 `(api key's user, external_conversation_id)` pair creates a new conversation; every

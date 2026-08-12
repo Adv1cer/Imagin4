@@ -34,6 +34,11 @@ class GenerationOut(BaseModel):
     id: str
     state: str
     kind: str
+    # Populated only by POST /v1/agent/message when called with wait=true (see
+    # app/api/v1/agent_router.py) and the job reached a terminal state -- every other
+    # caller of GenerationOut leaves these None, so this is additive/backward-compatible.
+    error_code: str | None = None
+    error_detail: str | None = None
 
 
 @router.post("", response_model=GenerationOut, status_code=status.HTTP_202_ACCEPTED)
