@@ -159,6 +159,18 @@ services:
     restart: unless-stopped
     volumes:
       - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
+    # --user-directory: ComfyUI keeps per-instance state (notably user/comfyui.db, a
+    # SQLite file) under <ComfyUI path>/user by default. Both workers bind-mount the
+    # SAME host ComfyUI checkout (models/custom_nodes/output are meant to be shared),
+    # which means BOTH would otherwise fight over the SAME comfyui.db -- confirmed
+    # 2026-08 on Chet's DGX: "Could not acquire lock on database... Another ComfyUI
+    # process may already be using it." Currently non-fatal (ComfyUI logs it and starts
+    # anyway), but ComfyUI's own warning says the database "will be required" in a
+    # future version. Pointing --user-directory at a path INSIDE each container's own
+    # filesystem (not the bind mount) gives every worker private, non-conflicting state
+    # -- safe to use the identical path string in both services below since each
+    # container's root filesystem is already isolated from the other's.
+    command: ["--user-directory", "/opt/comfyui-user"]
     ports:
       - "8188:8188"
     deploy:
@@ -180,6 +192,8 @@ services:
     restart: unless-stopped
     volumes:
       - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
+    # See comfyui-worker-1's --user-directory comment above -- same reasoning.
+    command: ["--user-directory", "/opt/comfyui-user"]
     ports:
       - "8189:8188"
     deploy:
