@@ -47,15 +47,30 @@ class JobQueue(Protocol):
 
     async def get(self, job_id: uuid.UUID) -> QueuedJob | None: ...
 
-    async def claim_next(self, worker_capacity: int = 1) -> list[QueuedJob]: ...
+    async def claim_next(
+        self, worker_capacity: int = 1, kinds: frozenset[str] | None = None
+    ) -> list[QueuedJob]:
+        """`kinds`, when given, restricts candidates to jobs whose `kind` is in the set --
+        used by the scheduler to claim ComfyUI-backend and Gemini-backend jobs against
+        independent capacity numbers (see app/services/scheduler.py and
+        app/domain/jobs/workflow_registry.py:kinds_for_backend) so a slow Gemini
+        poster/infographic job can't starve an unrelated ComfyUI job's slot or vice
+        versa. None (default) means no filtering -- every existing caller keeps its
+        original behavior."""
+        ...
 
     async def claim_next_with_lease(
-        self, worker_capacity: int, lease_owner: str, lease_seconds: float
+        self,
+        worker_capacity: int,
+        lease_owner: str,
+        lease_seconds: float,
+        kinds: frozenset[str] | None = None,
     ) -> list[QueuedJob]:
-        """Fairness-ordered claim (same selection as claim_next) that additionally stamps
-        a lease_owner/lease_expires_at on each claimed job, so a reconciler can later find
-        dispatched/running jobs whose lease expired without a heartbeat/finalization
-        (crashed scheduler, worker, or lost connection to ComfyUI)."""
+        """Fairness-ordered claim (same selection as claim_next, including the same
+        `kinds` filter) that additionally stamps a lease_owner/lease_expires_at on each
+        claimed job, so a reconciler can later find dispatched/running jobs whose lease
+        expired without a heartbeat/finalization (crashed scheduler, worker, or lost
+        connection to ComfyUI)."""
         ...
 
     async def list_active(self) -> list[QueuedJob]:
@@ -95,10 +110,16 @@ class InMemoryJobQueue:
     async def get(self, job_id: uuid.UUID) -> QueuedJob | None:
         return self._jobs.get(job_id)
 
-    async def claim_next(self, worker_capacity: int = 1) -> list[QueuedJob]:
+    async def claim_next(
+        self, worker_capacity: int = 1, kinds: frozenset[str] | None = None
+    ) -> list[QueuedJob]:
         claimed: list[QueuedJob] = []
         candidates = sorted(
-            (j for j in self._jobs.values() if j.state in ("queued", "retry_wait")),
+            (
+                j
+                for j in self._jobs.values()
+                if j.state in ("queued", "retry_wait") and (kinds is None or j.kind in kinds)
+            ),
             key=lambda j: (-j.effective_priority, j.queued_at),
         )
         for job in candidates[:worker_capacity]:
@@ -107,9 +128,13 @@ class InMemoryJobQueue:
         return claimed
 
     async def claim_next_with_lease(
-        self, worker_capacity: int, lease_owner: str, lease_seconds: float
+        self,
+        worker_capacity: int,
+        lease_owner: str,
+        lease_seconds: float,
+        kinds: frozenset[str] | None = None,
     ) -> list[QueuedJob]:
-        claimed = await self.claim_next(worker_capacity)
+        claimed = await self.claim_next(worker_capacity, kinds=kinds)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
         for job in claimed:
             job.lease_owner = lease_owner

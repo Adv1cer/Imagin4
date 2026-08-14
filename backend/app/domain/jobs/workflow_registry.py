@@ -68,3 +68,15 @@ def resolve_workflow(name: str, version: str) -> WorkflowDefinition:
 
 def list_workflows() -> list[WorkflowDefinition]:
     return list(_REGISTRY.values())
+
+
+def kinds_for_backend(backend: str) -> frozenset[str]:
+    """All registered workflow *names* (== QueuedJob.kind) whose current version routes
+    to `backend` ("comfyui" or "gemini") -- used by app/services/scheduler.py to claim
+    queued jobs per-backend so ComfyUI's GPU-bound capacity and Gemini's network-bound
+    capacity can be limited independently (see Settings.default_comfy_active_slots /
+    default_gemini_active_slots in app/core/config.py). A name with multiple versions
+    that disagree on backend isn't supported today (matches the existing assumption in
+    app/adapters/routing_comfyui.py:CompositeComfyUIClient._resolve_backend, which also
+    only ever looks at the "v1" definition)."""
+    return frozenset(w.name for w in _REGISTRY.values() if w.backend == backend)

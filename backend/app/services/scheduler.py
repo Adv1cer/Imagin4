@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from app.adapters.comfyui import ComfyUIClient, MockComfyUIClient
 from app.adapters.queue import InMemoryJobQueue, JobQueue, QueuedJob
 from app.core.config import Settings, get_settings
+from app.domain.jobs.workflow_registry import kinds_for_backend
 from app.domain.workers.scoring import WorkerSnapshot
 
 logger = logging.getLogger("imaginv.scheduler")
@@ -40,7 +41,9 @@ class Scheduler:
     score them with `app.domain.workers.scoring`. Without a DB (dev/in-memory mode, as
     wired by `app.main._build_state` today since only in-memory adapters exist), worker
     capacity falls back to `settings.default_comfy_active_slots` -- there is no real
-    workers table to query in that mode.
+    workers table to query in that mode. Either way, Gemini capacity is always
+    `settings.default_gemini_active_slots`, tracked independently of ComfyUI -- see
+    `_reserve_capacity_by_backend`.
     """
 
     def __init__(
@@ -70,10 +73,21 @@ class Scheduler:
             )
         self._shutdown.set()
 
-    async def _reserve_capacity(self) -> int:
-        """How many jobs may be claimed this tick."""
+    async def _reserve_capacity_by_backend(self) -> dict[str, int]:
+        """How many jobs of each backend ("comfyui" / "gemini") may be claimed this tick.
+
+        Split on purpose (see Settings.default_gemini_active_slots' docstring in
+        app/core/config.py): ComfyUI dispatch is GPU-bound and capped conservatively
+        (from the live `comfy_workers` registry when one exists, else
+        default_comfy_active_slots); Gemini image generation is just an outbound HTTPS
+        call to Google and doesn't compete for this machine's GPU at all, so it gets its
+        own independent cap (default_gemini_active_slots) regardless of which path is
+        used for ComfyUI capacity -- there is no "gemini_workers" registry table, Gemini
+        isn't a fleet of instances to select between."""
+        gemini_capacity = self.settings.default_gemini_active_slots
+
         if self.session_factory is None:
-            return self.settings.default_comfy_active_slots
+            return {"comfyui": self.settings.default_comfy_active_slots, "gemini": gemini_capacity}
 
         from sqlalchemy import select
 
@@ -104,7 +118,7 @@ class Scheduler:
             for s in snapshots
             if s.status == "online"
         )
-        return max(available, 0)
+        return {"comfyui": max(available, 0), "gemini": gemini_capacity}
 
     async def _dispatch(self, job: QueuedJob) -> None:
         """Marks the job running and submits it to ComfyUI. Any failure here is
@@ -130,18 +144,29 @@ class Scheduler:
             else:
                 await self.job_queue.mark_failed(job.id, "worker_unreachable", detail)
 
-    async def _tick(self) -> None:
-        capacity = await self._reserve_capacity()
+    async def _claim_for_backend(self, backend: str, capacity: int) -> list[QueuedJob]:
         if capacity <= 0:
-            return
+            return []
+        kinds = kinds_for_backend(backend)
         if hasattr(self.job_queue, "claim_next_with_lease"):
-            claimed = await self.job_queue.claim_next_with_lease(
+            return await self.job_queue.claim_next_with_lease(
                 worker_capacity=capacity,
                 lease_owner=self.owner_id,
                 lease_seconds=self.lease_seconds,
+                kinds=kinds,
             )
-        else:
-            claimed = await self.job_queue.claim_next(worker_capacity=capacity)
+        return await self.job_queue.claim_next(worker_capacity=capacity, kinds=kinds)
+
+    async def _tick(self) -> None:
+        capacity_by_backend = await self._reserve_capacity_by_backend()
+        # Two independent claims (one per backend, each against its own capacity number)
+        # rather than one combined claim -- see _reserve_capacity_by_backend's docstring.
+        # Each still preserves fairness/priority ordering *within* its own backend lane
+        # (JobQueue.claim_next sorts by -effective_priority, queued_at as before); the
+        # two lanes just no longer block each other.
+        claimed: list[QueuedJob] = []
+        for backend, capacity in capacity_by_backend.items():
+            claimed.extend(await self._claim_for_backend(backend, capacity))
         for job in claimed:
             task = asyncio.create_task(self._dispatch(job))
             self._inflight.add(task)
@@ -190,8 +215,8 @@ async def main() -> None:
     logging.basicConfig(level=settings.log_level)
 
     # NOTE: production wiring should build the Postgres-SKIP-LOCKED-backed JobQueue and
-    # a session_factory bound to settings.database_url so _reserve_capacity can score
-    # live comfy_workers rows. Only the in-memory fakes exist in this repo today (see
+    # a session_factory bound to settings.database_url so _reserve_capacity_by_backend
+    # can score live comfy_workers rows. Only the in-memory fakes exist in this repo today (see
     # app/adapters/queue and app/main.py), so the standalone entrypoint uses those, same
     # as `create_app()` does -- swap these two lines when the Postgres adapter lands.
     job_queue: JobQueue = InMemoryJobQueue()

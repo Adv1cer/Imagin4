@@ -30,6 +30,30 @@ def _job(**overrides) -> QueuedJob:
 
 
 @pytest.mark.asyncio
+async def test_claim_next_kinds_filter_restricts_candidates():
+    queue = InMemoryJobQueue()
+    comfy_job = _job(kind="image_basic")
+    gemini_job = _job(kind="poster_infographic")
+    await queue.enqueue(comfy_job)
+    await queue.enqueue(gemini_job)
+
+    claimed = await queue.claim_next(worker_capacity=10, kinds=frozenset({"poster_infographic"}))
+
+    assert [j.id for j in claimed] == [gemini_job.id]
+    # Untouched: still queued, not claimed by the filtered call above.
+    assert (await queue.get(comfy_job.id)).state == "queued"
+
+
+@pytest.mark.asyncio
+async def test_claim_next_kinds_none_means_no_filtering():
+    queue = InMemoryJobQueue()
+    job = _job()
+    await queue.enqueue(job)
+    claimed = await queue.claim_next(worker_capacity=10, kinds=None)
+    assert [j.id for j in claimed] == [job.id]
+
+
+@pytest.mark.asyncio
 async def test_scheduler_claims_and_dispatches_queued_job():
     queue = InMemoryJobQueue()
     job = _job()
@@ -55,8 +79,74 @@ async def test_scheduler_capacity_defaults_to_settings_without_session_factory()
     queue = InMemoryJobQueue()
     comfy = MockComfyUIClient()
     scheduler = Scheduler(job_queue=queue, comfy_client=comfy)
-    capacity = await scheduler._reserve_capacity()
-    assert capacity == scheduler.settings.default_comfy_active_slots
+    capacity = await scheduler._reserve_capacity_by_backend()
+    assert capacity == {
+        "comfyui": scheduler.settings.default_comfy_active_slots,
+        "gemini": scheduler.settings.default_gemini_active_slots,
+    }
+
+
+@pytest.mark.asyncio
+async def test_scheduler_dispatches_gemini_and_comfyui_jobs_as_independent_lanes():
+    """The whole point of splitting capacity by backend: a full ComfyUI lane must not
+    block a queued Gemini (poster_infographic) job, and vice versa -- see
+    Scheduler._reserve_capacity_by_backend / _claim_for_backend."""
+    queue = InMemoryJobQueue()
+    comfy_job = _job(kind="image_basic")
+    gemini_job = _job(kind="poster_infographic")
+    await queue.enqueue(comfy_job)
+    await queue.enqueue(gemini_job)
+    comfy = MockComfyUIClient(polls_to_complete=0)
+    scheduler = Scheduler(job_queue=queue, comfy_client=comfy, poll_interval_s=0.01)
+
+    await scheduler._tick()
+    if scheduler._inflight:
+        import asyncio
+
+        await asyncio.gather(*list(scheduler._inflight))
+
+    updated_comfy = await queue.get(comfy_job.id)
+    updated_gemini = await queue.get(gemini_job.id)
+    assert updated_comfy.state == "running"
+    assert updated_gemini.state == "running"
+
+
+@pytest.mark.asyncio
+async def test_full_gemini_lane_does_not_block_comfyui_claim():
+    queue = InMemoryJobQueue()
+    # Two gemini jobs, but capacity is overridden to 1 for that lane below -- only one
+    # should be claimed, while the comfyui job (separate lane/capacity) still is.
+    gemini_job_1 = _job(kind="poster_infographic")
+    gemini_job_2 = _job(kind="poster_infographic")
+    comfy_job = _job(kind="image_basic")
+    await queue.enqueue(gemini_job_1)
+    await queue.enqueue(gemini_job_2)
+    await queue.enqueue(comfy_job)
+    comfy = MockComfyUIClient(polls_to_complete=0)
+    from app.core.config import Settings
+
+    settings = Settings(default_comfy_active_slots=1, default_gemini_active_slots=1)
+    scheduler = Scheduler(
+        job_queue=queue, comfy_client=comfy, settings=settings, poll_interval_s=0.01
+    )
+
+    await scheduler._tick()
+    if scheduler._inflight:
+        import asyncio
+
+        await asyncio.gather(*list(scheduler._inflight))
+
+    states = {
+        gemini_job_1.id: (await queue.get(gemini_job_1.id)).state,
+        gemini_job_2.id: (await queue.get(gemini_job_2.id)).state,
+        comfy_job.id: (await queue.get(comfy_job.id)).state,
+    }
+    # Exactly one of the two gemini jobs claimed (lane capacity 1)...
+    gemini_states = [states[gemini_job_1.id], states[gemini_job_2.id]]
+    assert gemini_states.count("running") == 1
+    assert gemini_states.count("queued") == 1
+    # ...and the comfyui job claimed too, unaffected by the full gemini lane.
+    assert states[comfy_job.id] == "running"
 
 
 @pytest.mark.asyncio

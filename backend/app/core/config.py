@@ -48,6 +48,18 @@ class Settings(BaseSettings):
     max_queued_jobs_per_user: int = 3
     global_queue_cap: int = 5000
     default_comfy_active_slots: int = 1
+    # SEPARATE from the ComfyUI slot count above on purpose: ComfyUI dispatch is
+    # GPU-bound (one local device, one job at a time until benchmarked otherwise -- see
+    # default_comfy_active_slots' own caveat about single-GPU boxes), but Gemini image
+    # generation (poster_infographic, see app/domain/jobs/workflow_registry.py) is just
+    # an outbound HTTPS call to Google -- it doesn't touch this machine's GPU at all.
+    # Before this existed, both shared one scheduler capacity number (see
+    # Scheduler._reserve_capacity_by_backend in app/services/scheduler.py), so a slow
+    # poster/infographic job would needlessly block an unrelated general-image job (and
+    # vice versa) even though neither competes for the other's resource. Higher than 1
+    # by default since Gemini concurrency is limited by API rate limits/cost, not local
+    # hardware -- tune down if you hit 429s, up if your quota allows more.
+    default_gemini_active_slots: int = 3
     priority_tiers: int = 4
     aging_increment_per_minute: float = 0.5
 

@@ -259,8 +259,9 @@ In production, prefer S3 versioning + cross-region replication over manual mirro
 - [ ] Replace `InMemoryObjectStorage` with an S3/MinIO-backed `ObjectStorage` implementation.
 - [ ] Implement the live `ComfyUIClient` HTTP adapter (`APP_COMFY_MODE=live`).
 - [ ] Wire `app/services/scheduler.py` / `reconciler.py` to a real `session_factory` so
-      `_reserve_capacity` scores live `comfy_workers` rows instead of falling back to
-      `default_comfy_active_slots`.
+      `_reserve_capacity_by_backend` scores live `comfy_workers` rows instead of falling
+      back to `default_comfy_active_slots` (Gemini capacity is separate --
+      `default_gemini_active_slots` -- and always used regardless of this).
 - [ ] Wire reconciler `job_events` emission to real DB inserts instead of log lines.
 - [ ] Set `APP_COOKIE_SECURE=true`, real `APP_CORS_ALLOW_ORIGINS`, and rotate
       `POSTGRES_PASSWORD` / `MINIO_ROOT_PASSWORD` away from the `.env.example` placeholders.
