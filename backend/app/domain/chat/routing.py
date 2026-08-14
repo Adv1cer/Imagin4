@@ -145,7 +145,16 @@ exactly one concise question. Do not ask about optional details that can safely 
 
 Field rules:
 - normalized_prompt: the visual direction, cleaned up, but preserving the user's actual \
-intent and language (do not translate Thai to English or vice versa).
+intent and language (do not translate Thai to English or vice versa). Describe ONLY what \
+the LATEST message itself asks for. Earlier turns are context for interpreting ambiguous \
+references in the latest message (e.g. "make it bigger", "same style as before") -- they \
+are NEVER material to combine, merge, or summarize into the same image. If this \
+conversation contains several earlier, unrelated image/poster/infographic requests \
+(common in a long testing session), do not fold their subjects into this one: a request \
+for "a red panda" stays a request for exactly one red panda, never a collage/portfolio/\
+grid that also includes a cat, coffee, or people from earlier unrelated turns. Only \
+combine multiple subjects into one composition if the LATEST message explicitly asks for \
+that (e.g. "put the cat and the coffee cup in the same photo").
 - exact_text: any literal text/copy that must appear verbatim in the generated image \
 (headlines, dates, place names the user actually typed) -- preserve exact wording, \
 especially Thai. Do not invent additional text.
@@ -249,6 +258,9 @@ beyond what is given to you -- only add visual/design direction, never new facts
 - Be written as plain natural-language prompt text (a paragraph or a few short \
 paragraphs) -- not a list, not JSON, not markdown -- since it is sent directly to the \
 image model.
+- Describe exactly the ONE {kind} the content brief asks for -- never expand it into a \
+collage, portfolio, contact sheet, or multiple separate designs, even if earlier \
+unrelated requests are visible elsewhere in context.
 
 Respond with ONLY the final image-generation prompt text. No preamble, no explanation, \
 no surrounding quotation marks.
@@ -289,7 +301,11 @@ setting, composition, lighting, color palette, art style/medium, mood, and relev
 quality modifiers (e.g. "highly detailed", "sharp focus") -- this is the format \
 diffusion models respond best to, NOT a narrative paragraph.
 - Stay faithful to the content brief's actual subject and intent -- do not change what \
-the image is of.
+the image is of. The brief describes exactly ONE subject/scene for ONE single image -- \
+never expand it into a collage, portfolio, contact sheet, multi-panel, or grid layout \
+containing other subjects, even if earlier unrelated requests are visible elsewhere in \
+context. Only describe multiple subjects together if the brief itself explicitly asks \
+for them to appear in the same image.
 - NOT invent specific factual content (dates, names, statistics, real organizations) --
 only add visual/style/composition direction.
 - NOT instruct the model to render specific in-image text verbatim -- this generation \
