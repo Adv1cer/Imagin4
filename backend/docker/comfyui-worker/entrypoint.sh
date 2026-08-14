@@ -87,6 +87,14 @@ transforms = _MissingTorchaudioFeature()
 PYEOF
 echo "comfyui-worker: torchaudio stub written to $SITE_PACKAGES/torchaudio"
 
+# docker-compose.yml passes --user-directory /opt/comfyui-user via "$@" below (per-worker
+# private state, since both workers otherwise share and lock-contend on the bind-mounted
+# ComfyUI checkout's user/comfyui.db -- see that file's comment). ComfyUI's argparse
+# requires the path to already EXIST -- it does not create it -- so create it here every
+# startup (idempotent, cheap) rather than baking it into the image, since the image is
+# built once but this path needs to survive container recreation regardless.
+mkdir -p /opt/comfyui-user
+
 # --listen 0.0.0.0 so other containers (the api/scheduler/reconciler services) can reach
 # this over the docker network by service name, e.g. http://comfyui-worker-1:8188.
 exec python main.py --listen 0.0.0.0 --port 8188 "$@"
