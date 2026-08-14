@@ -140,12 +140,22 @@ class LiveComfyUIClient:
     def _http_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(timeout=self._timeout_s, transport=self._transport)
 
-    def _build_prompt_graph(self, workflow_payload: dict) -> dict[str, Any]:
+    def _build_prompt_graph(self, workflow_payload: dict, filename_prefix: str) -> dict[str, Any]:
         """Builds a standard txt2img node graph from validated inputs only -- see module
         docstring. Unknown/extra keys in workflow_payload are ignored, not forwarded.
         Branches on self._model_family since Qwen-Image's split-file architecture needs a
         structurally different graph than a single-file checkpoint (see class docstring
-        and Settings.comfy_model_family)."""
+        and Settings.comfy_model_family).
+
+        `filename_prefix` MUST be unique per submission (see submit()) -- every job used
+        to share the literal prefix "imaginv", which let ComfyUI's own asset-browser
+        group/collage same-prefix outputs into one composite thumbnail on at least one
+        real deployment; a later /history lookup then resolved to that composite instead
+        of this job's own single image. Root-caused 2026-08 against a live ComfyUI
+        instance (confirmed: the returned file exactly matched what ComfyUI's "Media
+        Assets" panel displayed for that shared-prefix group, not a bug in this file's
+        fetch/store logic). A unique prefix per job removes the collision outright,
+        regardless of the exact grouping mechanism on any given ComfyUI build/frontend."""
         prompt_text = str(workflow_payload.get("prompt") or "").strip()
         width, height = _resolve_dimensions(
             workflow_payload.get("aspect_ratio"),
@@ -155,11 +165,11 @@ class LiveComfyUIClient:
         seed = int(workflow_payload.get("seed") or uuid.uuid4().int % (2**32))
 
         if self._model_family == "qwen_image":
-            return self._build_qwen_image_graph(prompt_text, width, height, seed)
-        return self._build_checkpoint_graph(prompt_text, width, height, seed)
+            return self._build_qwen_image_graph(prompt_text, width, height, seed, filename_prefix)
+        return self._build_checkpoint_graph(prompt_text, width, height, seed, filename_prefix)
 
     def _build_checkpoint_graph(
-        self, prompt_text: str, width: int, height: int, seed: int
+        self, prompt_text: str, width: int, height: int, seed: int, filename_prefix: str
     ) -> dict[str, Any]:
         """Single-file checkpoint (e.g. classic SDXL) via CheckpointLoaderSimple, which
         bundles MODEL+CLIP+VAE in one file/node."""
@@ -201,12 +211,12 @@ class LiveComfyUIClient:
             },
             "9": {
                 "class_type": "SaveImage",
-                "inputs": {"filename_prefix": "imaginv", "images": ["8", 0]},
+                "inputs": {"filename_prefix": filename_prefix, "images": ["8", 0]},
             },
         }
 
     def _build_qwen_image_graph(
-        self, prompt_text: str, width: int, height: int, seed: int
+        self, prompt_text: str, width: int, height: int, seed: int, filename_prefix: str
     ) -> dict[str, Any]:
         """Qwen-Image's split-file architecture: separate diffusion model (UNETLoader),
         text encoder (CLIPLoader with type="qwen_image"), and VAE (VAELoader), plus a
@@ -248,7 +258,7 @@ class LiveComfyUIClient:
             },
             "9": {
                 "class_type": "SaveImage",
-                "inputs": {"filename_prefix": "imaginv", "images": ["8", 0]},
+                "inputs": {"filename_prefix": filename_prefix, "images": ["8", 0]},
             },
             "37": {
                 "class_type": "UNETLoader",
@@ -277,7 +287,12 @@ class LiveComfyUIClient:
         }
 
     async def submit(self, workflow_payload: dict, kind: str | None = None) -> ComfySubmitResult:
-        graph = self._build_prompt_graph(workflow_payload)
+        # Unique per submission -- see _build_prompt_graph's docstring for why every job
+        # sharing the literal "imaginv" prefix was a real bug, not just noise. Generated
+        # here (rather than reusing ComfyUI's own prompt_id, which doesn't exist yet at
+        # graph-build time) so it's guaranteed unique before the graph is even built.
+        filename_prefix = f"imaginv-{uuid.uuid4().hex[:12]}"
+        graph = self._build_prompt_graph(workflow_payload, filename_prefix)
         prompt_text = str(workflow_payload.get("prompt") or "").strip()
         if not prompt_text:
             prompt_id = str(uuid.uuid4())

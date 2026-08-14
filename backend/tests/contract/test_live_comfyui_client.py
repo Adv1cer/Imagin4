@@ -49,6 +49,31 @@ async def test_submit_posts_a_server_built_graph_never_a_client_graph() -> None:
 
 
 @pytest.mark.asyncio
+async def test_submit_uses_a_unique_filename_prefix_per_job() -> None:
+    """Regression test: every job used to share the literal SaveImage filename_prefix
+    "imaginv", which let ComfyUI's own asset-browser/gallery group same-prefix outputs
+    into one collage thumbnail -- a later /history lookup then resolved to that
+    composite image instead of this job's own single output (root-caused 2026-08
+    against a live ComfyUI instance whose "Media Assets" panel showed the exact same
+    collage for the colliding filename). Each submit() call must mint its own prefix."""
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"prompt_id": f"p{len(captured)}"})
+
+    client = _client(handler)
+    await client.submit({"prompt": "a cat", "aspect_ratio": "1:1", "resolution": "1K"})
+    await client.submit({"prompt": "a dog", "aspect_ratio": "1:1", "resolution": "1K"})
+
+    prefix_1 = captured[0]["prompt"]["9"]["inputs"]["filename_prefix"]
+    prefix_2 = captured[1]["prompt"]["9"]["inputs"]["filename_prefix"]
+    assert prefix_1.startswith("imaginv-")
+    assert prefix_2.startswith("imaginv-")
+    assert prefix_1 != prefix_2
+
+
+@pytest.mark.asyncio
 async def test_submit_qwen_image_family_builds_split_file_graph() -> None:
     """Qwen-Image uses a structurally different graph (UNETLoader/CLIPLoader/VAELoader +
     ModelSamplingAuraFlow, not CheckpointLoaderSimple) -- verified against the official
