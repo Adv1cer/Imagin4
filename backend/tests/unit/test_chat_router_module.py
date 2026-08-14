@@ -35,6 +35,35 @@ def test_fallback_clarification_result_starts_no_job_via_decision_layer():
     assert type(step).__name__ == "RespondClarification"
 
 
+def test_fallback_clarification_for_gemini_overload_says_busy_not_unclear():
+    """Regression: route_intent failing with a 503 UNAVAILABLE (Gemini overloaded --
+    see app.adapters.gemini._sanitized_error, which route_intent wraps into
+    RuntimeError("gemini_overloaded")) used to fall back to the same generic "I
+    couldn't understand you, please clarify" question as a genuinely malformed/
+    unclassifiable message -- confusing to a customer who typed something perfectly
+    clear while Gemini itself was just temporarily busy. Same class of fix as the
+    earlier image-generation error-classification change, applied to the chat/routing
+    path too."""
+    decision = _fallback_clarification("gemini_overloaded")
+    assert decision.intent == Intent.CLARIFICATION
+    assert "หนาแน่น" in decision.clarification_question
+    assert "แยกแยะคำขอไม่ได้" not in decision.clarification_question
+
+    step = decide_next_step(decision)
+    assert type(step).__name__ == "RespondClarification"
+
+
+def test_fallback_clarification_for_gemini_rate_limit_also_says_busy():
+    decision = _fallback_clarification("gemini_rate_limited")
+    assert "หนาแน่น" in decision.clarification_question
+
+
+def test_fallback_clarification_generic_reasons_keep_the_original_question():
+    for reason in ("invalid_schema", "llm_call_failed"):
+        decision = _fallback_clarification(reason)
+        assert "แยกแยะคำขอไม่ได้" in decision.clarification_question
+
+
 def test_poster_and_infographic_both_map_to_an_allowlisted_workflow():
     assert _WORKFLOW_FOR_ACTION_TYPE["poster"] == "poster_infographic"
     assert _WORKFLOW_FOR_ACTION_TYPE["infographic"] == "poster_infographic"

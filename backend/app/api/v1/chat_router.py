@@ -137,20 +137,43 @@ class SmartMessageOut(BaseModel):
     pending_action: PendingActionOut | None = None
 
 
+# Reasons that mean "Gemini itself is temporarily overloaded/rate-limited" (see
+# app.adapters.gemini._sanitized_error, which route_intent's RuntimeError message is
+# built from) as opposed to "we genuinely couldn't classify this message". Distinguished
+# so the customer-facing question doesn't say "I couldn't understand you" when the real
+# cause is Google's API being busy -- same "don't let the customer blame us/themselves
+# for Gemini's own outage" reasoning as the image-generation fix earlier (see
+# gemini.py's _sanitized_error docstring for the original 2026-08 incident this pattern
+# comes from).
+_OVERLOAD_REASONS = frozenset({"gemini_overloaded", "gemini_rate_limited"})
+_OVERLOAD_CLARIFICATION_QUESTION = (
+    "ขอโทษค่ะ ตอนนี้ระบบ AI มีผู้ใช้งานหนาแน่นชั่วคราว กรุณาลองส่งข้อความเดิมอีกครั้งในอีกสักครู่นะคะ 🙏"
+)
+_GENERIC_CLARIFICATION_QUESTION = (
+    "ขอโทษค่ะ ตอนนี้ระบบแยกแยะคำขอไม่ได้ ช่วยบอกอีกครั้งได้ไหมคะว่าต้องการแชทคุยเฉยๆ, "
+    "สร้างภาพทั่วไป, ทำโปสเตอร์ หรือทำอินโฟกราฟิกคะ?"
+)
+
+
 def _fallback_clarification(reason: str) -> RouteDecision:
     """Fail-safe decision used whenever the LLM's output is missing, malformed, or the
     call itself failed. Never guesses GENERAL_IMAGE/POSTER/INFOGRAPHIC -- an
     unclassifiable message always degrades to asking the user to clarify, never to
-    silently starting (let alone billing) a generation."""
+    silently starting (let alone billing) a generation.
+
+    `reason` is either "invalid_schema" / "llm_call_failed" (generic clarification
+    question) or one of _OVERLOAD_REASONS (Gemini-is-busy-specific question) -- see
+    process_routed_message's except-block, which is the only caller that can produce the
+    latter."""
+    question = (
+        _OVERLOAD_CLARIFICATION_QUESTION if reason in _OVERLOAD_REASONS else _GENERIC_CLARIFICATION_QUESTION
+    )
     return RouteDecision(
         intent=Intent.CLARIFICATION,
         normalized_prompt="",
         exact_text=[],
         missing_fields=[],
-        clarification_question=(
-            "ขอโทษค่ะ ตอนนี้ระบบแยกแยะคำขอไม่ได้ ช่วยบอกอีกครั้งได้ไหมคะว่าต้องการแชทคุยเฉยๆ, "
-            "สร้างภาพทั่วไป, ทำโปสเตอร์ หรือทำอินโฟกราฟิกคะ?"
-        ),
+        clarification_question=question,
         reason_code=ReasonCode.AMBIGUOUS_VISUAL_DELIVERABLE,
     )
 
@@ -272,14 +295,20 @@ async def process_routed_message(
         )
         decision = _fallback_clarification("invalid_schema")
     except Exception as exc:
-        validation_outcome = "llm_call_failed"
+        # route_intent wraps every failure as RuntimeError(_sanitized_error(exc)) (see
+        # app.adapters.gemini._sanitized_error) -- str(exc) is therefore always one of a
+        # small, controlled set of safe codes, never raw exception/response text, so
+        # matching on it here doesn't violate the "no raw exception text" rule.
+        sanitized_code = str(exc) if isinstance(exc, RuntimeError) else ""
+        validation_outcome = sanitized_code if sanitized_code in _OVERLOAD_REASONS else "llm_call_failed"
         logger.warning(
-            "chat_router: routing call failed conv=%s user=%s error_category=%s",
+            "chat_router: routing call failed conv=%s user=%s error_category=%s sanitized=%s",
             conv.id,
             user.id,
             type(exc).__name__,
+            sanitized_code or "n/a",
         )
-        decision = _fallback_clarification("llm_call_failed")
+        decision = _fallback_clarification(validation_outcome)
 
     decision = await _research_augment(gemini, history, decision, conv.id, user.id)
 
