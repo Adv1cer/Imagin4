@@ -33,9 +33,17 @@ class CompositeComfyUIClient:
         comfyui_client: ComfyUIClient,
         gemini_client: ComfyUIClient | None,
         comfy_prompt_designer=None,
+        image_provider_name: str = "gemini",
     ) -> None:
         self._comfyui = comfyui_client
         self._gemini = gemini_client
+        # Name of whichever provider `gemini_client` actually holds -- "gemini" (default,
+        # preserves prior behavior/error strings) or "openrouter" (see
+        # Settings.image_provider, app/core/config.py). Only used to phrase the
+        # not-configured failure below correctly; routing logic itself is unchanged
+        # (still keyed on workflow.backend == "gemini", an internal workflow-registry
+        # label unrelated to which real provider is wired).
+        self._image_provider_name = image_provider_name
         # Optional async callable (prompt: str, exact_text: list[str]) -> str -- normally
         # GeminiTextClient.design_comfyui_prompt, wired from app/main.py. Best-effort
         # refinement of the ComfyUI-bound prompt before delegating to the underlying
@@ -68,17 +76,22 @@ class CompositeComfyUIClient:
         adapter, backend_name = self._resolve_backend(kind)
 
         if adapter is None:
-            # backend_name == "gemini" but no Gemini client configured.
+            # backend_name == "gemini" (the workflow-registry label) but no image-
+            # generation client is actually configured -- error string names whichever
+            # real provider was supposed to be wired (see _image_provider_name above),
+            # not always literally "gemini", so the failure reads correctly under
+            # Settings.image_provider="openrouter" too.
             prompt_id = str(uuid.uuid4())
             self._local_failures[prompt_id] = ComfyStatus(
                 prompt_id=prompt_id,
                 state="failed",
-                error="gemini_not_configured",
+                error=f"{self._image_provider_name}_not_configured",
             )
             logger.warning(
-                "routing_comfyui: kind=%s requires gemini backend but APP_GEMINI_API_KEY "
-                "is unset; failing job instead of silently falling back to ComfyUI",
+                "routing_comfyui: kind=%s requires the %s image backend but it is not "
+                "configured; failing job instead of silently falling back to ComfyUI",
                 kind,
+                self._image_provider_name,
             )
             return ComfySubmitResult(prompt_id=prompt_id)
 

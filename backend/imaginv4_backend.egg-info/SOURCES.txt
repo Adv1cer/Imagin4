@@ -7,6 +7,7 @@ app/adapters/gemini.py
 app/adapters/routing_comfyui.py
 app/adapters/comfyui/__init__.py
 app/adapters/comfyui/live.py
+app/adapters/comfyui/multi_worker.py
 app/adapters/queue/__init__.py
 app/adapters/storage/__init__.py
 app/api/__init__.py

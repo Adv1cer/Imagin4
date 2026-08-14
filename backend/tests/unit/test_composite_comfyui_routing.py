@@ -73,6 +73,68 @@ async def test_poster_infographic_fails_clearly_without_gemini_configured() -> N
     assert result.prompt_id not in comfyui._payloads  # did NOT silently fall back
 
 
+@pytest.mark.asyncio
+async def test_poster_infographic_not_configured_error_names_openrouter_when_selected() -> None:
+    """Settings.image_provider="openrouter" (app/core/config.py) with no client wired --
+    the failure must say "openrouter_not_configured", not the old hardcoded
+    "gemini_not_configured", or the customer-facing message would blame the wrong
+    provider/misdirect debugging effort. See CompositeComfyUIClient's
+    image_provider_name param and app/main.py's wiring."""
+    comfyui = MockComfyUIClient()
+    router = CompositeComfyUIClient(
+        comfyui_client=comfyui, gemini_client=None, image_provider_name="openrouter"
+    )
+
+    result = await router.submit({"prompt": "a poster"}, kind="poster_infographic")
+    status = await router.get_status(result.prompt_id)
+
+    assert status.state == "failed"
+    assert status.error == "openrouter_not_configured"
+
+
+@pytest.mark.asyncio
+async def test_poster_infographic_routes_to_whichever_client_is_wired_as_gemini_client() -> None:
+    """CompositeComfyUIClient doesn't care whether the object passed as `gemini_client`
+    is actually GeminiImageComfyUIClient or OpenRouterImageComfyUIClient -- routing is
+    based purely on the workflow's `backend` field, so any ComfyUIClient-shaped adapter
+    works. This is what makes Settings.image_provider a pure config switch with no
+    routing-layer changes needed."""
+    comfyui = MockComfyUIClient()
+
+    class FakeOpenRouter:
+        def __init__(self) -> None:
+            self.submitted: list[dict] = []
+
+        async def submit(self, workflow_payload, kind=None):
+            from app.adapters.comfyui import ComfySubmitResult
+
+            self.submitted.append(workflow_payload)
+            return ComfySubmitResult(prompt_id="openrouter-prompt-1")
+
+        async def get_status(self, prompt_id):
+            from app.adapters.comfyui import ComfyStatus
+
+            return ComfyStatus(prompt_id=prompt_id, state="succeeded", outputs=[])
+
+        async def cancel(self, prompt_id):
+            pass
+
+        async def health(self):
+            return True
+
+    openrouter = FakeOpenRouter()
+    router = CompositeComfyUIClient(
+        comfyui_client=comfyui, gemini_client=openrouter, image_provider_name="openrouter"
+    )
+
+    result = await router.submit({"prompt": "a poster"}, kind="poster_infographic")
+    status = await router.get_status(result.prompt_id)
+
+    assert status.state == "succeeded"
+    assert len(openrouter.submitted) == 1
+    assert result.prompt_id not in comfyui._payloads
+
+
 # --- comfy_prompt_designer: the "refine the prompt before sending to ComfyUI" step
 # (mirrors GeminiImageComfyUIClient's prompt_designer on the Gemini side). ---
 

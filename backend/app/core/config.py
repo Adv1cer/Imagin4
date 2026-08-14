@@ -167,6 +167,47 @@ class Settings(BaseSettings):
     # re-classify, three sequential calls) bounded to roughly 30+20+30=80s instead of 90s.
     gemini_research_timeout_s: float = 20.0
 
+    # Image generation provider for "Poster / Infographic" jobs specifically (see
+    # app/domain/jobs/workflow_registry.py's `backend` field / CompositeComfyUIClient in
+    # app/adapters/routing_comfyui.py). "gemini" (default) calls Google's Gemini image
+    # models directly via gemini_* above. "openrouter" instead routes through
+    # OpenRouter's unified Image API (one API key, many underlying models -- Gemini,
+    # Seedream, FLUX, etc. -- see openrouter_* below), useful if you want a different
+    # underlying model or a separate billing account without touching code. Chat replies
+    # and the semantic router (GeminiTextClient) are UNCHANGED by this setting -- they
+    # always use Gemini, since OpenRouter's image endpoint is image-only. Ordinary
+    # "Image" generation (workflow image_basic) is also unaffected -- it always uses
+    # ComfyUI (comfy_mode above) regardless of this setting. Whichever provider is NOT
+    # selected here does not need its API key configured; app/main.py logs clearly which
+    # provider is actually wired at startup.
+    image_provider: Literal["gemini", "openrouter"] = "gemini"
+
+    # OpenRouter (https://openrouter.ai/) -- alternative to Gemini for "Poster /
+    # Infographic" generation, selected via image_provider="openrouter" above. Uses
+    # OpenRouter's dedicated Image API (POST {openrouter_base_url}/images, NOT the
+    # chat/completions endpoint) -- a single synchronous call returning base64-encoded
+    # image data (response["data"][0]["b64_json"]), same "submit does the whole thing,
+    # get_status just looks up the cached result" shape as GeminiImageComfyUIClient (see
+    # app/adapters/openrouter.py). Billing is all-or-nothing per OpenRouter's docs: a
+    # failed generation errors out and is not billed, so there's no separate "partial
+    # charge" case to handle. Get a key at https://openrouter.ai/keys.
+    #
+    # Model slugs are OpenRouter's own catalog names, not Google's/ByteDance's/BFL's raw
+    # model names -- confirmed via https://openrouter.ai/models?output_modalities=image
+    # (2026-08): "google/gemini-3-pro-image-preview" ("Nano Banana Pro"),
+    # "google/gemini-2.5-flash-image" ("Nano Banana"), "bytedance-seed/seedream-4.5",
+    # "black-forest-labs/flux.2-pro" are all real, current slugs as of 2026-08 -- but
+    # like Gemini's own model names (see gemini_image_model's comment above), these
+    # rotate over time; a 400/404 "model not found" is a config fix via this env var, not
+    # a bug. Default picked for output quality parity with the direct-Gemini path's
+    # default; switch to the flash variant if cost/latency matters more than quality.
+    openrouter_api_key: str | None = None
+    openrouter_image_model: str = "google/gemini-3-pro-image-preview"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # Same reasoning as gemini_image_request_timeout_s directly above: a detail-heavy
+    # poster/infographic prompt routinely takes longer than a simple image.
+    openrouter_image_request_timeout_s: float = 90.0
+
     # Rate limiting (requests per window per identity)
     rl_login_per_min: int = 10
     rl_refresh_per_min: int = 30

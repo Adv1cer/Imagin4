@@ -101,58 +101,99 @@ def _build_state(app: FastAPI) -> None:
             ),
         )
 
+    # GeminiTextClient (chat replies + semantic router + both providers' "design a
+    # better prompt first" step) is wired whenever a Gemini key exists, REGARDLESS of
+    # settings.image_provider -- OpenRouter's Image API is image-only, it has no
+    # chat/completions role here, so text/routing/research always stays on Gemini. Only
+    # which client actually generates poster/infographic PIXELS switches below.
     if settings.gemini_api_key:
-        # Gemini (Google AI Studio) powers "Poster / Infographic" generation
-        # specifically (see app/domain/jobs/workflow_registry.py's `backend` field and
-        # app/adapters/routing_comfyui.py:CompositeComfyUIClient) and real text chat
-        # replies. It does NOT replace ComfyUI for ordinary image generation -- both
-        # backends are wired simultaneously and CompositeComfyUIClient routes each job
-        # to the right one based on its workflow.
-        from app.adapters.gemini import GeminiImageComfyUIClient, GeminiTextClient
+        from app.adapters.gemini import GeminiTextClient
 
-        # Text client constructed first: the image client uses its design_image_prompt
-        # method as a best-effort "prompt engineer" step (see
-        # GeminiImageComfyUIClient.__init__'s prompt_designer param) that runs before
-        # every generation to turn the router's short prompt into a detailed,
-        # well-composed image-generation prompt instead of sending it to the image
-        # model as-is.
         app.state.gemini_text_client = GeminiTextClient(
             api_key=settings.gemini_api_key,
             model=settings.gemini_text_model,
             timeout_s=settings.gemini_request_timeout_s,
             research_timeout_s=settings.gemini_research_timeout_s,
         )
+        logger.info(
+            "gemini: wired for chat replies + routing (model=%s)", settings.gemini_text_model
+        )
+    else:
+        app.state.gemini_text_client = None
+        logger.info(
+            "gemini: APP_GEMINI_API_KEY not set -- chat replies will fail clearly "
+            "(POST .../assistant-reply 503) instead of silently degrading"
+        )
+
+    prompt_designer = (
+        app.state.gemini_text_client.design_image_prompt
+        if app.state.gemini_text_client is not None
+        else None
+    )
+
+    # Poster/infographic PIXEL-generation backend -- switches on settings.image_provider
+    # (see its comment in app/core/config.py). Historically this variable only ever held
+    # a Gemini client (hence CompositeComfyUIClient's constructor param still being named
+    # `gemini_client` below); it now holds whichever provider is actually selected.
+    if settings.image_provider == "openrouter":
+        if settings.openrouter_api_key:
+            from app.adapters.openrouter import OpenRouterImageComfyUIClient
+
+            gemini_image_client = OpenRouterImageComfyUIClient(
+                api_key=settings.openrouter_api_key,
+                model=settings.openrouter_image_model,
+                storage=app.state.storage,
+                timeout_s=settings.openrouter_image_request_timeout_s,
+                base_url=settings.openrouter_base_url,
+                prompt_designer=prompt_designer,
+            )
+            logger.info(
+                "image_provider=openrouter: wired for poster/infographic generation "
+                "(model=%s); ordinary image generation still uses %s",
+                settings.openrouter_image_model,
+                "mock ComfyUI" if settings.comfy_mode == "mock" else "ComfyUI",
+            )
+        else:
+            gemini_image_client = None
+            logger.info(
+                "image_provider=openrouter but APP_OPENROUTER_API_KEY not set -- "
+                "poster/infographic generation will fail clearly (job failed, "
+                "error_detail=openrouter_not_configured) instead of silently degrading"
+            )
+    elif settings.gemini_api_key:
+        from app.adapters.gemini import GeminiImageComfyUIClient
+
         gemini_image_client = GeminiImageComfyUIClient(
             api_key=settings.gemini_api_key,
             model=settings.gemini_image_model,
             storage=app.state.storage,
             timeout_s=settings.gemini_image_request_timeout_s,
-            prompt_designer=app.state.gemini_text_client.design_image_prompt,
+            prompt_designer=prompt_designer,
         )
         logger.info(
-            "gemini: wired for poster/infographic generation (model=%s) and chat (model=%s); "
+            "image_provider=gemini: wired for poster/infographic generation (model=%s); "
             "ordinary image generation still uses %s",
             settings.gemini_image_model,
-            settings.gemini_text_model,
             "mock ComfyUI" if settings.comfy_mode == "mock" else "ComfyUI",
         )
     else:
         gemini_image_client = None
-        app.state.gemini_text_client = None
         logger.info(
-            "gemini: APP_GEMINI_API_KEY not set -- ordinary image generation uses %s, "
-            "poster/infographic generation and chat replies will fail clearly "
-            "(job failed / POST .../assistant-reply 503) instead of silently degrading",
-            "mock ComfyUI" if settings.comfy_mode == "mock" else "ComfyUI",
+            "image_provider=gemini but APP_GEMINI_API_KEY not set -- poster/infographic "
+            "generation will fail clearly (job failed, error_detail=gemini_not_configured) "
+            "instead of silently degrading"
         )
 
     app.state.comfy_client = CompositeComfyUIClient(
         comfyui_client=comfyui_client,
         gemini_client=gemini_image_client,
-        # Same best-effort "design a good prompt first" step as the Gemini image path,
-        # applied to ordinary ComfyUI (GENERAL_IMAGE) generation -- None when Gemini
-        # isn't configured, in which case CompositeComfyUIClient just uses the router's
-        # prompt unmodified (unchanged from before this existed).
+        image_provider_name=settings.image_provider,
+        # Same best-effort "design a good prompt first" step as the poster/infographic
+        # path, applied to ordinary ComfyUI (GENERAL_IMAGE) generation -- None when
+        # Gemini isn't configured, in which case CompositeComfyUIClient just uses the
+        # router's prompt unmodified. Deliberately still keyed off gemini_text_client
+        # (not image_provider) since this is a text-only design step, unrelated to which
+        # provider renders the final poster pixels.
         comfy_prompt_designer=(
             app.state.gemini_text_client.design_comfyui_prompt
             if app.state.gemini_text_client is not None
