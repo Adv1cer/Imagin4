@@ -89,8 +89,15 @@ so retried jobs don't get starved behind newer high-priority jobs forever.
 cd backend
 cp .env.example .env            # edit as needed
 
-# Full stack (Postgres/pgbouncer/Redis/MinIO/mock-comfyui/api/scheduler/reconciler):
-docker compose up -d postgres pgbouncer redis minio minio-init mock-comfyui
+# Full stack, mock ComfyUI (no GPU needed -- local dev / CI):
+docker compose --profile mock up -d postgres pgbouncer redis minio minio-init mock-comfyui
+docker compose run --rm api alembic upgrade head
+docker compose up -d api scheduler reconciler
+
+# Full stack, real GPU worker(s) (see docker/comfyui-worker/Dockerfile and set
+# APP_COMFY_MODE=live + APP_COMFY_WORKER_BASE_URLS_CSV in .env first -- NEVER run this
+# alongside mock-comfyui, both bind host port 8188 and will collide silently):
+docker compose up -d postgres pgbouncer redis minio minio-init comfyui-worker-1 comfyui-worker-2
 docker compose run --rm api alembic upgrade head
 docker compose up -d api scheduler reconciler
 
@@ -257,7 +264,16 @@ In production, prefer S3 versioning + cross-region replication over manual mirro
 - [ ] Replace `InMemoryJobQueue` with a Postgres `SELECT ... FOR UPDATE SKIP LOCKED`
       implementation of the `JobQueue` port (see comments in `app/adapters/queue/__init__.py`).
 - [ ] Replace `InMemoryObjectStorage` with an S3/MinIO-backed `ObjectStorage` implementation.
-- [ ] Implement the live `ComfyUIClient` HTTP adapter (`APP_COMFY_MODE=live`).
+- [x] Implement the live `ComfyUIClient` HTTP adapter (`APP_COMFY_MODE=live`).
+- [x] Run more than one ComfyUI execution engine at once -- `MultiWorkerComfyUIClient`
+      (`app/adapters/comfyui/multi_worker.py`, wired via `APP_COMFY_WORKER_BASE_URLS_CSV`)
+      round-robins across a fixed, statically-configured list of worker URLs (e.g.
+      `comfyui-worker-1`/`comfyui-worker-2` in docker-compose.yml). This is deliberately
+      simpler than the `comfy_workers`-table-backed scoring/heartbeat system described
+      below -- fine for a small fixed worker count, but doesn't do capability-aware
+      routing, health-based selection, or dynamic registration. Graduate to the real
+      thing (next line) if the worker pool needs to grow dynamically or route by model
+      capability.
 - [ ] Wire `app/services/scheduler.py` / `reconciler.py` to a real `session_factory` so
       `_reserve_capacity_by_backend` scores live `comfy_workers` rows instead of falling
       back to `default_comfy_active_slots` (Gemini capacity is separate --

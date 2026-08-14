@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.adapters.comfyui import MockComfyUIClient
 from app.adapters.comfyui.live import LiveComfyUIClient
+from app.adapters.comfyui.multi_worker import MultiWorkerComfyUIClient
 from app.adapters.queue import InMemoryJobQueue
 from app.adapters.routing_comfyui import CompositeComfyUIClient
 from app.adapters.storage import InMemoryObjectStorage
@@ -59,25 +60,39 @@ def _build_state(app: FastAPI) -> None:
         # trivial) image behind its object_key -- see MockComfyUIClient's docstring.
         comfyui_client = MockComfyUIClient(storage=app.state.storage)
     else:
-        comfyui_client = LiveComfyUIClient(
-            base_url=settings.comfy_base_url,
-            storage=app.state.storage,
-            checkpoint_name=settings.comfy_checkpoint_name,
-            model_family=settings.comfy_model_family,
-            diffusion_model_name=settings.comfy_diffusion_model_name,
-            clip_name=settings.comfy_clip_name,
-            vae_name=settings.comfy_vae_name,
-            model_sampling_shift=settings.comfy_model_sampling_shift,
-            sampler_name=settings.comfy_sampler_name,
-            scheduler=settings.comfy_scheduler,
-            steps=settings.comfy_steps,
-            cfg_scale=settings.comfy_cfg_scale,
-            negative_prompt=settings.comfy_negative_prompt,
-            request_timeout_s=settings.comfy_request_timeout_s,
+        # comfy_worker_base_urls_csv (when set) wins over the single comfy_base_url --
+        # one LiveComfyUIClient per worker URL, all sharing the same model/checkpoint
+        # config, wrapped so the scheduler/reconciler still see one ComfyUIClient. See
+        # app/adapters/comfyui/multi_worker.py's docstring for why a single client can't
+        # just round-robin HTTP requests to different base_urls: prompt_id ownership must
+        # be tracked per-worker.
+        worker_urls = settings.comfy_worker_base_urls or [settings.comfy_base_url]
+
+        def _build_live_client(base_url: str) -> LiveComfyUIClient:
+            return LiveComfyUIClient(
+                base_url=base_url,
+                storage=app.state.storage,
+                checkpoint_name=settings.comfy_checkpoint_name,
+                model_family=settings.comfy_model_family,
+                diffusion_model_name=settings.comfy_diffusion_model_name,
+                clip_name=settings.comfy_clip_name,
+                vae_name=settings.comfy_vae_name,
+                model_sampling_shift=settings.comfy_model_sampling_shift,
+                sampler_name=settings.comfy_sampler_name,
+                scheduler=settings.comfy_scheduler,
+                steps=settings.comfy_steps,
+                cfg_scale=settings.comfy_cfg_scale,
+                negative_prompt=settings.comfy_negative_prompt,
+                request_timeout_s=settings.comfy_request_timeout_s,
+            )
+
+        live_clients = [_build_live_client(url) for url in worker_urls]
+        comfyui_client = (
+            live_clients[0] if len(live_clients) == 1 else MultiWorkerComfyUIClient(live_clients)
         )
         logger.info(
-            "comfyui: live mode, base_url=%s family=%s diffusion_model=%s",
-            settings.comfy_base_url,
+            "comfyui: live mode, workers=%s family=%s diffusion_model=%s",
+            worker_urls,
             settings.comfy_model_family,
             (
                 settings.comfy_diffusion_model_name

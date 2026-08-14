@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Entrypoint for the comfyui-worker-* docker-compose services. ComfyUI's own source is
+# bind-mounted to /workspace/ComfyUI (see docker-compose.yml), NOT baked into the image,
+# so dependency install has to happen at container start against whatever requirements.txt
+# is on the mounted volume right now -- see Dockerfile's comment for why.
+set -euo pipefail
+
+cd /workspace/ComfyUI
+
+echo "comfyui-worker: checking GPU visibility..."
+nvidia-smi || echo "comfyui-worker: WARNING - nvidia-smi failed; GPU may not be visible to this container (check docker-compose.yml's GPU reservation and that the NVIDIA Container Toolkit is installed on the host)"
+python -c "import torch; print('comfyui-worker: torch', torch.__version__, 'cuda available:', torch.cuda.is_available())" \
+  || echo "comfyui-worker: WARNING - could not import torch / check CUDA availability"
+
+if [ -f requirements.txt ]; then
+  echo "comfyui-worker: installing ComfyUI's requirements.txt (skipping torch/torchvision/torchaudio -- the base image's NGC-matched build must not be overwritten by a generic PyPI wheel)..."
+  grep -viE '^(torch|torchvision|torchaudio)([<>=! ]|$)' requirements.txt > /tmp/requirements.filtered.txt || true
+  pip install --no-cache-dir -r /tmp/requirements.filtered.txt
+else
+  echo "comfyui-worker: WARNING - no requirements.txt found at /workspace/ComfyUI (bind mount empty/wrong path?)"
+fi
+
+# --listen 0.0.0.0 so other containers (the api/scheduler/reconciler services) can reach
+# this over the docker network by service name, e.g. http://comfyui-worker-1:8188.
+exec python main.py --listen 0.0.0.0 --port 8188 "$@"

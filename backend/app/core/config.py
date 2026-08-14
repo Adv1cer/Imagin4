@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     max_active_jobs_per_user: int = 1
     max_queued_jobs_per_user: int = 3
     global_queue_cap: int = 5000
+    # How many image_basic jobs the scheduler may claim+dispatch concurrently. Only
+    # meaningful up to how many independent ComfyUI execution engines actually exist to
+    # run them -- see comfy_worker_base_urls_csv above. With a single ComfyUI process
+    # (comfy_worker_base_urls_csv empty), keep this at 1 until benchmarked otherwise: a
+    # single GPU can't run two full generations in parallel just because two jobs were
+    # dispatched to the same process. With N workers configured, this can go up to N (one
+    # in-flight job per worker) -- but per the same single-GPU caveat, if those N workers
+    # share one physical GPU, more concurrent jobs does not mean proportionally faster
+    # completion, only more overlap of otherwise-idle time (I/O, model loading, etc.).
+    # Benchmark actual wall-clock throughput at each step rather than assuming.
     default_comfy_active_slots: int = 1
     # SEPARATE from the ComfyUI slot count above on purpose: ComfyUI dispatch is
     # GPU-bound (one local device, one job at a time until benchmarked otherwise -- see
@@ -74,6 +84,20 @@ class Settings(BaseSettings):
     # ComfyUI
     comfy_mode: Literal["mock", "live"] = "mock"
     comfy_base_url: str = "http://localhost:8188"
+    # Comma-separated base URLs for MULTIPLE independent ComfyUI instances (e.g. the
+    # comfyui-worker-1/comfyui-worker-2 docker-compose services), so the scheduler can
+    # actually dispatch concurrently-claimed jobs (see default_comfy_active_slots) to
+    # more than one execution engine instead of serializing everything behind one
+    # process. Empty (default) means "use comfy_base_url as a single worker" --
+    # unchanged, backward-compatible behavior. When set, this WINS over comfy_base_url
+    # entirely (see app/main.py); all listed workers share every other comfy_* setting
+    # below (same model/checkpoint config assumed identical across workers).
+    #
+    # IMPORTANT (single-GPU caveat, see README/project instructions): more worker
+    # processes does not multiply GPU compute. If they all share one physical GPU,
+    # expect at best partial overlap, not linear speedup -- start with 2 and benchmark
+    # actual wall-clock throughput before scaling to more.
+    comfy_worker_base_urls_csv: str = ""
     comfy_request_timeout_s: float = 10.0
     # Only used when comfy_mode == "live" (see app/adapters/comfyui/live.py). Filenames
     # below MUST match exactly what's installed on the target ComfyUI instance -- there
@@ -105,6 +129,10 @@ class Settings(BaseSettings):
     # Qwen-Image's official template uses cfg=4.0 (vs the classic SDXL default of ~7.0).
     comfy_cfg_scale: float = 4.0
     comfy_negative_prompt: str = ""
+
+    @property
+    def comfy_worker_base_urls(self) -> list[str]:
+        return [u.strip() for u in self.comfy_worker_base_urls_csv.split(",") if u.strip()]
 
     # Gemini (Google AI Studio) -- when gemini_api_key is set, it replaces both the
     # image-generation backend (in place of ComfyUI) and powers real text chat

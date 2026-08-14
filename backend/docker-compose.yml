@@ -3,12 +3,26 @@
 # repo's Settings (app/core/config.py) and models (app/db/models.py) but has NOT been
 # run with `docker compose up` -- see README.md "Known limitations" before relying on it.
 #
-# Usage:
+# Usage (mock ComfyUI -- local dev / CI, no GPU needed):
 #   cp .env.example .env   # then edit as needed
-#   docker compose up -d postgres pgbouncer redis minio minio-init mock-comfyui
+#   docker compose --profile mock up -d postgres pgbouncer redis minio minio-init mock-comfyui
 #   docker compose run --rm api alembic upgrade head
 #   docker compose up -d api scheduler reconciler
 #   docker compose --profile load-test run --rm k6 run /scripts/smoke.js   # opt-in only
+#
+# Usage (real GPU workers -- see comfyui-worker-* below and set APP_COMFY_MODE=live +
+# APP_COMFY_WORKER_BASE_URLS_CSV in .env):
+#   cp .env.example .env   # then edit as needed
+#   docker compose up -d postgres pgbouncer redis minio minio-init comfyui-worker-1 comfyui-worker-2
+#   docker compose run --rm api alembic upgrade head
+#   docker compose up -d api scheduler reconciler
+#
+# mock-comfyui is gated behind `--profile mock` on purpose (2026-08): it used to start by
+# default and bind host port 8188 unconditionally, which silently collided with a real
+# ComfyUI (or comfyui-worker-*) also listening on 8188 on the same host -- requests would
+# nondeterministically land on whichever one actually held the port, producing wrong/
+# confusing results with no error. Never run mock-comfyui and a real ComfyUI target on
+# the same port at the same time.
 
 name: imaginv4
 
@@ -112,7 +126,10 @@ services:
     # Python package -- swap for the real ComfyUI image (or point APP_COMFY_BASE_URL at
     # a real GPU host) for production. Uses a tiny static echo server as a stand-in;
     # replace `image` with a maintained mock-comfyui image before relying on this.
+    # profiles: only starts with `docker compose --profile mock up ...` -- see the
+    # port-collision warning in this file's header comment before removing this.
     image: mendhak/http-https-echo:31
+    profiles: ["mock"]
     restart: unless-stopped
     environment:
       HTTP_PORT: "8188"
@@ -123,6 +140,61 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # Real GPU workers, running ComfyUI from source bind-mounted from the host (see
+  # docker/comfyui-worker/Dockerfile's comment on the NGC PyTorch base image and why).
+  # Starting with 2 on purpose (2026-08 product decision): benchmark actual wall-clock
+  # throughput with 2 concurrent jobs before adding more -- if these share one physical
+  # GPU (e.g. a DGX Spark's single Superchip), more worker containers does not multiply
+  # GPU compute, only overlaps otherwise-idle time. See Settings.default_comfy_active_slots
+  # / comfy_worker_base_urls_csv docstrings in app/core/config.py.
+  #
+  # Set COMFYUI_HOST_PATH in .env to your actual ComfyUI checkout (the same directory you
+  # currently run `python main.py` from natively) -- both workers mount the SAME path
+  # read-write, so they share one set of models/custom_nodes/output. Point
+  # APP_COMFY_WORKER_BASE_URLS_CSV at these two service names (see .env.example) once
+  # they're up, then stop running ComfyUI natively to avoid a second port-8188 collision.
+  comfyui-worker-1:
+    build: ./docker/comfyui-worker
+    restart: unless-stopped
+    volumes:
+      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
+    ports:
+      - "8188:8188"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8188/system_stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 120s # model loading can take a while on first request
+
+  comfyui-worker-2:
+    build: ./docker/comfyui-worker
+    restart: unless-stopped
+    volumes:
+      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
+    ports:
+      - "8189:8188"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8188/system_stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
 
   api:
     build: .
