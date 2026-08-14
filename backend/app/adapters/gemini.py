@@ -43,7 +43,27 @@ _ROLE_TO_GEMINI = {"user": "user", "assistant": "model"}
 
 def _sanitized_error(exc: Exception) -> str:
     """Never echo raw exception text (which can include request payload fragments)
-    back to clients or into job_events; keep only the exception class name."""
+    back to clients or into job_events; keep only the exception class name -- EXCEPT for
+    a couple of specific, high-value cases below, where we surface a distinct, safe
+    (not raw-text) code so the customer-facing message doesn't read as "our system is
+    broken" when it's actually Google's API temporarily refusing the request.
+
+    google-genai's APIError (parent of ServerError/ClientError) exposes a structured
+    `.code` (HTTP status int) and `.status` (Google's string enum, e.g. "UNAVAILABLE")
+    -- see google.genai.errors.APIError. These are controlled, non-arbitrary fields
+    (not the raw exception message/response body), so surfacing them is safe under the
+    same "no raw exception text" rule the generic fallback below follows.
+
+    Reported 2026-08 (Chet): a poster job failed with the generic `gemini_error:
+    ServerError`, which reads to a customer like a bug in OUR system, when the actual
+    cause was `503 UNAVAILABLE: This model is currently experiencing high demand` --
+    Google's own image model being temporarily overloaded, nothing wrong on our end."""
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    if code == 503 or status == "UNAVAILABLE":
+        return "gemini_overloaded"
+    if code == 429 or status == "RESOURCE_EXHAUSTED":
+        return "gemini_rate_limited"
     return f"gemini_error:{type(exc).__name__}"
 
 
