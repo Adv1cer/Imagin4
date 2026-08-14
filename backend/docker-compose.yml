@@ -11,11 +11,13 @@
 #   docker compose --profile load-test run --rm k6 run /scripts/smoke.js   # opt-in only
 #
 # Usage (real GPU workers -- see comfyui-worker-* below and set APP_COMFY_MODE=live +
-# APP_COMFY_WORKER_BASE_URLS_CSV in .env):
+# APP_COMFY_WORKER_BASE_URLS_CSV in .env). Listed here with all 4 workers; drop the
+# ones you don't want (e.g. just comfyui-worker-1 comfyui-worker-2) and match
+# APP_COMFY_WORKER_BASE_URLS_CSV / APP_DEFAULT_COMFY_ACTIVE_SLOTS accordingly:
 #   cp .env.example .env   # then edit as needed
-#   docker compose up -d postgres pgbouncer redis minio minio-init comfyui-worker-1 comfyui-worker-2
+#   docker compose up -d postgres pgbouncer redis minio minio-init comfyui-worker-1 comfyui-worker-2 comfyui-worker-3 comfyui-worker-4
 #   docker compose run --rm api alembic upgrade head
-#   docker compose up -d api scheduler reconciler
+#   docker compose up -d --build api scheduler reconciler
 #
 # mock-comfyui is gated behind `--profile mock` on purpose (2026-08): it used to start by
 # default and bind host port 8188 unconditionally, which silently collided with a real
@@ -143,17 +145,19 @@ services:
 
   # Real GPU workers, running ComfyUI from source bind-mounted from the host (see
   # docker/comfyui-worker/Dockerfile's comment on the NGC PyTorch base image and why).
-  # Starting with 2 on purpose (2026-08 product decision): benchmark actual wall-clock
-  # throughput with 2 concurrent jobs before adding more -- if these share one physical
-  # GPU (e.g. a DGX Spark's single Superchip), more worker containers does not multiply
-  # GPU compute, only overlaps otherwise-idle time. See Settings.default_comfy_active_slots
+  # Started at 2 originally (2026-08 product decision) to benchmark before scaling
+  # further; scaled to 4 (comfyui-worker-3/4 below) after that. If these share one
+  # physical GPU (e.g. a DGX Spark's single Superchip), more worker containers does not
+  # multiply GPU compute, only overlaps otherwise-idle time -- re-benchmark wall-clock
+  # throughput whenever you change the count. See Settings.default_comfy_active_slots
   # / comfy_worker_base_urls_csv docstrings in app/core/config.py.
   #
   # Set COMFYUI_HOST_PATH in .env to your actual ComfyUI checkout (the same directory you
-  # currently run `python main.py` from natively) -- both workers mount the SAME path
+  # currently run `python main.py` from natively) -- all workers mount the SAME path
   # read-write, so they share one set of models/custom_nodes/output. Point
-  # APP_COMFY_WORKER_BASE_URLS_CSV at these two service names (see .env.example) once
-  # they're up, then stop running ComfyUI natively to avoid a second port-8188 collision.
+  # APP_COMFY_WORKER_BASE_URLS_CSV at whichever of these service names you're running
+  # (see .env.example) once they're up, then stop running ComfyUI natively to avoid a
+  # second port-8188 collision.
   comfyui-worker-1:
     build: ./docker/comfyui-worker
     restart: unless-stopped
@@ -196,6 +200,59 @@ services:
     command: ["--user-directory", "/opt/comfyui-user"]
     ports:
       - "8189:8188"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8188/system_stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  # worker-3/worker-4: scaled up from the original 2 per Chet's explicit request
+  # (2026-08), AFTER 2-worker dispatch was confirmed reaching real ComfyUI processes.
+  # Single-GPU caveat still applies (see comfyui-worker-1's comment above) -- if all 4
+  # share one physical GPU (DGX Spark), expect at best partial overlap of otherwise-idle
+  # time, not a 4x speedup. Benchmark real wall-clock throughput before assuming this
+  # is strictly better than 2; drop back down if 4 doesn't actually help or makes each
+  # job slower via VRAM/compute contention.
+  comfyui-worker-3:
+    build: ./docker/comfyui-worker
+    restart: unless-stopped
+    volumes:
+      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
+    # See comfyui-worker-1's --user-directory comment above -- same reasoning.
+    command: ["--user-directory", "/opt/comfyui-user"]
+    ports:
+      - "8190:8188"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8188/system_stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  comfyui-worker-4:
+    build: ./docker/comfyui-worker
+    restart: unless-stopped
+    volumes:
+      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
+    # See comfyui-worker-1's --user-directory comment above -- same reasoning.
+    command: ["--user-directory", "/opt/comfyui-user"]
+    ports:
+      - "8191:8188"
     deploy:
       resources:
         reservations:
