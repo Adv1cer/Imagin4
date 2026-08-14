@@ -1,6 +1,7 @@
 import { API_BASE_URL } from '../api/client'
 import { PendingActionCard } from './PendingActionCard'
 import { ThinkingIndicator } from './ThinkingIndicator'
+import { describeJobError } from '../utils/errorMessages'
 import type { UiMessage } from '../types/chat'
 
 function ImageJobStatus({ job }: { job: NonNullable<UiMessage['imageJob']> }) {
@@ -28,15 +29,20 @@ function ImageJobStatus({ job }: { job: NonNullable<UiMessage['imageJob']> }) {
     )
   }
   if (job.state === 'failed' || job.state === 'cancelled') {
+    if (job.state === 'failed' && (job.errorDetail || job.errorCode)) {
+      // Raw codes are logged for debugging (support/console), never shown to the
+      // customer verbatim -- see src/utils/errorMessages.ts's docstring for why.
+      // eslint-disable-next-line no-console
+      console.error('Image generation failed', {
+        jobId: job.jobId,
+        errorCode: job.errorCode,
+        errorDetail: job.errorDetail,
+      })
+    }
+    const { message } = describeJobError(job.errorDetail, job.errorCode)
     return (
       <div className="mt-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700">
-        <div>
-          Image generation {job.state}
-          {job.errorCode ? ` (${job.errorCode})` : ''}.
-        </div>
-        {job.errorDetail && (
-          <div className="mt-0.5 text-red-500">Reason: {job.errorDetail}</div>
-        )}
+        <div>{job.state === 'cancelled' ? 'Image generation cancelled.' : message}</div>
       </div>
     )
   }

@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.gemini import GEMINI_OVERLOAD_ERROR_CODES
 from app.api.deps import get_current_user, get_db_session, get_gemini_text_client
 from app.db.models import ChatMessage, Conversation, User
 from app.domain.conversations.pagination import Cursor, InvalidCursorError
@@ -312,9 +313,25 @@ async def create_assistant_reply(
 
     try:
         reply_text = await gemini.complete(history)
-    except Exception:
+    except Exception as exc:
+        # gemini.complete() only ever raises RuntimeError(_sanitized_error(exc)) (see
+        # app.adapters.gemini._sanitized_error) -- str(exc) is therefore always one of a
+        # small, controlled set of safe codes, never raw exception/response text.
+        # GEMINI_OVERLOAD_ERROR_CODES means "temporarily busy, safe to retry shortly" --
+        # surfaced as 503 (Service Unavailable, matches the semantics: come back later)
+        # with that exact code as `detail` so the frontend can show "Google is
+        # experiencing high demand, try again later" instead of a generic failure
+        # message. Anything else keeps the previous generic 502 (Bad Gateway: we're a
+        # gateway to an upstream Gemini failure, but not something retrying immediately
+        # is expected to fix) with a stable detail string instead of the previous vague
+        # sentence, so the frontend has one consistent field to key error text off of.
+        sanitized_code = str(exc) if isinstance(exc, RuntimeError) else ""
+        if sanitized_code in GEMINI_OVERLOAD_ERROR_CODES:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=sanitized_code
+            )
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail="chat completion failed"
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="chat_completion_failed"
         )
 
     message = await _append_message(

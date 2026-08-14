@@ -45,6 +45,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.gemini import GEMINI_OVERLOAD_ERROR_CODES
 from app.adapters.queue import JobQueue
 from app.api.deps import get_current_user, get_db_session, get_gemini_text_client, get_job_queue
 from app.api.v1.conversations import MessageOut, _append_message, _get_owned_conversation
@@ -137,15 +138,17 @@ class SmartMessageOut(BaseModel):
     pending_action: PendingActionOut | None = None
 
 
-# Reasons that mean "Gemini itself is temporarily overloaded/rate-limited" (see
-# app.adapters.gemini._sanitized_error, which route_intent's RuntimeError message is
-# built from) as opposed to "we genuinely couldn't classify this message". Distinguished
-# so the customer-facing question doesn't say "I couldn't understand you" when the real
-# cause is Google's API being busy -- same "don't let the customer blame us/themselves
-# for Gemini's own outage" reasoning as the image-generation fix earlier (see
-# gemini.py's _sanitized_error docstring for the original 2026-08 incident this pattern
-# comes from).
-_OVERLOAD_REASONS = frozenset({"gemini_overloaded", "gemini_rate_limited"})
+# GEMINI_OVERLOAD_ERROR_CODES (app/adapters/gemini.py) are the reasons that mean "Gemini
+# itself is temporarily overloaded/rate-limited" (route_intent's RuntimeError message is
+# built from _sanitized_error) as opposed to "we genuinely couldn't classify this
+# message". Distinguished so the customer-facing question doesn't say "I couldn't
+# understand you" when the real cause is Google's API being busy -- same "don't let the
+# customer blame us/themselves for Gemini's own outage" reasoning as the
+# image-generation fix earlier (see gemini.py's _sanitized_error docstring for the
+# original 2026-08 incident this pattern comes from). Shared (not redefined here) so
+# app/api/v1/conversations.py's create_assistant_reply can apply the exact same
+# classification to its own Gemini failures.
+_OVERLOAD_REASONS = GEMINI_OVERLOAD_ERROR_CODES
 _OVERLOAD_CLARIFICATION_QUESTION = (
     "ขอโทษค่ะ ตอนนี้ระบบ AI มีผู้ใช้งานหนาแน่นชั่วคราว กรุณาลองส่งข้อความเดิมอีกครั้งในอีกสักครู่นะคะ 🙏"
 )

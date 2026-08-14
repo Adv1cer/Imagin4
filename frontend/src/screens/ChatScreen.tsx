@@ -14,6 +14,7 @@ import {
   listMessages,
 } from '../api/endpoints'
 import { ApiError } from '../api/client'
+import { describeErrorCode } from '../utils/errorMessages'
 import type { MeResponse } from '../api/types'
 import type { PendingActionState, UiMessage } from '../types/chat'
 import { DEFAULT_IMAGE_GEN_CONFIG, workflowNameFor } from '../types/imageGen'
@@ -109,7 +110,8 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
         } else {
           delete pollTimers.current[jobId]
         }
-      } catch {
+      } catch (err) {
+        console.error('job status poll failed', jobId, err)
         showToast('Lost connection while checking image generation status.', 'error')
       }
     }
@@ -161,6 +163,7 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
           )
         }
       } catch (err) {
+        console.error('confirm pending action failed', pendingActionId, err)
         const msg =
           err instanceof ApiError ? err.message : 'Failed to confirm — please try again.'
         setMessages((prev) =>
@@ -202,6 +205,7 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
           ),
         )
       } catch (err) {
+        console.error('cancel pending action failed', pendingActionId, err)
         const msg = err instanceof ApiError ? err.message : 'Failed to cancel — please try again.'
         setMessages((prev) =>
           prev.map((m) =>
@@ -294,6 +298,7 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
               )
               pollJob(generation.id, msgId)
             } catch (err) {
+              console.error('createGeneration failed', err)
               const msg =
                 err instanceof ApiError ? err.message : 'Failed to start image generation.'
               setMessages((prev) =>
@@ -396,12 +401,28 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
             )
           }
         } catch (err) {
-          const msg =
-            err instanceof ApiError && err.status === 503
-              ? "Chat isn't configured on the backend yet (no Gemini API key set)."
-              : err instanceof ApiError
-                ? err.message
-                : 'Failed to get a reply.'
+          // Logged for debugging (support/console) -- see src/utils/errorMessages.ts's
+          // docstring for why the customer-facing text below never includes this raw
+          // detail/status directly.
+          console.error('smart-message failed', err)
+          let msg: string
+          if (err instanceof ApiError) {
+            const detail = typeof err.detail === 'string' ? err.detail : null
+            if (err.status === 503 && detail?.includes('not configured')) {
+              // The ONE genuinely permanent-until-an-admin-fixes-it case (APP_GEMINI_API_KEY
+              // unset server-side, see backend/app/api/v1/chat_router.py:smart_message) --
+              // distinct from a live Gemini outage, which is a temporary "try again" case
+              // (see describeErrorCode) and is normally intercepted server-side into a
+              // friendly CLARIFICATION chat reply before it ever reaches this catch at all.
+              msg = "Chat isn't configured on the backend yet (no Gemini API key set)."
+            } else if (err.status === 502 || err.status === 503) {
+              msg = describeErrorCode(detail).message
+            } else {
+              msg = err.message
+            }
+          } else {
+            msg = 'Failed to get a reply.'
+          }
           setMessages((prev) =>
             prev.map((m) => (m.id === pendingId ? { ...m, thinking: false, text: msg } : m)),
           )
@@ -409,6 +430,7 @@ export function ChatScreen({ user, onLogout }: { user: MeResponse; onLogout: () 
         }
       }
     } catch (err) {
+      console.error('handleSend failed', err)
       const msg =
         err instanceof ApiError ? err.message : 'Something went wrong sending your message.'
       setBanner(msg)

@@ -40,6 +40,16 @@ logger = logging.getLogger("imaginv.gemini")
 # don't have any interactive tool-use flow generating "tool" messages yet).
 _ROLE_TO_GEMINI = {"user": "user", "assistant": "model"}
 
+# Sanitized codes from _sanitized_error below that mean "Gemini itself is temporarily
+# overloaded/rate-limited, the request is safe to retry shortly" -- as opposed to every
+# other _sanitized_error output, which means something more fundamentally wrong (bad
+# config, malformed input, an unexpected exception type). Public (not a leading-
+# underscore module-private name) because callers outside this module -- currently
+# app/api/v1/chat_router.py and app/api/v1/conversations.py -- need to distinguish these
+# two cases too: an overload should read to the customer as "try again in a moment", not
+# as generic failure/misconfiguration text.
+GEMINI_OVERLOAD_ERROR_CODES = frozenset({"gemini_overloaded", "gemini_rate_limited"})
+
 
 def _sanitized_error(exc: Exception) -> str:
     """Never echo raw exception text (which can include request payload fragments)
