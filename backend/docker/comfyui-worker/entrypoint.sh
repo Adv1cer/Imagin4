@@ -15,7 +15,15 @@ python -c "import torch; print('comfyui-worker: torch', torch.__version__, 'cuda
 if [ -f requirements.txt ]; then
   echo "comfyui-worker: installing ComfyUI's requirements.txt (skipping torch/torchvision/torchaudio -- the base image's NGC-matched build must not be overwritten by a generic PyPI wheel)..."
   grep -viE '^(torch|torchvision|torchaudio)([<>=! ]|$)' requirements.txt > /tmp/requirements.filtered.txt || true
-  pip install --no-cache-dir -r /tmp/requirements.filtered.txt
+  # The NGC base image ships with an extra pip index (pypi.ngc.nvidia.com) meant for
+  # NVIDIA's own internal build network -- unreachable from a normal DGX on a regular
+  # network, so pip burns 5 retries with backoff per package against it before falling
+  # back to the real pypi.org (observed 2026-08: install still eventually succeeds, just
+  # very slowly and noisily). Force public PyPI only, ignoring whatever index config is
+  # baked into the image, to skip that entirely.
+  PIP_INDEX_URL=https://pypi.org/simple \
+  PIP_EXTRA_INDEX_URL= \
+  pip install --no-cache-dir --index-url https://pypi.org/simple -r /tmp/requirements.filtered.txt
 else
   echo "comfyui-worker: WARNING - no requirements.txt found at /workspace/ComfyUI (bind mount empty/wrong path?)"
 fi
