@@ -226,11 +226,24 @@ class PostgresJobQueue:
         if worker_capacity <= 0:
             return []
 
+        # NOTE (2026-08-17, root-caused from Chet's actual concurrent-claim integration
+        # test): the original version of this query used a `WITH candidates AS (SELECT
+        # ... FOR UPDATE SKIP LOCKED) UPDATE ... FROM candidates` CTE form. That let TWO
+        # concurrent transactions both claim the SAME row under real Postgres (confirmed
+        # via test_claim_next_with_lease_is_atomic_under_concurrent_schedulers failing
+        # with `assert 2 == 1`) -- a data-modifying CTE's row set is NOT guaranteed to
+        # observe another session's FOR UPDATE SKIP LOCKED the same way a plain subquery
+        # does. Rewritten to the well-established, widely-used-for-exactly-this-purpose
+        # form instead: the SKIP LOCKED scan lives directly in the UPDATE's own WHERE
+        # subquery (the pattern used by Que/pg-boss/River and virtually every "Postgres
+        # as a queue" reference implementation), which does NOT have this gap.
         kinds_clause = "AND kind IN :kinds" if kinds is not None else ""
         stmt = text(
             f"""
-            WITH candidates AS (
-                SELECT id, current_attempt
+            UPDATE generation_jobs g
+            SET state = 'dispatched'
+            WHERE g.id IN (
+                SELECT id
                 FROM generation_jobs
                 WHERE state IN ('queued', 'retry_wait')
                 {kinds_clause}
@@ -240,18 +253,11 @@ class PostgresJobQueue:
                     queued_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT :capacity
-            ),
-            claimed AS (
-                UPDATE generation_jobs g
-                SET state = 'dispatched'
-                FROM candidates c
-                WHERE g.id = c.id
-                RETURNING g.id, g.user_id, g.kind, g.state, g.priority, g.effective_priority,
-                          g.input_payload, g.idempotency_key, g.queued_at, g.current_attempt,
-                          g.max_attempts, g.assigned_worker_id, g.error_code,
-                          g.error_detail_sanitized
             )
-            SELECT * FROM claimed
+            RETURNING g.id, g.user_id, g.kind, g.state, g.priority, g.effective_priority,
+                      g.input_payload, g.idempotency_key, g.queued_at, g.current_attempt,
+                      g.max_attempts, g.assigned_worker_id, g.error_code,
+                      g.error_detail_sanitized
             """
         )
         if kinds is not None:
@@ -422,33 +428,32 @@ class PostgresJobQueue:
     async def mark_retry_wait(
         self, job_id: uuid.UUID, error_code: str, error_detail: str | None = None
     ) -> None:
-        async with self.session_factory() as session:
-            async with session.begin():
-                updated = await session.execute(
-                    text(
-                        """
-                        UPDATE generation_jobs
-                        SET state = 'retry_wait', current_attempt = current_attempt + 1,
-                            error_code = :error_code, error_detail_sanitized = :error_detail
-                        WHERE id = :id AND state NOT IN :terminal
-                        RETURNING id
-                        """
-                    ).bindparams(bindparam("terminal", expanding=True)),
-                    {
-                        "id": job_id,
-                        "terminal": list(_TERMINAL_STATES),
-                        "error_code": error_code,
-                        "error_detail": error_detail,
-                    },
-                )
-                if updated.first() is None:
-                    return  # no-op: also correctly leaves current_attempt un-bumped
-                await self._update_latest_attempt(
-                    session, job_id, state="retry_wait", finished=True, error_code=error_code
-                )
-                await self._append_event(
-                    session, job_id, "job_retry_scheduled", {"error_code": error_code, "detail": error_detail}
-                )
+        async with self.session_factory() as session, session.begin():
+            updated = await session.execute(
+                text(
+                    """
+                    UPDATE generation_jobs
+                    SET state = 'retry_wait', current_attempt = current_attempt + 1,
+                        error_code = :error_code, error_detail_sanitized = :error_detail
+                    WHERE id = :id AND state NOT IN :terminal
+                    RETURNING id
+                    """
+                ).bindparams(bindparam("terminal", expanding=True)),
+                {
+                    "id": job_id,
+                    "terminal": list(_TERMINAL_STATES),
+                    "error_code": error_code,
+                    "error_detail": error_detail,
+                },
+            )
+            if updated.first() is None:
+                return  # no-op: also correctly leaves current_attempt un-bumped
+            await self._update_latest_attempt(
+                session, job_id, state="retry_wait", finished=True, error_code=error_code
+            )
+            await self._append_event(
+                session, job_id, "job_retry_scheduled", {"error_code": error_code, "detail": error_detail}
+            )
 
     async def set_prompt_id(self, job_id: uuid.UUID, prompt_id: str) -> None:
         async with self.session_factory() as session, session.begin():
