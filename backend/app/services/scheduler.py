@@ -23,7 +23,8 @@ import uuid
 from datetime import datetime, timezone
 
 from app.adapters.comfyui import ComfyUIClient, MockComfyUIClient
-from app.adapters.queue import InMemoryJobQueue, JobQueue, QueuedJob
+from app.adapters.queue import JobQueue, QueuedJob
+from app.adapters.queue.factory import build_job_queue
 from app.core.config import Settings, get_settings
 from app.domain.jobs.workflow_registry import kinds_for_backend
 from app.domain.workers.scoring import WorkerSnapshot
@@ -214,15 +215,30 @@ async def main() -> None:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
 
-    # NOTE: production wiring should build the Postgres-SKIP-LOCKED-backed JobQueue and
-    # a session_factory bound to settings.database_url so _reserve_capacity_by_backend
-    # can score live comfy_workers rows. Only the in-memory fakes exist in this repo today (see
-    # app/adapters/queue and app/main.py), so the standalone entrypoint uses those, same
-    # as `create_app()` does -- swap these two lines when the Postgres adapter lands.
-    job_queue: JobQueue = InMemoryJobQueue()
+    # queue_backend picks InMemoryJobQueue vs the durable/shared PostgresJobQueue (see
+    # app/adapters/queue/factory.py) -- this is now the SAME switch app/main.py uses, so
+    # this standalone process and the API agree on where job state actually lives.
+    session_factory = None
+    if settings.queue_backend == "postgres":
+        from app.db.base import get_session_factory
+
+        session_factory = get_session_factory()
+    job_queue: JobQueue = build_job_queue(settings, session_factory=session_factory)
+
+    # NOTE (still a gap, unrelated to the JobQueue backend above): this standalone
+    # entrypoint always dispatches against MockComfyUIClient, unlike app/main.py's
+    # `_build_state`, which wires a real live/multi-worker ComfyUI client or Gemini from
+    # settings. A live-mode deployment running this process standalone (queue_backend=
+    # postgres, APP_COMFY_MODE=live) would currently claim real jobs and "dispatch" them
+    # to the mock instead of real ComfyUI -- extracting `_build_state`'s comfy_client
+    # wiring into a shared factory (mirroring build_job_queue above) is the next
+    # increment before relying on this process in production; not done here to keep this
+    # change scoped to the job-queue durability gap.
     comfy_client: ComfyUIClient = MockComfyUIClient()
 
-    scheduler = Scheduler(job_queue=job_queue, comfy_client=comfy_client, settings=settings)
+    scheduler = Scheduler(
+        job_queue=job_queue, comfy_client=comfy_client, settings=settings, session_factory=session_factory
+    )
     _install_signal_handlers(scheduler)
     await scheduler.run_forever()
 

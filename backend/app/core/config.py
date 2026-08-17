@@ -21,6 +21,17 @@ class Settings(BaseSettings):
     db_pool_timeout_s: int = 5
     db_pool_pre_ping: bool = True
 
+    # JobQueue backend. "memory" (default) = InMemoryJobQueue, process-local, gone on
+    # restart -- fine for unit/e2e tests and quick local smoke-testing without Postgres
+    # up, but NOT safe with >1 API replica or across restarts (see README "Known
+    # limitations"). "postgres" = PostgresJobQueue (app/adapters/queue/postgres.py),
+    # durable and shared across every API/scheduler/reconciler process -- required
+    # before running more than one API replica or trusting job state to survive a
+    # deploy/crash. Selected via app/adapters/queue/factory.py:build_job_queue, used by
+    # app/main.py, app/services/scheduler.py, and app/services/reconciler.py so all
+    # three agree on which backend is active from the same Settings value.
+    queue_backend: Literal["memory", "postgres"] = "memory"
+
     # Redis
     redis_url: str = "redis://localhost:6379/0"
     redis_connect_timeout_s: float = 0.5

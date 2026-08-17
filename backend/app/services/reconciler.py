@@ -33,7 +33,8 @@ import uuid
 from datetime import datetime, timezone
 
 from app.adapters.comfyui import ComfyUIClient, MockComfyUIClient
-from app.adapters.queue import InMemoryJobQueue, JobQueue, QueuedJob
+from app.adapters.queue import JobQueue, QueuedJob
+from app.adapters.queue.factory import build_job_queue
 from app.core.config import Settings, get_settings
 from app.domain.jobs.retry import BackoffConfig, compute_backoff_seconds, is_retryable
 
@@ -175,9 +176,15 @@ async def main() -> None:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
 
-    # See scheduler.py's main() for the same caveat: only in-memory adapters exist in
-    # this repo today, so the standalone entrypoint uses those.
-    job_queue: JobQueue = InMemoryJobQueue()
+    # See scheduler.py's main() -- same settings.queue_backend switch, same still-open
+    # comfy_client wiring gap (this always dispatches against MockComfyUIClient; a real
+    # live-mode deployment needs the shared comfy_client factory extraction noted there).
+    session_factory = None
+    if settings.queue_backend == "postgres":
+        from app.db.base import get_session_factory
+
+        session_factory = get_session_factory()
+    job_queue: JobQueue = build_job_queue(settings, session_factory=session_factory)
     comfy_client: ComfyUIClient = MockComfyUIClient()
 
     reconciler = Reconciler(job_queue=job_queue, comfy_client=comfy_client, settings=settings)

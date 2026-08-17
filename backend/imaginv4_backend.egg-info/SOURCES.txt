@@ -4,6 +4,7 @@ app/__init__.py
 app/main.py
 app/adapters/__init__.py
 app/adapters/gemini.py
+app/adapters/openrouter.py
 app/adapters/routing_comfyui.py
 app/adapters/comfyui/__init__.py
 app/adapters/comfyui/live.py

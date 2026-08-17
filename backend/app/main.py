@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.adapters.comfyui import MockComfyUIClient
 from app.adapters.comfyui.live import LiveComfyUIClient
 from app.adapters.comfyui.multi_worker import MultiWorkerComfyUIClient
-from app.adapters.queue import InMemoryJobQueue
+from app.adapters.queue.factory import build_job_queue
 from app.adapters.routing_comfyui import CompositeComfyUIClient
 from app.adapters.storage import InMemoryObjectStorage
 from app.api.v1 import (
@@ -47,10 +47,13 @@ def _build_state(app: FastAPI) -> None:
     engine = get_engine()
     app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    # NOTE: production job queue/storage should be swapped for the Postgres-SKIP-LOCKED
-    # and S3/MinIO-backed adapters respectively; in-memory fakes keep `create_app()`
-    # runnable without external infra for local dev smoke-testing.
-    app.state.job_queue = InMemoryJobQueue()
+    # settings.queue_backend selects InMemoryJobQueue (dev/test, no Postgres needed) vs
+    # PostgresJobQueue (durable, shared across every API/scheduler/reconciler process --
+    # see app/adapters/queue/factory.py and app/adapters/queue/postgres.py). Object
+    # storage is still the in-memory fake either way; swap for the S3/MinIO-backed
+    # adapter separately (see app/adapters/storage) -- unrelated to the job-queue gap
+    # this closes.
+    app.state.job_queue = build_job_queue(settings, session_factory=app.state.session_factory)
     app.state.storage = InMemoryObjectStorage()
 
     # ComfyUI adapter always exists (mock or, eventually, live) -- ordinary "Image"
@@ -208,24 +211,41 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _build_state(app)
     logger.info("imaginv backend starting up")
 
-    # The standalone `scheduler`/`reconciler` docker-compose services each construct
-    # their own InMemoryJobQueue (see app/services/scheduler.py:main /
-    # app/services/reconciler.py:main), which is process-local -- so in dev/in-memory
-    # mode they never actually see jobs enqueued by this API process. Until the
-    # Postgres-backed JobQueue lands (see README "Known limitations"), run both loops
-    # in-process here too, sharing app.state.job_queue/comfy_client, so a submitted
-    # generation is actually dispatched and finalized end to end without requiring the
-    # separate containers to coincidentally share state (they don't).
-    scheduler = Scheduler(job_queue=app.state.job_queue, comfy_client=app.state.comfy_client)
-    reconciler = Reconciler(job_queue=app.state.job_queue, comfy_client=app.state.comfy_client)
-    scheduler_task = asyncio.create_task(scheduler.run_forever())
-    reconciler_task = asyncio.create_task(reconciler.run_forever())
+    # settings.queue_backend == "memory": the standalone `scheduler`/`reconciler`
+    # docker-compose services each construct their own InMemoryJobQueue (see
+    # app/services/scheduler.py:main / app/services/reconciler.py:main), which is
+    # process-local -- so they never actually see jobs enqueued by this API process.
+    # Run both loops in-process here too in that mode, sharing app.state.job_queue/
+    # comfy_client, so a submitted generation is still dispatched/finalized end to end
+    # without needing external infra for quick local smoke-testing.
+    #
+    # settings.queue_backend == "postgres": job state is durable and shared via
+    # PostgresJobQueue (see app/adapters/queue/factory.py), so the standalone
+    # `scheduler`/`reconciler` containers now genuinely work as independent,
+    # horizontally-replicable processes -- do NOT also start them in-process here, or
+    # every API replica would run its own extra scheduler/reconciler loop on top of the
+    # dedicated ones (harmless correctness-wise, since claims are SKIP LOCKED and every
+    # transition is a conditional UPDATE, but wasteful and confusing).
+    settings = get_settings()
+    scheduler_task = reconciler_task = None
+    scheduler = reconciler = None
+    if settings.queue_backend == "memory":
+        scheduler = Scheduler(job_queue=app.state.job_queue, comfy_client=app.state.comfy_client)
+        reconciler = Reconciler(job_queue=app.state.job_queue, comfy_client=app.state.comfy_client)
+        scheduler_task = asyncio.create_task(scheduler.run_forever())
+        reconciler_task = asyncio.create_task(reconciler.run_forever())
+    else:
+        logger.info(
+            "queue_backend=postgres: in-process scheduler/reconciler NOT started here -- "
+            "run the standalone `scheduler`/`reconciler` docker-compose services"
+        )
 
     yield
 
-    scheduler.request_shutdown()
-    reconciler.request_shutdown()
-    await asyncio.gather(scheduler_task, reconciler_task, return_exceptions=True)
+    if scheduler is not None:
+        scheduler.request_shutdown()
+        reconciler.request_shutdown()
+        await asyncio.gather(scheduler_task, reconciler_task, return_exceptions=True)
 
     engine = getattr(app.state, "session_factory", None)
     if engine is not None:

@@ -161,8 +161,6 @@ services:
   comfyui-worker-1:
     build: ./docker/comfyui-worker
     restart: unless-stopped
-    volumes:
-      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
     # --user-directory: ComfyUI keeps per-instance state (notably user/comfyui.db, a
     # SQLite file) under <ComfyUI path>/user by default. Both workers bind-mount the
     # SAME host ComfyUI checkout (models/custom_nodes/output are meant to be shared),
@@ -175,6 +173,28 @@ services:
     # -- safe to use the identical path string in both services below since each
     # container's root filesystem is already isolated from the other's.
     command: ["--user-directory", "/opt/comfyui-user"]
+    # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
+    # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
+    # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
+    # documented symptom of multiple processes hitting one GPU without MPS. These three
+    # lines make each container a client of one shared MPS server context instead of its
+    # own independent context; they are INERT (no behavior change, safe to leave in) if
+    # the host-side MPS control daemon isn't running -- CUDA falls back to normal
+    # per-process contexts. See docker/comfyui-worker/MPS_RUNBOOK.md before re-widening
+    # APP_COMFY_WORKER_BASE_URLS_CSV past 2 workers in .env -- this alone does not
+    # guarantee the crash is fixed (unconfirmed until tested on real hardware), and GB10's
+    # unified-memory architecture has known NVML/nvidia-smi VRAM-reporting gaps (confirmed
+    # via NVIDIA's own developer forum, 2026-03) that make "watch nvidia-smi" an
+    # unreliable success signal here -- judge success by the ABSENCE of the CUBLAS crash
+    # in worker-3/4's logs under load, not by VRAM numbers.
+    ipc: host
+    environment:
+      CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
+      CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
+    volumes:
+      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
+      - /tmp/nvidia-mps:/tmp/nvidia-mps
+      - /tmp/nvidia-mps-log:/tmp/nvidia-mps-log
     ports:
       - "8188:8188"
     deploy:
@@ -194,10 +214,30 @@ services:
   comfyui-worker-2:
     build: ./docker/comfyui-worker
     restart: unless-stopped
-    volumes:
-      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
     # See comfyui-worker-1's --user-directory comment above -- same reasoning.
     command: ["--user-directory", "/opt/comfyui-user"]
+    # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
+    # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
+    # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
+    # documented symptom of multiple processes hitting one GPU without MPS. These three
+    # lines make each container a client of one shared MPS server context instead of its
+    # own independent context; they are INERT (no behavior change, safe to leave in) if
+    # the host-side MPS control daemon isn't running -- CUDA falls back to normal
+    # per-process contexts. See docker/comfyui-worker/MPS_RUNBOOK.md before re-widening
+    # APP_COMFY_WORKER_BASE_URLS_CSV past 2 workers in .env -- this alone does not
+    # guarantee the crash is fixed (unconfirmed until tested on real hardware), and GB10's
+    # unified-memory architecture has known NVML/nvidia-smi VRAM-reporting gaps (confirmed
+    # via NVIDIA's own developer forum, 2026-03) that make "watch nvidia-smi" an
+    # unreliable success signal here -- judge success by the ABSENCE of the CUBLAS crash
+    # in worker-3/4's logs under load, not by VRAM numbers.
+    ipc: host
+    environment:
+      CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
+      CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
+    volumes:
+      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
+      - /tmp/nvidia-mps:/tmp/nvidia-mps
+      - /tmp/nvidia-mps-log:/tmp/nvidia-mps-log
     ports:
       - "8189:8188"
     deploy:
@@ -224,10 +264,30 @@ services:
   comfyui-worker-3:
     build: ./docker/comfyui-worker
     restart: unless-stopped
-    volumes:
-      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
     # See comfyui-worker-1's --user-directory comment above -- same reasoning.
     command: ["--user-directory", "/opt/comfyui-user"]
+    # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
+    # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
+    # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
+    # documented symptom of multiple processes hitting one GPU without MPS. These three
+    # lines make each container a client of one shared MPS server context instead of its
+    # own independent context; they are INERT (no behavior change, safe to leave in) if
+    # the host-side MPS control daemon isn't running -- CUDA falls back to normal
+    # per-process contexts. See docker/comfyui-worker/MPS_RUNBOOK.md before re-widening
+    # APP_COMFY_WORKER_BASE_URLS_CSV past 2 workers in .env -- this alone does not
+    # guarantee the crash is fixed (unconfirmed until tested on real hardware), and GB10's
+    # unified-memory architecture has known NVML/nvidia-smi VRAM-reporting gaps (confirmed
+    # via NVIDIA's own developer forum, 2026-03) that make "watch nvidia-smi" an
+    # unreliable success signal here -- judge success by the ABSENCE of the CUBLAS crash
+    # in worker-3/4's logs under load, not by VRAM numbers.
+    ipc: host
+    environment:
+      CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
+      CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
+    volumes:
+      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
+      - /tmp/nvidia-mps:/tmp/nvidia-mps
+      - /tmp/nvidia-mps-log:/tmp/nvidia-mps-log
     ports:
       - "8190:8188"
     deploy:
@@ -247,10 +307,30 @@ services:
   comfyui-worker-4:
     build: ./docker/comfyui-worker
     restart: unless-stopped
-    volumes:
-      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
     # See comfyui-worker-1's --user-directory comment above -- same reasoning.
     command: ["--user-directory", "/opt/comfyui-user"]
+    # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
+    # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
+    # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
+    # documented symptom of multiple processes hitting one GPU without MPS. These three
+    # lines make each container a client of one shared MPS server context instead of its
+    # own independent context; they are INERT (no behavior change, safe to leave in) if
+    # the host-side MPS control daemon isn't running -- CUDA falls back to normal
+    # per-process contexts. See docker/comfyui-worker/MPS_RUNBOOK.md before re-widening
+    # APP_COMFY_WORKER_BASE_URLS_CSV past 2 workers in .env -- this alone does not
+    # guarantee the crash is fixed (unconfirmed until tested on real hardware), and GB10's
+    # unified-memory architecture has known NVML/nvidia-smi VRAM-reporting gaps (confirmed
+    # via NVIDIA's own developer forum, 2026-03) that make "watch nvidia-smi" an
+    # unreliable success signal here -- judge success by the ABSENCE of the CUBLAS crash
+    # in worker-3/4's logs under load, not by VRAM numbers.
+    ipc: host
+    environment:
+      CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
+      CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
+    volumes:
+      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
+      - /tmp/nvidia-mps:/tmp/nvidia-mps
+      - /tmp/nvidia-mps-log:/tmp/nvidia-mps-log
     ports:
       - "8191:8188"
     deploy:

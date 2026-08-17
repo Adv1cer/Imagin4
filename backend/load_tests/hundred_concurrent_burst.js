@@ -16,17 +16,44 @@
 // question being answered ("100 people generate at once, how long until everyone has
 // their image").
 //
+// Auth: two modes, controlled by LOADTEST_AUTH env var.
+//   session (default): each VU does its own POST /v1/auth/login (Argon2id password
+//     verification + session-row write) before submitting. Realistic, but a burst of
+//     100 simultaneous logins can 500 on constrained setups -- Argon2id is deliberately
+//     CPU-heavy (app/domain/auth/passwords.py) and APP_DB_POOL_SIZE/MAX_OVERFLOW are
+//     small by default (.env). If you see login 500s, that's a real finding about login
+//     capacity, not this script -- see README's "Known issue: concurrent login 500s".
+//   bearer: skip login entirely, use pre-minted API keys (Authorization: Bearer) from
+//     scripts/seed_load_test_api_keys.py's output. Isolates ComfyUI/GPU dispatch
+//     capacity from login-path capacity -- use this when you specifically want to
+//     measure generation throughput without login being a confounding variable.
+//
 // Prereqs:
+//   # session mode:
 //   docker compose run --rm api python -m scripts.seed_load_test_users --count 100
+//   # bearer mode (also seeds the same 100 users, plus mints a key per user):
+//   docker compose run --rm api python -m scripts.seed_load_test_api_keys --count 100 \
+//       > load_tests/loadtest_api_keys.json
 //
 // Run: k6 run load_tests/hundred_concurrent_burst.js
-// Env: BASE_URL, LOADTEST_PASSWORD, LOADTEST_USER_COUNT (must match --count above),
+//      LOADTEST_AUTH=bearer k6 run load_tests/hundred_concurrent_burst.js
+// Env: BASE_URL, LOADTEST_PASSWORD (session mode), LOADTEST_AUTH (session|bearer),
+//      LOADTEST_KEYS_FILE (bearer mode, default ./loadtest_api_keys.json, relative to
+//      this script), LOADTEST_USER_COUNT (must match --count used when seeding),
 //      LOADTEST_POLL_TIMEOUT_S (default 600 = 10min ceiling per job)
 
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Trend, Rate, Counter } from 'k6/metrics';
 import { BASE_URL, authHeaders, randomIdempotencyKey, generationPayload } from './common.js';
+
+const AUTH_MODE = __ENV.LOADTEST_AUTH || 'session';
+const KEYS_FILE = __ENV.LOADTEST_KEYS_FILE || './loadtest_api_keys.json';
+
+// open() only works in k6's init context (module scope), not inside default(), and only
+// for a mode that actually needs the file -- session mode must keep working even if
+// loadtest_api_keys.json was never generated.
+const apiKeys = AUTH_MODE === 'bearer' ? JSON.parse(open(KEYS_FILE)) : null;
 
 const dispatchLag = new Trend('dispatch_lag_ms', true); // submit -> first non-queued
 const completionLag = new Trend('completion_lag_ms', true); // submit -> terminal state
@@ -67,22 +94,41 @@ function emailForVU(vu) {
 
 export default function () {
   const email = emailForVU(__VU);
+  let headers;
 
-  const loginRes = http.post(
-    `${BASE_URL}/v1/auth/login`,
-    JSON.stringify({ email, password: PASSWORD }),
-    { headers: { 'Content-Type': 'application/json' }, tags: { endpoint: 'login' } },
-  );
-  if (loginRes.status !== 200) {
-    console.error(
-      `hundred_concurrent_burst: login failed for ${email} (status=${loginRes.status}) -- ` +
-        'did you run `python -m scripts.seed_load_test_users` first?',
+  if (AUTH_MODE === 'bearer') {
+    // apiKeys[i].email follows the SAME loadtest-user-NNNN template as emailForVU(), and
+    // seed_load_test_api_keys.py writes them in the same 1..count order, so index-align.
+    const idx = ((__VU - 1) % USER_COUNT);
+    const entry = apiKeys[idx];
+    if (!entry || entry.email !== email) {
+      console.error(
+        `hundred_concurrent_burst: apiKeys[${idx}] (${entry ? entry.email : 'missing'}) ` +
+          `doesn't match expected ${email} -- LOADTEST_KEYS_FILE/LOADTEST_USER_COUNT out of sync ` +
+          'with how it was seeded.',
+      );
+      jobLost.add(1);
+      return;
+    }
+    headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${entry.api_key}` };
+  } else {
+    const loginRes = http.post(
+      `${BASE_URL}/v1/auth/login`,
+      JSON.stringify({ email, password: PASSWORD }),
+      { headers: { 'Content-Type': 'application/json' }, tags: { endpoint: 'login' } },
     );
-    jobLost.add(1);
-    return;
+    if (loginRes.status !== 200) {
+      console.error(
+        `hundred_concurrent_burst: login failed for ${email} (status=${loginRes.status}) -- ` +
+          'did you run `python -m scripts.seed_load_test_users` first? Or try LOADTEST_AUTH=bearer ' +
+          'to bypass login entirely -- see this file\'s header comment.',
+      );
+      jobLost.add(1);
+      return;
+    }
+    const token = loginRes.json('session_token');
+    headers = authHeaders(token);
   }
-  const token = loginRes.json('session_token');
-  const headers = authHeaders(token);
 
   const submittedAt = Date.now();
   const postRes = http.post(`${BASE_URL}/v1/generations`, generationPayload(), {

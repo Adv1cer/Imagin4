@@ -173,6 +173,87 @@ k6 run backend/load_tests/hundred_concurrent_burst.js
 Only exercises the ComfyUI/general_image (`txt2img_basic`) path -- does not touch
 poster/infographic (Gemini/OpenRouter), by design.
 
+**If step 3 fails with 100 concurrent `500`s on login**, see "Known issue: concurrent
+login 500s" below -- switch to Bearer-token mode to isolate GPU/dispatch capacity from
+the login bottleneck:
+
+```bash
+docker compose run --rm api python -m scripts.seed_load_test_api_keys --count 100 \
+    > backend/load_tests/loadtest_api_keys.json
+LOADTEST_AUTH=bearer k6 run backend/load_tests/hundred_concurrent_burst.js
+```
+
+### Known issue: concurrent login 500s under burst (2026-08-17, unresolved)
+
+100 simultaneous `POST /v1/auth/login` calls (as `hundred_concurrent_burst.js`'s default
+session mode does, one per VU) produced `500`s in Chet's first run against the real
+4-worker DGX Spark stack, not the expected `200`/`429`. Two likely contributors, neither
+confirmed yet:
+- Argon2id is deliberately CPU-heavy (`app/domain/auth/passwords.py`) -- 100 concurrent
+  verifications will serialize on CPU and could time out or exhaust a worker thread pool.
+- `APP_DB_POOL_SIZE=5` / `APP_DB_MAX_OVERFLOW=5` (10 total connections) per API replica
+  (`.env`) is small relative to 100 concurrent session-row writes.
+
+This is a real capacity gap in the login path worth fixing (500 should not be possible
+under load -- shed with `429`/`503` instead, per this repo's own architecture
+invariants), not something to route around silently. `LOADTEST_AUTH=bearer` mode above
+is a valid way to keep measuring GPU/dispatch capacity in the meantime, but the login
+500s themselves are still open: capture `docker compose logs api` during a repro and
+check whether it's the Argon2id CPU cost, the DB pool, or something else (e.g. Redis
+rate-limit key contention) before shipping this to a real campus rollout.
+
+### Known issue: worker-3/4 CUBLAS crash under 4-worker load (2026-08-17, confirmed -- downgraded to 2 workers)
+
+Ran `hundred_concurrent_burst.js` against all 4 `comfyui-worker-*` on Chet's DGX Spark
+(single physical GPU). `comfyui-worker-1` and `comfyui-worker-2` each completed a job
+concurrently (~56-57s/image, `[INFO] Prompt executed in 57.07 seconds` /
+`56.68 seconds`). `comfyui-worker-3` and `comfyui-worker-4` both crashed almost
+immediately (`[INFO] Prompt executed in 0.35 seconds`) with:
+
+```
+RuntimeError: CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when calling
+`cublasSgemm(handle, opa, opb, m, n, k, &alpha, a, lda, b, ldb, &beta, c, ldc)`
+```
+
+...inside the Qwen text-encoder forward pass (`comfy/text_encoders/llama.py`), i.e.
+during the very first matmul of the 3rd/4th concurrent load, not partway through a
+render. This is exactly the "single-GPU caveat" `multi_worker.py`/`docker-compose.yml`
+warned about, except worse than "no speedup" -- it's an outright crash, not just slower
+overlap.
+
+**Working theory, NOT yet confirmed**: VRAM/CUDA-context exhaustion. Each worker's log
+shows it staging `QwenImage` (~19.5GB) + `QwenImageTEModel_` (~7.9GB) ≈ 27GB per worker
+once dispatched a job. Two workers concurrently resident is ~55GB; a 3rd/4th landing on
+top of that on a single physical GPU/unified-memory pool is a plausible trigger, but
+`CUBLAS_STATUS_INTERNAL_ERROR` is also a known symptom of CUDA context corruption from
+multiple processes hitting one GPU without NVIDIA MPS (Multi-Process Service) enabled --
+either is consistent with what was observed, neither has been isolated yet.
+
+**What was done**: `APP_COMFY_WORKER_BASE_URLS_CSV` in `.env` downgraded from 4 workers
+back to the 2 that were actually verified stable (`comfyui-worker-1`,
+`comfyui-worker-2`). `APP_DEFAULT_COMFY_ACTIVE_SLOTS` stays at 2 (matches).
+
+**Before trying 4 workers again**: watch VRAM live during a 3rd/4th concurrent dispatch
+(`nvidia-smi` or the DGX Spark's equivalent monitoring) to see actual headroom at the
+moment of the crash, check `dmesg`/driver logs for a Xid error alongside the cuBLAS
+error (would confirm a real GPU-level fault vs. an application-level VRAM budget issue),
+and consider whether NVIDIA MPS or an explicit per-worker VRAM cap is needed to safely
+run more than 2 processes against one physical GPU. Don't re-widen
+`APP_COMFY_WORKER_BASE_URLS_CSV` past 2 until one of those points at a real fix --
+otherwise a live campus rollout would intermittently fail generations under load exactly
+like this.
+
+**2026-08-17 update**: `docker-compose.yml`'s `comfyui-worker-1..4` now carry the client
+side of an NVIDIA MPS wiring (`ipc: host` + `CUDA_MPS_PIPE_DIRECTORY`/
+`CUDA_MPS_LOG_DIRECTORY` + shared pipe/log volumes), inert until the host-side MPS
+control daemon is actually started. See `docker/comfyui-worker/MPS_RUNBOOK.md` for the
+full step-by-step (start the daemon, widen back to 4 workers, reproduce the load test,
+judge success by the absence of the CUBLAS crash in worker-3/4's own logs -- **not** by
+`nvidia-smi`'s VRAM column, which has a confirmed reporting gap on GB10's unified-memory
+architecture, see the runbook). **Not yet run against the real DGX Spark** -- this is
+wiring + a runbook, not a confirmed fix; update this section with the actual result
+(pass or fail) once tested.
+
 ## Mock vs. live ComfyUI vs. Gemini
 
 Controlled by `APP_COMFY_MODE` (`mock` | `live`, see `app/core/config.py`) **unless**
