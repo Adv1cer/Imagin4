@@ -317,13 +317,21 @@ async def process_routed_message(
 
     step = decide_next_step(decision)
     logger.info(
-        "chat_router: conv=%s user=%s intent=%s reason_code=%s step=%s validation=%s",
+        "chat_router: conv=%s user=%s intent=%s reason_code=%s step=%s validation=%s "
+        "normalized_prompt=%r",
         conv.id,
         user.id,
         decision.intent.value,
         decision.reason_code.value,
         type(step).__name__,
         validation_outcome,
+        # Truncated -- this is purely a server-side diagnostic breadcrumb (see
+        # app/adapters/comfyui/live.py's matching submit()-time prompt log) so a
+        # "the wrong subject came out of the image" report can be traced end-to-end
+        # (classification -> prompt-design refine -> final ComfyUI/Gemini submission)
+        # from docker logs alone, without needing to separately query ComfyUI's own
+        # history for the raw prompt text after the fact. Never shown to the customer.
+        decision.normalized_prompt[:200] if decision.normalized_prompt else None,
     )
 
     if isinstance(step, RespondChat):

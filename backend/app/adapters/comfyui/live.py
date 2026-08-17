@@ -310,7 +310,13 @@ class LiveComfyUIClient:
                 resp.raise_for_status()
                 data = resp.json()
             prompt_id = str(data["prompt_id"])
-            logger.info("comfyui_live: submitted prompt_id=%s kind=%s", prompt_id, kind)
+            logger.info(
+                "comfyui_live: submitted prompt_id=%s kind=%s base_url=%s prompt=%r",
+                prompt_id,
+                kind,
+                self._base_url,
+                prompt_text[:300],
+            )
             return ComfySubmitResult(prompt_id=prompt_id)
         except Exception as exc:
             # Submission itself failed (ComfyUI unreachable, graph rejected, etc.) --
@@ -363,6 +369,20 @@ class LiveComfyUIClient:
                     entry = history[prompt_id]
                     status_info = entry.get("status") or {}
                     if status_info.get("status_str") == "error":
+                        # ComfyUI's own /history response carries the real node-level
+                        # exception under status.messages (e.g. OOM, missing model file,
+                        # a bad custom-node) -- log it server-side (never sanitized/
+                        # surfaced to the customer, who only ever sees the fixed
+                        # "comfy_execution_error" code below) so a failure like this is
+                        # diagnosable straight from `docker compose logs api` instead of
+                        # needing to separately dig through the ComfyUI worker's own
+                        # container logs after the fact.
+                        logger.warning(
+                            "comfyui_live: execution error prompt_id=%s base_url=%s messages=%s",
+                            prompt_id,
+                            self._base_url,
+                            status_info.get("messages"),
+                        )
                         status = ComfyStatus(
                             prompt_id=prompt_id, state="failed", error="comfy_execution_error"
                         )
