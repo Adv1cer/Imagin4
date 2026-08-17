@@ -3,6 +3,41 @@
 The real implementation claims rows from `generation_jobs` in Postgres using
 `SELECT ... FOR UPDATE SKIP LOCKED` (see backend/app/scheduler). This module defines the
 port plus a deterministic in-memory fake used by tests and local dev without Postgres/Redis.
+
+CONCURRENCY BUG FIXED HERE (2026-08, root-caused from Chet's live production logs): a
+poster_infographic job (kind requiring the Gemini backend) was observed dispatching FOUR
+separate Gemini image-generation attempts for what should have been at most
+`max_attempts` (3) -- including at least one dispatch that happened AFTER the job had
+already reached a terminal `succeeded` state, and a `job_failed` reconciler event that
+fired using an error from what turned out to be a STALE, superseded attempt.
+
+Root cause: the Scheduler's dispatch (`mark_running` -> await `comfy_client.submit()` --
+which for Gemini can take up to `gemini_image_request_timeout_s`, i.e. up to 90s -- ->
+`set_prompt_id`) and the Reconciler's reconciliation pass (`list_active()` ->
+`_reconcile_job`, polled independently on its own 5s interval) both read/write the SAME
+mutable `QueuedJob` object with no locking or conditional-update guard between them --
+exactly the race the project's own architecture doc warns about ("ทุก transition ต้องใช้
+conditional update ... กัน worker สองตัวเปลี่ยนสถานะพร้อมกัน", see project instructions
+section 4), which the in-memory adapter here had NOT actually been implementing despite
+the real Postgres adapter being designed around it. Concretely: `job.prompt_id` from a
+PREVIOUS (already-resolved, failed) attempt was never cleared when a NEW attempt began
+dispatching, so if the reconciler's poll landed while a new attempt was still in flight
+(job.state already "running" but the new prompt_id not yet set), it would resolve the
+job using the OLD attempt's already-known-failed prompt_id -- potentially firing a
+terminal failure (or, worse, overwriting an already-`succeeded` job) based on stale
+information, independent of whatever the new, actually-in-flight attempt was doing.
+
+Fixed two ways, both applied to InMemoryJobQueue below (and required of any future
+Postgres-backed implementation too, per the docstrings on the JobQueue Protocol
+methods above):
+  1. `mark_running` now clears `prompt_id` back to None -- for the entire window between
+     a new attempt starting and its own `set_prompt_id` call landing, the reconciler sees
+     "no known prompt_id yet" and correctly does nothing (falls through to the
+     lease-expiry check) instead of resolving a stale one.
+  2. `mark_succeeded` / `mark_failed` / `mark_retry_wait` are now no-ops if the job is
+     already in a terminal state (succeeded/failed/cancelled) -- a late-arriving stale
+     reconciliation result can no longer downgrade/overwrite a job that has already
+     reached its true final outcome.
 """
 
 from __future__ import annotations
@@ -77,17 +112,32 @@ class JobQueue(Protocol):
         """Returns jobs currently in `dispatched` or `running` state, for reconciliation."""
         ...
 
-    async def mark_running(self, job_id: uuid.UUID) -> None: ...
+    async def mark_running(self, job_id: uuid.UUID) -> None:
+        """Transitions to `running` for a NEW attempt about to be dispatched. Must also
+        clear any previously-set `prompt_id` -- see module docstring's "stale prompt_id"
+        race for why a leftover prompt_id from a prior (already-resolved) attempt must
+        never survive into a new attempt's in-flight window."""
+        ...
 
-    async def mark_succeeded(self, job_id: uuid.UUID, result: dict) -> None: ...
+    async def mark_succeeded(self, job_id: uuid.UUID, result: dict) -> None:
+        """Must be a no-op (never downgrade) if the job is already in a terminal state
+        (succeeded/failed/cancelled) -- see module docstring's "conditional update"
+        note. A real (Postgres) implementation should express this as
+        `WHERE id=:id AND state NOT IN ('succeeded','failed','cancelled')`, exactly the
+        project's documented "every transition uses a conditional update" invariant."""
+        ...
 
     async def mark_failed(
         self, job_id: uuid.UUID, error_code: str, error_detail: str | None = None
-    ) -> None: ...
+    ) -> None:
+        """Same terminal-state guard as mark_succeeded above."""
+        ...
 
     async def mark_retry_wait(
         self, job_id: uuid.UUID, error_code: str, error_detail: str | None = None
-    ) -> None: ...
+    ) -> None:
+        """Same terminal-state guard as mark_succeeded above."""
+        ...
 
     async def set_prompt_id(self, job_id: uuid.UUID, prompt_id: str) -> None: ...
 
@@ -144,13 +194,28 @@ class InMemoryJobQueue:
     async def list_active(self) -> list[QueuedJob]:
         return [j for j in self._jobs.values() if j.state in ("dispatched", "running")]
 
+    # Terminal states: once a job reaches one of these, no further mark_* call may
+    # change it -- see module docstring's "CONCURRENCY BUG FIXED HERE" note. Cheap
+    # in-process equivalent of a Postgres `WHERE state NOT IN (...)` guard.
+    _TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
+
     async def mark_running(self, job_id: uuid.UUID) -> None:
         if job_id in self._jobs:
-            self._jobs[job_id].state = "running"
+            job = self._jobs[job_id]
+            job.state = "running"
+            # Clear any prompt_id left over from a previous (already-resolved) attempt
+            # -- see module docstring. Without this, a reconciler pass landing while
+            # THIS new attempt's own comfy_client.submit() is still in flight (which for
+            # Gemini can take up to gemini_image_request_timeout_s) would resolve the
+            # job using the stale prior attempt's prompt_id/outcome instead of waiting
+            # for the new one.
+            job.prompt_id = None
 
     async def mark_succeeded(self, job_id: uuid.UUID, result: dict) -> None:
         if job_id in self._jobs:
             job = self._jobs[job_id]
+            if job.state in self._TERMINAL_STATES:
+                return
             job.state = "succeeded"
             job.result = result
             job.lease_owner = None
@@ -161,6 +226,8 @@ class InMemoryJobQueue:
     ) -> None:
         if job_id in self._jobs:
             job = self._jobs[job_id]
+            if job.state in self._TERMINAL_STATES:
+                return
             job.state = "failed"
             job.error_code = error_code
             job.error_detail = error_detail
@@ -172,6 +239,8 @@ class InMemoryJobQueue:
     ) -> None:
         if job_id in self._jobs:
             job = self._jobs[job_id]
+            if job.state in self._TERMINAL_STATES:
+                return
             job.state = "retry_wait"
             job.error_code = error_code
             job.error_detail = error_detail
