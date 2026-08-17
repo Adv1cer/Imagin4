@@ -146,6 +146,33 @@ RUN_CAMPUS_PEAK=1 k6 run backend/load_tests/campus_peak.js
 docker compose --profile load-test run --rm k6 run /scripts/baseline.js
 ```
 
+### "100 concurrent users" scenario (real ComfyUI GPU path, not admission-only)
+
+`spike.js` reuses one login at 100 VUs, which mostly tests rate-limit shedding (a single
+account is capped by `max_active_jobs_per_user`/`rl_generation_per_min` regardless of VU
+count). To actually model "100 different people generate an image at the same moment"
+against real ComfyUI worker capacity, use 100 distinct seeded accounts and
+`hundred_concurrent_burst.js`, which polls each job all the way to a terminal state
+(succeeded/failed) instead of stopping at "admitted" -- so you get real wall-clock batch
+completion time, not just admission latency:
+
+```bash
+# 1. Seed 100 distinct accounts (idempotent, safe to re-run):
+docker compose run --rm api python -m scripts.seed_load_test_users --count 100
+
+# 2. Wire APP_COMFY_WORKER_BASE_URLS_CSV / APP_DEFAULT_COMFY_ACTIVE_SLOTS in .env (see
+#    comments there), bring up comfyui-worker-1..4 + api/scheduler/reconciler.
+
+# 3. Run the burst:
+k6 run backend/load_tests/hundred_concurrent_burst.js
+
+# Env overrides: BASE_URL, LOADTEST_PASSWORD, LOADTEST_USER_COUNT (must match --count
+# above), LOADTEST_POLL_TIMEOUT_S (default 600s ceiling per job before it's counted lost).
+```
+
+Only exercises the ComfyUI/general_image (`txt2img_basic`) path -- does not touch
+poster/infographic (Gemini/OpenRouter), by design.
+
 ## Mock vs. live ComfyUI vs. Gemini
 
 Controlled by `APP_COMFY_MODE` (`mock` | `live`, see `app/core/config.py`) **unless**
