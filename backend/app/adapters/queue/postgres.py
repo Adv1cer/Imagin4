@@ -77,6 +77,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import bindparam, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.adapters.queue import QueuedJob
@@ -179,7 +180,14 @@ class PostgresJobQueue:
                              :priority, :effective_priority, :idempotency_key, :input_payload,
                              :current_attempt, :max_attempts, :queued_at)
                         """
-                ),
+                # Raw text() params default to NullType -- without an explicit JSONB
+                # type here, SQLAlchemy skips the JSON-serialize bind processor and
+                # hands asyncpg a raw Python dict, which its binary jsonb encoder
+                # rejects with `AttributeError: 'dict' object has no attribute
+                # 'encode'` (confirmed via Chet's actual integration-test run against a
+                # real Postgres, 2026-08-17 -- this was NOT caught before that, since
+                # this sandbox has no Docker to run the integration suite against).
+                ).bindparams(bindparam("input_payload", type_=JSONB)),
                 {
                     "id": job.id,
                     "user_id": job.user_id,
@@ -496,6 +504,9 @@ class PostgresJobQueue:
     # -- internal helpers -----------------------------------------------------------
 
     async def _append_event(self, session, job_id: uuid.UUID, event_type: str, payload: dict) -> None:
+        # See enqueue()'s comment on bindparam(type_=JSONB) -- same fix needed here,
+        # and this one helper is shared by every mark_*/cancel/claim call site, so this
+        # single bindparams() call was the fix for 7 of the 8 failing integration tests.
         await session.execute(
             text(
                 """
@@ -506,7 +517,7 @@ class PostgresJobQueue:
                     :event_type, :payload
                 )
                 """
-            ),
+            ).bindparams(bindparam("payload", type_=JSONB)),
             {"job_id": job_id, "event_type": event_type, "payload": payload},
         )
 
@@ -533,14 +544,17 @@ class PostgresJobQueue:
         if extra_metrics is not None:
             set_clauses.append("metrics = metrics || :extra_metrics")
             params["extra_metrics"] = extra_metrics
-        await session.execute(
-            text(
-                f"""
-                UPDATE job_attempts
-                SET {", ".join(set_clauses)}
-                WHERE job_id = :job_id
-                  AND attempt_no = (SELECT max(attempt_no) FROM job_attempts WHERE job_id = :job_id)
-                """
-            ),
-            params,
+        stmt = text(
+            f"""
+            UPDATE job_attempts
+            SET {", ".join(set_clauses)}
+            WHERE job_id = :job_id
+              AND attempt_no = (SELECT max(attempt_no) FROM job_attempts WHERE job_id = :job_id)
+            """
         )
+        if extra_metrics is not None:
+            # See enqueue()'s comment on bindparam(type_=JSONB) -- same fix, needed here
+            # too since `metrics || :extra_metrics` is a jsonb || jsonb concat and
+            # asyncpg needs the JSON-serialize bind processor to run on this param.
+            stmt = stmt.bindparams(bindparam("extra_metrics", type_=JSONB))
+        await session.execute(stmt, params)
