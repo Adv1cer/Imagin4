@@ -41,14 +41,16 @@ logger = logging.getLogger("imaginv.gemini")
 _ROLE_TO_GEMINI = {"user": "user", "assistant": "model"}
 
 # Sanitized codes from _sanitized_error below that mean "Gemini itself is temporarily
-# overloaded/rate-limited, the request is safe to retry shortly" -- as opposed to every
-# other _sanitized_error output, which means something more fundamentally wrong (bad
-# config, malformed input, an unexpected exception type). Public (not a leading-
+# overloaded/rate-limited/slow, the request is safe to retry shortly" -- as opposed to
+# every other _sanitized_error output, which means something more fundamentally wrong
+# (bad config, malformed input, an unexpected exception type). Public (not a leading-
 # underscore module-private name) because callers outside this module -- currently
 # app/api/v1/chat_router.py and app/api/v1/conversations.py -- need to distinguish these
 # two cases too: an overload should read to the customer as "try again in a moment", not
 # as generic failure/misconfiguration text.
-GEMINI_OVERLOAD_ERROR_CODES = frozenset({"gemini_overloaded", "gemini_rate_limited"})
+GEMINI_OVERLOAD_ERROR_CODES = frozenset(
+    {"gemini_overloaded", "gemini_rate_limited", "gemini_timeout"}
+)
 
 
 def _sanitized_error(exc: Exception) -> str:
@@ -56,7 +58,8 @@ def _sanitized_error(exc: Exception) -> str:
     back to clients or into job_events; keep only the exception class name -- EXCEPT for
     a couple of specific, high-value cases below, where we surface a distinct, safe
     (not raw-text) code so the customer-facing message doesn't read as "our system is
-    broken" when it's actually Google's API temporarily refusing the request.
+    broken" when it's actually Google's API temporarily refusing/failing to answer the
+    request.
 
     google-genai's APIError (parent of ServerError/ClientError) exposes a structured
     `.code` (HTTP status int) and `.status` (Google's string enum, e.g. "UNAVAILABLE")
@@ -67,7 +70,20 @@ def _sanitized_error(exc: Exception) -> str:
     Reported 2026-08 (Chet): a poster job failed with the generic `gemini_error:
     ServerError`, which reads to a customer like a bug in OUR system, when the actual
     cause was `503 UNAVAILABLE: This model is currently experiencing high demand` --
-    Google's own image model being temporarily overloaded, nothing wrong on our end."""
+    Google's own image model being temporarily overloaded, nothing wrong on our end.
+
+    Also reported 2026-08 (Chet, live logs): route_intent failing with a bare
+    `asyncio.wait_for` TimeoutError (asyncio.TimeoutError IS builtins.TimeoutError as of
+    Python 3.11+, no import needed) -- our own client giving up after
+    gemini_request_timeout_s, not an explicit status Gemini sent back. Functionally the
+    same "try again shortly" situation from the customer's perspective (whether Gemini is
+    slow because it's overloaded, or a transient network hiccup made this one call slow,
+    retrying is the right move either way), so classified into GEMINI_OVERLOAD_ERROR_CODES
+    too rather than falling through to the generic gemini_error:TimeoutError bucket, which
+    previously meant a timeout during chat routing surfaced the same "I couldn't
+    understand your request" clarification text as a genuinely malformed message."""
+    if isinstance(exc, TimeoutError):
+        return "gemini_timeout"
     code = getattr(exc, "code", None)
     status = getattr(exc, "status", None)
     if code == 503 or status == "UNAVAILABLE":

@@ -40,6 +40,11 @@ const KNOWN_CODES: Record<string, ErrorDescription> = {
       'The image/chat model has hit a rate or quota limit -- please try again shortly. (ระบบใช้งานเกินโควต้าชั่วคราว กรุณาลองใหม่อีกครั้งค่ะ)',
     retryableSoon: true,
   },
+  gemini_timeout: {
+    message:
+      "Google's model took too long to respond -- please try again in a moment. (ระบบตอบกลับช้าผิดปกติชั่วคราว กรุณาลองใหม่อีกครั้งค่ะ)",
+    retryableSoon: true,
+  },
   gemini_not_configured: {
     message: "This feature isn't set up on the server yet (missing Gemini API key). Please contact support.",
     retryableSoon: false,

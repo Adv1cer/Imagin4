@@ -36,6 +36,16 @@ def test_429_resource_exhausted_maps_to_gemini_rate_limited():
     assert _sanitized_error(exc) == "gemini_rate_limited"
 
 
+def test_bare_timeout_error_maps_to_gemini_timeout():
+    # Regression (2026-08, Chet's live logs): route_intent's asyncio.wait_for gave up
+    # after gemini_request_timeout_s and raised a bare TimeoutError (asyncio.TimeoutError
+    # IS builtins.TimeoutError as of Python 3.11+) -- previously fell through to the
+    # generic gemini_error:TimeoutError bucket, which chat_router.py's fallback question
+    # doesn't treat as an overload, so a slow-Gemini timeout showed the same "I couldn't
+    # understand your request" text as a genuinely malformed message.
+    assert _sanitized_error(TimeoutError()) == "gemini_timeout"
+
+
 def test_unrelated_api_error_falls_back_to_generic_class_name():
     exc = _FakeAPIError(code=400, status="INVALID_ARGUMENT")
     assert _sanitized_error(exc) == "gemini_error:_FakeAPIError"
