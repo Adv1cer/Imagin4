@@ -18,7 +18,7 @@ import os
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -67,10 +67,30 @@ async def session_factory(postgres_url: str):
 @pytest.fixture()
 async def test_user_id(session_factory) -> uuid.UUID:
     """generation_jobs.user_id is a NOT NULL FK to users(id) -- every test needs a real
-    row to satisfy it."""
-    user_id = uuid.uuid4()
+    row to satisfy it.
+
+    Also truncates every table this suite touches FIRST (2026-08-17, root-caused from
+    Chet's actual test run): `postgres_url` is module-scoped (one container/schema
+    reused for the whole file, for speed -- see its docstring), but this fixture and
+    `session_factory` are function-scoped, so nothing was ever clearing data BETWEEN
+    tests. `test_enqueue_and_get_round_trip` (runs first) enqueues a job and never
+    claims it; that row was still sitting there with state='queued' when
+    `test_claim_next_with_lease_is_atomic_under_concurrent_schedulers` ran next --
+    `claim_next_with_lease` correctly has no per-test scoping (it claims ANY eligible
+    job, exactly like the real scheduler would), so with TWO eligible 'queued' rows in
+    the table, queue_a and queue_b each legitimately claimed a DIFFERENT one --
+    `total_claimed == 2` was the database being in a dirty cross-test state, not a
+    Postgres locking gap. (The earlier CTE -> subquery rewrite of `_claim`'s SQL was a
+    genuine improvement -- that CTE form does have a real, separately-documented
+    correctness edge case -- but it was never what this specific failure was about, and
+    saying otherwise before actually isolating the cause was a mistake.)
+    """
     async with session_factory() as session:
         async with session.begin():
+            await session.execute(
+                text("TRUNCATE job_events, job_attempts, generation_jobs, users RESTART IDENTITY CASCADE")
+            )
+            user_id = uuid.uuid4()
             await session.execute(
                 text(
                     "INSERT INTO users (id, email, display_name) "
