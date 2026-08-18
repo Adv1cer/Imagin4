@@ -59,6 +59,14 @@ from app.domain.jobs.comfy_profiles import DEFAULT_PROFILE_KEY, ComfyProfile
 
 logger = logging.getLogger("imaginv.comfyui_live")
 
+# Marks a prompt_id that was never actually submitted to ComfyUI (a local
+# validation/transport failure minted the id purely so the rest of the pipeline has
+# something to key on -- see submit()). get_status() decodes the failure reason directly
+# from this prefix instead of relying only on self._resolved, which is a plain in-process
+# dict and therefore invisible to get_status() calls made from a different OS process
+# (scheduler submits, reconciler polls -- see submit()'s comment for the full story).
+_LOCAL_FAIL_PREFIX = "localfail:"
+
 # SDXL-friendly base sizes (multiples of 64, ~1024 long edge) per common aspect ratio,
 # scaled up for 2K/4K. Used when comfy_model_family == "checkpoint".
 _BASE_DIMENSIONS_1K: dict[str, tuple[int, int]] = {
@@ -381,7 +389,19 @@ class LiveComfyUIClient:
         graph = self._build_prompt_graph(workflow_payload, filename_prefix)
         prompt_text = str(workflow_payload.get("prompt") or "").strip()
         if not prompt_text:
-            prompt_id = str(uuid.uuid4())
+            # Encoded directly into the prompt_id (see _LOCAL_FAIL_PREFIX / get_status
+            # below) rather than only cached in self._resolved -- under
+            # queue_backend=postgres, submit() and get_status() for the same job run in
+            # DIFFERENT OS processes (scheduler dispatches, reconciler polls; see
+            # app/services/scheduler.py + reconciler.py), each with its own in-memory
+            # ComfyUIClient instance. A dict-only cache is invisible across that process
+            # boundary -- the reconciler's get_status() would see an empty self._resolved
+            # and, since ComfyUI never actually received this (never-submitted) prompt,
+            # find it in neither /history nor /queue either, leaving the job stuck
+            # "running" forever instead of failing with the real reason. Confirmed live
+            # (2026-08) as the same-shaped bug that broke MultiWorkerComfyUIClient/
+            # CompositeComfyUIClient's _owner dicts -- see those modules' fixes.
+            prompt_id = f"{_LOCAL_FAIL_PREFIX}{uuid.uuid4().hex}:empty_prompt"
             self._resolved[prompt_id] = ComfyStatus(
                 prompt_id=prompt_id, state="failed", error="empty_prompt"
             )
@@ -410,9 +430,10 @@ class LiveComfyUIClient:
             # one purely so the rest of the pipeline (which is keyed on prompt_id) has
             # something to look up; get_status() below serves the cached failure for it.
             logger.exception("comfyui_live: submit failed")
-            prompt_id = str(uuid.uuid4())
+            reason = _sanitized_error(exc)
+            prompt_id = f"{_LOCAL_FAIL_PREFIX}{uuid.uuid4().hex}:{reason}"
             self._resolved[prompt_id] = ComfyStatus(
-                prompt_id=prompt_id, state="failed", error=_sanitized_error(exc)
+                prompt_id=prompt_id, state="failed", error=reason
             )
             return ComfySubmitResult(prompt_id=prompt_id)
 
@@ -441,6 +462,16 @@ class LiveComfyUIClient:
         return outputs
 
     async def get_status(self, prompt_id: str) -> ComfyStatus:
+        if prompt_id.startswith(_LOCAL_FAIL_PREFIX):
+            # Stateless decode -- see submit()'s comment on why this can't rely solely on
+            # self._resolved (invisible across the scheduler/reconciler process
+            # boundary). The reason is encoded directly in the id itself, so this is
+            # correct even when this get_status() call is a totally different process
+            # (and therefore a different LiveComfyUIClient instance/empty self._resolved)
+            # than the one that ran submit().
+            _, _, reason = prompt_id[len(_LOCAL_FAIL_PREFIX) :].partition(":")
+            return ComfyStatus(prompt_id=prompt_id, state="failed", error=reason or "local_failure")
+
         cached = self._resolved.get(prompt_id)
         if cached is not None:
             return cached

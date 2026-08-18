@@ -22,6 +22,11 @@ from app.domain.jobs.workflow_registry import resolve_workflow
 
 logger = logging.getLogger("imaginv.routing_comfyui")
 
+_SEP = ":"
+_NOT_CONFIGURED_TAG = "notconfigured"
+_COMFYUI_TAG = "comfyui"
+_GEMINI_TAG = "gemini"
+
 
 class CompositeComfyUIClient:
     """`ComfyUIClient` implementation that dispatches to one of several underlying
@@ -50,10 +55,6 @@ class CompositeComfyUIClient:
         # adapter; see submit() below. None when Gemini isn't configured, in which case
         # the original prompt is used unmodified (same as before this existed).
         self._comfy_prompt_designer = comfy_prompt_designer
-        # Tracks which underlying adapter owns each prompt_id so get_status/cancel can
-        # be routed consistently without re-deriving the workflow's backend later.
-        self._owner: dict[str, ComfyUIClient] = {}
-        self._local_failures: dict[str, ComfyStatus] = {}
 
     def _resolve_backend(self, kind: str | None) -> tuple[ComfyUIClient | None, str]:
         """Returns (adapter_or_None, backend_name). adapter is None only when the
@@ -81,11 +82,18 @@ class CompositeComfyUIClient:
             # real provider was supposed to be wired (see _image_provider_name above),
             # not always literally "gemini", so the failure reads correctly under
             # Settings.image_provider="openrouter" too.
-            prompt_id = str(uuid.uuid4())
-            self._local_failures[prompt_id] = ComfyStatus(
-                prompt_id=prompt_id,
-                state="failed",
-                error=f"{self._image_provider_name}_not_configured",
+            #
+            # The reason is encoded directly in the prompt_id (not a self._local_failures
+            # dict) so get_status() can decode it statelessly -- under
+            # queue_backend=postgres, submit() and get_status() run in separate OS
+            # processes (scheduler dispatches, reconciler polls), each with its own
+            # CompositeComfyUIClient instance; a dict populated here would be invisible
+            # to a get_status() call from the other process. See module-level _SEP/
+            # _NOT_CONFIGURED_TAG and this class's get_status() for the decode side, and
+            # MultiWorkerComfyUIClient (app/adapters/comfyui/multi_worker.py) for the
+            # identically-shaped fix one layer down.
+            prompt_id = (
+                f"{_NOT_CONFIGURED_TAG}{_SEP}{self._image_provider_name}{_SEP}{uuid.uuid4().hex}"
             )
             logger.warning(
                 "routing_comfyui: kind=%s requires the %s image backend but it is not "
@@ -117,28 +125,47 @@ class CompositeComfyUIClient:
                     )
 
         result = await adapter.submit(payload, kind=kind)
-        self._owner[result.prompt_id] = adapter
+        composite_id = f"{backend_name}{_SEP}{result.prompt_id}"
         logger.info(
             "routing_comfyui: kind=%s routed to backend=%s prompt_id=%s",
             kind,
             backend_name,
-            result.prompt_id,
+            composite_id,
         )
-        return result
+        return ComfySubmitResult(prompt_id=composite_id)
+
+    def _decode(self, prompt_id: str) -> tuple[ComfyUIClient | None, str, str | None]:
+        """Returns (adapter_or_None, tag, real_id_or_None). See submit()'s comment on why
+        this is decoded from the prompt_id itself rather than looked up in a dict."""
+        tag, sep, rest = prompt_id.partition(_SEP)
+        if not sep:
+            return None, tag, None
+        if tag == _NOT_CONFIGURED_TAG:
+            return None, tag, rest  # rest here is "<provider_name>:<uuid>", not a real id
+        if tag == _COMFYUI_TAG:
+            return self._comfyui, tag, rest
+        if tag == _GEMINI_TAG:
+            return self._gemini, tag, rest
+        return None, tag, None
 
     async def get_status(self, prompt_id: str) -> ComfyStatus:
-        if prompt_id in self._local_failures:
-            return self._local_failures[prompt_id]
-        adapter = self._owner.get(prompt_id)
-        if adapter is None:
+        adapter, tag, rest = self._decode(prompt_id)
+        if tag == _NOT_CONFIGURED_TAG:
+            provider_name = (rest or "").split(_SEP, 1)[0] or self._image_provider_name
+            return ComfyStatus(
+                prompt_id=prompt_id, state="failed", error=f"{provider_name}_not_configured"
+            )
+        if adapter is None or rest is None:
             return ComfyStatus(prompt_id=prompt_id, state="failed", error="unknown_prompt_id")
-        return await adapter.get_status(prompt_id)
+        status = await adapter.get_status(rest)
+        return ComfyStatus(
+            prompt_id=prompt_id, state=status.state, outputs=status.outputs, error=status.error
+        )
 
     async def cancel(self, prompt_id: str) -> None:
-        adapter = self._owner.get(prompt_id)
-        if adapter is not None:
-            await adapter.cancel(prompt_id)
-        self._local_failures.pop(prompt_id, None)
+        adapter, _tag, rest = self._decode(prompt_id)
+        if adapter is not None and rest is not None:
+            await adapter.cancel(rest)
 
     async def health(self) -> bool:
         # Cheap check: ComfyUI adapter is always present; Gemini's own health() is

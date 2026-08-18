@@ -15,8 +15,18 @@ the scheduler somewhere to actually send concurrently-claimed jobs.
 Correctness note: a ComfyUI `prompt_id` is only meaningful against the SAME instance that
 accepted it -- `/history/{prompt_id}` and `/queue` are per-process state, not shared
 across a cluster. So `get_status()`/`cancel()` must be routed back to whichever worker
-actually owns each prompt_id, tracked here exactly like CompositeComfyUIClient tracks
-which backend (ComfyUI vs Gemini) owns each prompt_id -- never re-derived or guessed.
+actually owns each prompt_id.
+
+Ownership is encoded directly IN the returned prompt_id (`"<worker_index>:<real_id>"`),
+not tracked in an in-memory dict -- see CompositeComfyUIClient (app/adapters/
+routing_comfyui.py) for the parallel fix and the full story. Under
+queue_backend=postgres, submit() (called by the scheduler process) and get_status()/
+cancel() (called by the reconciler process) run in separate OS processes, each with its
+own MultiWorkerComfyUIClient instance -- a dict populated by submit() in one process is
+invisible to get_status() in the other, which is exactly the bug this encoding avoids.
+Confirmed live (2026-08): every real job failed with error="unknown_prompt_id" because
+the reconciler's own (empty) ownership dict never saw what the scheduler's submit() call
+recorded in ITS process memory.
 
 Single-GPU caveat (see project instructions / README): running N workers does not
 multiply GPU compute -- if every worker shares one physical GPU, expect at best partial
@@ -32,6 +42,8 @@ from app.adapters.comfyui import ComfyStatus, ComfySubmitResult, ComfyUIClient
 
 logger = logging.getLogger("imaginv.comfyui_multi_worker")
 
+_SEP = ":"
+
 
 class MultiWorkerComfyUIClient:
     """`ComfyUIClient` implementation that round-robins `submit()` across `workers`."""
@@ -41,46 +53,61 @@ class MultiWorkerComfyUIClient:
             raise ValueError("MultiWorkerComfyUIClient requires at least one worker")
         self._workers = list(workers)
         self._next_index = 0
-        # Tracks which underlying worker accepted each prompt_id so get_status/cancel
-        # always ask the SAME instance that owns it -- see module docstring.
-        self._owner: dict[str, ComfyUIClient] = {}
 
-    def _pick_worker(self) -> ComfyUIClient:
+    def _pick_worker(self) -> tuple[int, ComfyUIClient]:
         """Plain round-robin: no health/load awareness needed here -- a worker that's
         actually down will fail submit() or the resulting job's polling, which the
         existing retry/backoff path (app/domain/jobs/retry.py) already handles by
         re-queuing the job for a fresh scheduler dispatch, which calls submit() again and
         so naturally has a chance to land on a different (healthy) worker next attempt."""
-        worker = self._workers[self._next_index % len(self._workers)]
+        index = self._next_index % len(self._workers)
         self._next_index += 1
-        return worker
+        return index, self._workers[index]
+
+    def _resolve(self, prompt_id: str) -> tuple[ComfyUIClient | None, str]:
+        """Splits the leading `"<worker_index>:"` tag back off. `self._workers`' order is
+        rebuilt identically (same settings.comfy_worker_base_urls order) in every
+        process's own build_comfy_client() call, so an index minted by submit() in the
+        scheduler process resolves to the same worker when decoded in the reconciler
+        process -- no shared state required. Returns (None, prompt_id) if the tag is
+        missing/unparseable (e.g. a prompt_id from some other source), which callers treat
+        as "unknown"."""
+        index_str, sep, real_id = prompt_id.partition(_SEP)
+        if not sep:
+            return None, prompt_id
+        try:
+            index = int(index_str)
+            return self._workers[index], real_id
+        except (ValueError, IndexError):
+            return None, prompt_id
 
     async def submit(self, workflow_payload: dict, kind: str | None = None) -> ComfySubmitResult:
-        worker = self._pick_worker()
+        index, worker = self._pick_worker()
         result = await worker.submit(workflow_payload, kind=kind)
-        self._owner[result.prompt_id] = worker
+        composite_id = f"{index}{_SEP}{result.prompt_id}"
         logger.info(
             "comfyui_multi_worker: kind=%s routed to worker=%s prompt_id=%s",
             kind,
-            self._workers.index(worker),
-            result.prompt_id,
+            index,
+            composite_id,
         )
-        return result
+        return ComfySubmitResult(prompt_id=composite_id)
 
     async def get_status(self, prompt_id: str) -> ComfyStatus:
-        worker = self._owner.get(prompt_id)
+        worker, real_id = self._resolve(prompt_id)
         if worker is None:
             return ComfyStatus(prompt_id=prompt_id, state="failed", error="unknown_prompt_id")
-        return await worker.get_status(prompt_id)
+        status = await worker.get_status(real_id)
+        # Re-wrap under the original composite id -- callers (reconciler, JobOut, etc.)
+        # only ever know this job by the id submit() returned.
+        return ComfyStatus(
+            prompt_id=prompt_id, state=status.state, outputs=status.outputs, error=status.error
+        )
 
     async def cancel(self, prompt_id: str) -> None:
-        # Deliberately does NOT forget ownership here (unlike a hypothetical "cancel also
-        # unregisters" design) -- a caller may reasonably call get_status() right after
-        # cancel() to confirm the terminal state, which must still route back to the same
-        # worker. Matches CompositeComfyUIClient.cancel()'s equivalent choice.
-        worker = self._owner.get(prompt_id)
+        worker, real_id = self._resolve(prompt_id)
         if worker is not None:
-            await worker.cancel(prompt_id)
+            await worker.cancel(real_id)
 
     async def health(self) -> bool:
         """True if AT LEAST ONE worker is healthy -- one worker being briefly down
