@@ -374,6 +374,62 @@ services:
       retries: 20
       start_period: 120s
 
+  # Self-hosted Qwen3.8-27B brain via vLLM's OpenAI-compatible server (see
+  # app/adapters/qwen.py + app/core/config.py's brain_backend/qwen_* settings). Opt-in:
+  # `docker compose --profile brain up -d qwen-brain` -- never started by plain
+  # `docker compose up`. Was referenced by .env.example (APP_QWEN_BASE_URL=
+  # http://qwen-brain:8000) before this service definition existed here -- added
+  # 2026-08-18 while picking this work back up.
+  #
+  # Replaces chat replies + semantic routing ONLY. Poster/Infographic image generation
+  # still needs APP_GEMINI_API_KEY or APP_OPENROUTER_API_KEY regardless of
+  # APP_BRAIN_BACKEND -- see Settings.image_provider's docstring in app/core/config.py.
+  # There is no local/offline image_provider option; removing both keys breaks Poster/
+  # Infographic even with brain_backend=qwen serving chat fine. Ordinary "Image"
+  # generation (workflow image_basic) is unaffected either way -- it always uses ComfyUI.
+  #
+  # ⚠️ VRAM: do not run this alongside all 4 comfyui-worker-* on the one shared GB10 GPU
+  # -- see docker/comfyui-worker/MPS_RUNBOOK.md and the still-open 2-vs-4-worker decision
+  # in .env. gpu-memory-utilization=0.3 (~38GB of 128GB unified memory) is an untested
+  # estimate, not a benchmarked number -- watch `docker compose logs -f qwen-brain` on
+  # first boot for an OOM before assuming it's fine.
+  qwen-brain:
+    image: vllm/vllm-openai:latest
+    profiles: ["brain"]
+    restart: unless-stopped
+    ipc: host
+    environment:
+      CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
+      CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
+      # Qwen3.8-27B-FP8 is a gated/rate-limited repo on some accounts -- set in .env if
+      # you hit a 401/403 pull error; harmless empty value otherwise.
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    command:
+      - "--model=Qwen/Qwen3.8-27B-FP8"
+      - "--gpu-memory-utilization=0.3"
+      - "--max-model-len=8192"
+    volumes:
+      - /tmp/nvidia-mps:/tmp/nvidia-mps
+      - /tmp/nvidia-mps-log:/tmp/nvidia-mps-log
+      # Persists the downloaded checkpoint across container restarts -- without this a
+      # `docker compose down`/`up` cycle re-downloads ~27-33GB every time.
+      - qwen_hf_cache:/root/.cache/huggingface
+    ports:
+      - "8100:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 300s # first run downloads + loads a ~27-33GB checkpoint
+
   api:
     build: .
     <<: *app-env
@@ -483,3 +539,4 @@ volumes:
   imaginv_postgres_data:
   imaginv_redis_data:
   imaginv_minio_data:
+  qwen_hf_cache:
