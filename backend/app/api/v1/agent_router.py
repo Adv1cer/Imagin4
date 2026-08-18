@@ -47,7 +47,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.queue import JobQueue, QueuedJob
-from app.api.deps import get_current_user, get_db_session, get_gemini_text_client, get_job_queue
+from app.api.deps import (
+    check_admission_capacity,
+    get_current_user,
+    get_db_session,
+    get_gemini_text_client,
+    get_job_queue,
+    rate_limited,
+)
 from app.api.v1.chat_router import SmartMessageOut, process_routed_message
 from app.api.v1.conversations import _append_message
 from app.db.models import Conversation, User
@@ -139,7 +146,17 @@ async def _get_or_create_conversation_by_external_ref(
     return conv
 
 
-@router.post("/message", response_model=SmartMessageOut, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/message",
+    response_model=SmartMessageOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    # Same admit_generation_job path as smart_message -- gate it identically. See
+    # app/core/rate_limit.py.
+    dependencies=[
+        Depends(check_admission_capacity),
+        Depends(rate_limited("message", "rl_message_per_min")),
+    ],
+)
 async def agent_message(
     payload: AgentMessageIn,
     session: AsyncSession = Depends(get_db_session),

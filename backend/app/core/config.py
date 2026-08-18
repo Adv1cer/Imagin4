@@ -189,6 +189,61 @@ class Settings(BaseSettings):
     # re-classify, three sequential calls) bounded to roughly 30+20+30=80s instead of 90s.
     gemini_research_timeout_s: float = 20.0
 
+    # Which model powers chat replies + the semantic intent router (app/adapters/gemini.py's
+    # GeminiTextClient vs app/adapters/qwen.py's QwenTextClient -- see app/main.py's
+    # _build_state). "gemini" (default) is the original, fully-featured path (grounded
+    # Google Search research included). "qwen" points app.state.gemini_text_client (name
+    # kept for now -- see app/api/deps.py's get_gemini_text_client, still the one
+    # dependency chat_router.py/agent_router.py/conversations.py use) at a self-hosted
+    # Qwen3.8-27B served over vLLM's OpenAI-compatible API instead, for cost control and
+    # to keep chat traffic off an external API entirely (Chet, 2026-08-18).
+    #
+    # KNOWN GAP, read before flipping this in production: QwenTextClient.research_missing_fields
+    # ALWAYS raises (there is no equivalent of Gemini's built-in google_search grounding
+    # tool wired up here) -- chat_router.py already treats research failures as
+    # best-effort/optional and falls back to just asking the user, so this degrades
+    # gracefully rather than breaking anything, but it does mean POSTER/INFOGRAPHIC jobs
+    # lose the "auto-fill a publicly-known missing field" capability entirely under
+    # brain_backend="qwen". Wiring a real search tool (e.g. Serper/Brave + vLLM tool
+    # calling) is a separate future increment, not done here.
+    brain_backend: Literal["gemini", "qwen"] = "gemini"
+
+    # vLLM OpenAI-compatible server hosting Qwen3.8-27B (see docker-compose.yml's
+    # `qwen-brain` service) -- only used when brain_backend="qwen". Released 2026-08-14,
+    # Apache 2.0, native hybrid-attention (48 Gated DeltaNet linear-attention layers + 16
+    # full Gated Attention layers) architecture -- much lighter KV cache per token than a
+    # plain transformer of this size, but NOT the reason it was picked here (chat/routing
+    # messages are short; long-context KV cost barely matters for this use case).
+    #
+    # QUANTIZATION CHOICE, read before changing qwen_text_model: default below points at
+    # an FP8 checkpoint (~27-33GB weights per public reports), NOT the NVFP4 checkpoints
+    # also on the Hub (~19GB, more VRAM headroom on paper). This is deliberate: GB10/DGX
+    # Spark's tensor cores are sm_121 ("consumer Blackwell"), and NVIDIA's own tcgen05 FP4
+    # tensor-core path is documented as hard-restricted to sm_100a/sm_103a -- explicitly
+    # EXCLUDING sm_121 (confirmed via NVIDIA dev forum, 2026-08). NVFP4 weights would
+    # likely load and run, but may silently fall back to a slower dequant path rather than
+    # getting real FP4 tensor-core acceleration on this specific chip -- unconfirmed
+    # either way as of this writing, so FP8 (broadly supported since Hopper, safer bet
+    # pending a real benchmark) is the conservative default. Benchmark NVFP4 for real
+    # before trusting the smaller footprint in production.
+    #
+    # VRAM BUDGET, read before choosing worker count alongside this: DGX Spark has 128GB
+    # unified memory shared between CPU and GPU. FP8 Qwen3.8-27B needs roughly 30-35GB
+    # (weights + modest KV cache for short chat/routing messages, not the model's full
+    # 262144-token context). 4 ComfyUI workers via MPS were measured using most of the
+    # remaining budget with little headroom (see README's MPS section) -- running the
+    # brain alongside 4 image workers is tight. Alongside 2 ComfyUI workers there is
+    # comfortable headroom. This is the other half of the still-open "2 vs 4 workers"
+    # decision (see README's "Known issue: worker-3/4 CUBLAS crash" section) -- adding the
+    # brain is a real argument for settling on 2.
+    qwen_base_url: str = "http://localhost:8100"
+    qwen_text_model: str = "Qwen/Qwen3.8-27B-FP8"
+    qwen_request_timeout_s: float = 30.0
+    # See the research_missing_fields gap noted above -- kept for interface parity with
+    # gemini_research_timeout_s even though QwenTextClient's research call always raises
+    # immediately (no network call actually made), so this value doesn't do much yet.
+    qwen_research_timeout_s: float = 20.0
+
     # Image generation provider for "Poster / Infographic" jobs specifically (see
     # app/domain/jobs/workflow_registry.py's `backend` field / CompositeComfyUIClient in
     # app/adapters/routing_comfyui.py). "gemini" (default) calls Google's Gemini image
@@ -231,11 +286,23 @@ class Settings(BaseSettings):
     openrouter_image_request_timeout_s: float = 90.0
 
     # Rate limiting (requests per window per identity)
+    # NOTE (2026-08-18): these settings existed but were never wired into any endpoint --
+    # app/core/rate_limit.py:check_rate_limit / app/api/deps.py:rate_limited() is the
+    # enforcement, applied at the POST /v1/generations, /smart-message, /agent/message
+    # call sites (see app/api/v1/generations.py, chat_router.py, agent_router.py).
     rl_login_per_min: int = 10
     rl_refresh_per_min: int = 30
     rl_message_per_min: int = 60
     rl_generation_per_min: int = 10
     rl_sse_connect_per_min: int = 30
+
+    # Admission control -- see app/core/rate_limit.py:AdmissionGate's docstring for the
+    # 2026-08-18 burst-test incident this exists to prevent. FLEET-WIDE cap (shared via
+    # Redis across every API replica), not per-process: size it to the shared PgBouncer/
+    # Postgres capacity (pgbouncer DEFAULT_POOL_SIZE in docker-compose.yml), not to a
+    # single replica's own db_pool_size + db_max_overflow. 0 disables the gate.
+    admission_max_inflight: int = 150
+    admission_gate_ttl_s: int = 60
 
 
 @lru_cache

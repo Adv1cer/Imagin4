@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from pydantic import BaseModel
 
 from app.adapters.queue import JobQueue
-from app.api.deps import get_current_user, get_job_queue
+from app.api.deps import check_admission_capacity, get_current_user, get_job_queue, rate_limited
 from app.db.models import User
 from app.domain.jobs.admission import (
     IdempotencyConflictError,
@@ -41,7 +41,18 @@ class GenerationOut(BaseModel):
     error_detail: str | None = None
 
 
-@router.post("", response_model=GenerationOut, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "",
+    response_model=GenerationOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    # check_admission_capacity runs first (no DB touched yet) and sheds excess load with
+    # a fast 503; rate_limited runs after auth and caps a single user's own throughput.
+    # See app/core/rate_limit.py for the 2026-08-18 burst-test incident these exist for.
+    dependencies=[
+        Depends(check_admission_capacity),
+        Depends(rate_limited("generation", "rl_generation_per_min")),
+    ],
+)
 async def create_generation(
     payload: GenerationCreate,
     response: Response,

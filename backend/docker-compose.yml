@@ -42,6 +42,14 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    # max_connections bumped from the image default (100) -- 2026-08-18: with a single
+    # `api` replica's own pool raised to APP_DB_POOL_SIZE=100 / APP_DB_MAX_OVERFLOW=50
+    # (150 possible connections from that one process alone) plus scheduler/reconciler
+    # each holding their own small pool, the default 100 doesn't leave enough headroom
+    # even with PgBouncer transaction pooling in front. Raise further if you scale `api`
+    # to more replicas or add more comfyui-worker orchestrator processes that talk to
+    # Postgres directly.
+    command: ["postgres", "-c", "max_connections=250"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-imaginv}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-imaginv}
@@ -65,8 +73,20 @@ services:
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-imaginv}:${POSTGRES_PASSWORD:-imaginv}@postgres:5432/${POSTGRES_DB:-imaginv}
       POOL_MODE: transaction
-      MAX_CLIENT_CONN: 500
-      DEFAULT_POOL_SIZE: 25
+      # 2026-08-18: bumped alongside postgres.max_connections above and
+      # APP_DB_POOL_SIZE=100/APP_DB_MAX_OVERFLOW=50 on the api service -- the previous
+      # MAX_CLIENT_CONN=500/DEFAULT_POOL_SIZE=25 pairing is what let a 100-VU burst test
+      # exhaust the api process's DB pool and take down every in-flight request (see
+      # app/core/rate_limit.py's module docstring for the full incident writeup).
+      # DEFAULT_POOL_SIZE is the number of real backend connections PgBouncer keeps open
+      # to Postgres per (database, user) pair in transaction mode -- every client-side
+      # connection (from every api/scheduler/reconciler process, however many replicas)
+      # is multiplexed through this many, so it does NOT need to equal
+      # MAX_CLIENT_CONN or the app's own pool size, just comfortably cover the real
+      # concurrent-transaction rate. Keep it under postgres's max_connections above,
+      # with headroom for direct (non-pgbouncer) connections.
+      MAX_CLIENT_CONN: 2000
+      DEFAULT_POOL_SIZE: 60
       # postgres:16-alpine defaults password_encryption to scram-sha-256; edoburu/pgbouncer
       # defaults AUTH_TYPE to md5, so without this pgbouncer rejects the upstream login with
       # "wrong password type". Must match Postgres's actual encryption method.
@@ -359,10 +379,46 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    # No `ports:` here on purpose (2026-08-18) -- a fixed host port mapping is exactly
+    # what breaks `docker compose up --scale api=N`, since every replica would fight over
+    # the same host port. Reach the API through the `nginx` service below instead, which
+    # is the one thing that binds host port 8000 now. A single unscaled `api` container
+    # is still reachable at http://api:8000 from other containers on this network (used
+    # directly by `docker compose run --rm api alembic upgrade head`, tests, etc).
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # L7 load balancer -- see docs/architecture.md's diagram ("Next.js/API client -> L7
+  # load balancer -> FastAPI replicas"). 2026-08-18: added because the api service had no
+  # load balancer AND no host-scalability in front of it at all -- a single uvicorn
+  # process with no `--workers` and no replicas took the full force of a 100-VU burst
+  # test. Scale api with `docker compose up -d --scale api=N nginx ...`.
+  #
+  # IMPORTANT when scaling api beyond 1 replica: APP_DB_POOL_SIZE / APP_DB_MAX_OVERFLOW
+  # in .env are PER REPLICA (each api process builds its own SQLAlchemy engine/pool) --
+  # divide the single-replica values by N so the fleet's total requested connections
+  # stays sane against pgbouncer's DEFAULT_POOL_SIZE/postgres's max_connections above.
+  # APP_ADMISSION_MAX_INFLIGHT does NOT need dividing -- it's a fleet-wide cap shared via
+  # Redis across every replica already (see app/core/rate_limit.py:AdmissionGate).
+  #
+  # This nginx config is a lightweight round-robin suitable for local/DGX dev and load
+  # testing, not a production-grade LB (no health-aware routing, no TLS termination) --
+  # swap in a real LB/ingress for actual production per docs/architecture.md section 1.
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    volumes:
+      - ./docker/nginx/api-lb.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "8000:8000"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health/live"]
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8000/v1/health/live"]
       interval: 5s
       timeout: 5s
       retries: 10

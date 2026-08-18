@@ -7,7 +7,7 @@ get_comfy_client, get_db) with fakes without touching the router code.
 
 from __future__ import annotations
 
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator, Callable
 
 from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
@@ -17,9 +17,13 @@ from app.adapters.comfyui import ComfyUIClient
 from app.adapters.queue import JobQueue
 from app.adapters.storage import ObjectStorage
 from app.core.config import Settings, get_settings
+from app.core.rate_limit import AdmissionGate, check_rate_limit
 from app.db.models import ApiKey, AuthSession, User
 from app.domain.auth.api_keys import KEY_PREFIX, hash_api_key, is_api_key_active
 from app.domain.auth.sessions import hash_token, is_session_valid
+
+if TYPE_CHECKING:
+    import redis.asyncio as redis
 
 
 def get_app_settings() -> Settings:
@@ -48,6 +52,71 @@ def get_gemini_text_client(request: Request):
     """None when GEMINI_API_KEY isn't configured (see app/main.py:_build_state) --
     callers must handle that case explicitly rather than assuming it's always wired."""
     return getattr(request.app.state, "gemini_text_client", None)
+
+
+def get_redis(request: Request) -> "redis.Redis | None":
+    return getattr(request.app.state, "redis", None)
+
+
+async def check_admission_capacity(request: Request) -> AsyncIterator[None]:
+    """Global concurrency gate -- must run BEFORE any DB-touching dependency, including
+    get_current_user. Deliberately does not depend on the authenticated user: rejecting
+    excess load has to happen before a DB connection is spent resolving who's asking,
+    which is exactly the code path (SELECT ... FROM api_keys) that exhausted the pool
+    during the 2026-08-18 100-VU burst test. See app/core/rate_limit.py:AdmissionGate.
+
+    Add `dependencies=[Depends(check_admission_capacity)]` to any route that ends up
+    calling admit_generation_job (app/domain/jobs/admission.py) -- currently POST
+    /v1/generations, /conversations/{id}/smart-message, /pending-actions/{id}/confirm,
+    and /agent/message.
+
+    `app.state.admission_gate` may not exist at all -- e.g. tests/e2e/test_smoke.py
+    builds a bare FastAPI() app with only the fakes it needs, not the full
+    app.main._build_state wiring -- in which case this is a no-op, same as an
+    AdmissionGate built with no Redis client.
+    """
+    gate: AdmissionGate | None = getattr(request.app.state, "admission_gate", None)
+    if gate is None:
+        yield
+        return
+    if not await gate.try_acquire():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server is at capacity, please retry shortly",
+        )
+    try:
+        yield
+    finally:
+        await gate.release()
+
+
+def rate_limited(scope: str, limit_attr: str) -> Callable:
+    """Dependency factory for the per-user fixed-window limits in Settings (rl_* fields,
+    e.g. rl_generation_per_min) -- those settings existed but were never enforced
+    anywhere before 2026-08-18; this is the enforcement. Runs AFTER get_current_user
+    (needs an identity), unlike check_admission_capacity above which runs before it.
+    """
+
+    async def _dependency(
+        request: Request,
+        user: User = Depends(get_current_user),
+    ) -> None:
+        settings = get_settings()
+        limit = getattr(settings, limit_attr)
+        allowed = await check_rate_limit(
+            get_redis(request),
+            scope=scope,
+            user_id=str(user.id),
+            limit_per_window=limit,
+            window_seconds=60,
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many requests, please slow down",
+            )
+
+    return _dependency
 
 
 async def _resolve_api_key_user(session: AsyncSession, raw_key: str) -> User | None:

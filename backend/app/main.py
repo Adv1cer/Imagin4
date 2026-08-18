@@ -13,6 +13,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import redis.asyncio as redis_asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -32,6 +33,7 @@ from app.api.v1 import (
     metrics,
 )
 from app.core.config import get_settings
+from app.core.rate_limit import AdmissionGate
 from app.db.base import get_engine
 from app.services.reconciler import Reconciler
 from app.services.scheduler import Scheduler
@@ -44,6 +46,22 @@ def _build_state(app: FastAPI) -> None:
     settings = get_settings()
     engine = get_engine()
     app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    # Redis client is lazy (from_url doesn't connect eagerly) -- fine here, since both
+    # consumers (AdmissionGate, rate_limit.check_rate_limit) fail open on any Redis error
+    # rather than needing a verified connection at startup. See app/core/rate_limit.py
+    # for why this exists: a 2026-08-18 100-VU burst test exhausted the DB pool because
+    # nothing rejected excess requests before they reached it.
+    app.state.redis = redis_asyncio.from_url(
+        settings.redis_url,
+        socket_connect_timeout=settings.redis_connect_timeout_s,
+        socket_timeout=settings.redis_connect_timeout_s,
+    )
+    app.state.admission_gate = AdmissionGate(
+        app.state.redis,
+        max_inflight=settings.admission_max_inflight,
+        ttl_seconds=settings.admission_gate_ttl_s,
+    )
 
     # settings.queue_backend selects InMemoryJobQueue (dev/test, no Postgres needed) vs
     # PostgresJobQueue (durable, shared across every API/scheduler/reconciler process --
@@ -62,7 +80,35 @@ def _build_state(app: FastAPI) -> None:
     # design step build_comfy_client wires up internally for the image clients below --
     # two thin client instances, not two different code paths; see
     # app/adapters/comfyui/factory.py's module docstring for why the split is correct.
-    if settings.gemini_api_key:
+    #
+    # settings.brain_backend picks which model actually answers chat/routing: "gemini"
+    # (default, external API) or "qwen" (self-hosted Qwen3.8-27B via vLLM -- see
+    # app/adapters/qwen.py's module docstring and Settings.brain_backend's docstring for
+    # the VRAM/quantization/feature-gap tradeoffs, 2026-08-18). Attribute name is kept as
+    # `gemini_text_client` either way -- chat_router.py/conversations.py/agent_router.py
+    # all depend on it by that name via app/api/deps.py's get_gemini_text_client, and
+    # both clients expose the identical method surface (duck-typed, no formal Protocol),
+    # so renaming the attribute would be a larger, purely-cosmetic diff for no behavior
+    # change. Only the comfy-dispatch prompt-designer inside build_comfy_client() is
+    # UNAFFECTED by this setting and still always uses Gemini/OpenRouter when configured
+    # -- intentionally out of scope for this pass, see app/adapters/comfyui/factory.py.
+    if settings.brain_backend == "qwen":
+        from app.adapters.qwen import QwenTextClient
+
+        app.state.gemini_text_client = QwenTextClient(
+            base_url=settings.qwen_base_url,
+            model=settings.qwen_text_model,
+            timeout_s=settings.qwen_request_timeout_s,
+            research_timeout_s=settings.qwen_research_timeout_s,
+        )
+        logger.info(
+            "brain: wired for chat replies + routing via self-hosted Qwen "
+            "(base_url=%s, model=%s) -- research_missing_fields is NOT available in "
+            "this mode, see Settings.brain_backend's docstring",
+            settings.qwen_base_url,
+            settings.qwen_text_model,
+        )
+    elif settings.gemini_api_key:
         from app.adapters.gemini import GeminiTextClient
 
         app.state.gemini_text_client = GeminiTextClient(
@@ -72,13 +118,15 @@ def _build_state(app: FastAPI) -> None:
             research_timeout_s=settings.gemini_research_timeout_s,
         )
         logger.info(
-            "gemini: wired for chat replies + routing (model=%s)", settings.gemini_text_model
+            "brain: wired for chat replies + routing via Gemini (model=%s)",
+            settings.gemini_text_model,
         )
     else:
         app.state.gemini_text_client = None
         logger.info(
-            "gemini: APP_GEMINI_API_KEY not set -- chat replies will fail clearly "
-            "(POST .../assistant-reply 503) instead of silently degrading"
+            "brain: neither APP_BRAIN_BACKEND=qwen nor APP_GEMINI_API_KEY configured -- "
+            "chat replies will fail clearly (POST .../assistant-reply 503) instead of "
+            "silently degrading"
         )
 
     # ComfyUI (mock/live) + Gemini/OpenRouter poster-infographic wiring -- see
@@ -133,6 +181,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = getattr(app.state, "session_factory", None)
     if engine is not None:
         await get_engine().dispose()
+
+    redis_client = getattr(app.state, "redis", None)
+    if redis_client is not None:
+        # aclose() landed in redis-py 5.0.1; fall back to close() for 5.0.0 exactly
+        # (pyproject.toml pins redis>=5.0, not >=5.0.1).
+        await (redis_client.aclose() if hasattr(redis_client, "aclose") else redis_client.close())
     logger.info("imaginv backend shut down")
 
 

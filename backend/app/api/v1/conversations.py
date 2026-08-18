@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.gemini import GEMINI_OVERLOAD_ERROR_CODES
+from app.adapters.qwen import QWEN_OVERLOAD_ERROR_CODES
 from app.api.deps import get_current_user, get_db_session, get_gemini_text_client
 from app.db.models import ChatMessage, Conversation, User
 from app.domain.conversations.pagination import Cursor, InvalidCursorError
@@ -326,7 +327,9 @@ async def create_assistant_reply(
         # is expected to fix) with a stable detail string instead of the previous vague
         # sentence, so the frontend has one consistent field to key error text off of.
         sanitized_code = str(exc) if isinstance(exc, RuntimeError) else ""
-        if sanitized_code in GEMINI_OVERLOAD_ERROR_CODES:
+        # Unioned with QWEN_OVERLOAD_ERROR_CODES -- see chat_router.py's _OVERLOAD_REASONS
+        # comment for why (Settings.brain_backend picks which backend is actually live).
+        if sanitized_code in GEMINI_OVERLOAD_ERROR_CODES | QWEN_OVERLOAD_ERROR_CODES:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=sanitized_code
             )

@@ -46,8 +46,16 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.gemini import GEMINI_OVERLOAD_ERROR_CODES
+from app.adapters.qwen import QWEN_OVERLOAD_ERROR_CODES
 from app.adapters.queue import JobQueue
-from app.api.deps import get_current_user, get_db_session, get_gemini_text_client, get_job_queue
+from app.api.deps import (
+    check_admission_capacity,
+    get_current_user,
+    get_db_session,
+    get_gemini_text_client,
+    get_job_queue,
+    rate_limited,
+)
 from app.api.v1.conversations import MessageOut, _append_message, _get_owned_conversation
 from app.api.v1.generations import GenerationOut
 from app.db.models import ChatMessage, PendingAction, User
@@ -147,8 +155,11 @@ class SmartMessageOut(BaseModel):
 # image-generation fix earlier (see gemini.py's _sanitized_error docstring for the
 # original 2026-08 incident this pattern comes from). Shared (not redefined here) so
 # app/api/v1/conversations.py's create_assistant_reply can apply the exact same
-# classification to its own Gemini failures.
-_OVERLOAD_REASONS = GEMINI_OVERLOAD_ERROR_CODES
+# classification to its own Gemini failures. Unioned with QWEN_OVERLOAD_ERROR_CODES
+# (app/adapters/qwen.py) so this reads correctly regardless of which one
+# Settings.brain_backend actually has active -- the two sets never overlap (qwen_* vs
+# gemini_* prefixes), so the union is always safe.
+_OVERLOAD_REASONS = GEMINI_OVERLOAD_ERROR_CODES | QWEN_OVERLOAD_ERROR_CODES
 _OVERLOAD_CLARIFICATION_QUESTION = (
     "ขอโทษค่ะ ตอนนี้ระบบ AI มีผู้ใช้งานหนาแน่นชั่วคราว กรุณาลองส่งข้อความเดิมอีกครั้งในอีกสักครู่นะคะ 🙏"
 )
@@ -433,6 +444,14 @@ async def process_routed_message(
     "/conversations/{conversation_id}/smart-message",
     response_model=SmartMessageOut,
     status_code=status.HTTP_202_ACCEPTED,
+    # This can end up calling admit_generation_job (EnqueueGeneralImage/EnqueuePaidImage
+    # in decide_next_step) just like POST /v1/generations, and always does at least the
+    # DB-touching work in _append_message first -- gate it the same way. See
+    # app/core/rate_limit.py.
+    dependencies=[
+        Depends(check_admission_capacity),
+        Depends(rate_limited("message", "rl_message_per_min")),
+    ],
 )
 async def smart_message(
     conversation_id: str,
@@ -497,7 +516,14 @@ _CONFIRM_ERROR_DETAIL = {
 }
 
 
-@router.post("/pending-actions/{pending_action_id}/confirm", response_model=SmartMessageOut)
+@router.post(
+    "/pending-actions/{pending_action_id}/confirm",
+    response_model=SmartMessageOut,
+    # Dormant path today (module docstring: nothing currently creates new PendingAction
+    # rows) but still calls admit_generation_job on confirm -- gate it too so reinstating
+    # the confirm flow later doesn't silently reopen the burst-exhaustion hole.
+    dependencies=[Depends(check_admission_capacity)],
+)
 async def confirm_pending_action(
     pending_action_id: str,
     session: AsyncSession = Depends(get_db_session),
