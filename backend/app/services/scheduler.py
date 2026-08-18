@@ -22,9 +22,15 @@ import socket
 import uuid
 from datetime import datetime, timezone
 
-from app.adapters.comfyui import ComfyUIClient, MockComfyUIClient
+import httpx
+from sqlalchemy import text
+
+from app.adapters.comfyui import ComfyUIClient
+from app.adapters.comfyui.factory import build_comfy_client
 from app.adapters.queue import JobQueue, QueuedJob
 from app.adapters.queue.factory import build_job_queue
+from app.adapters.storage import InMemoryObjectStorage
+from app.adapters.storage.s3 import S3ObjectStorage
 from app.core.config import Settings, get_settings
 from app.domain.jobs.workflow_registry import kinds_for_backend
 from app.domain.workers.scoring import WorkerSnapshot
@@ -33,6 +39,13 @@ logger = logging.getLogger("imaginv.scheduler")
 
 DEFAULT_POLL_INTERVAL_S = 1.0
 DEFAULT_LEASE_SECONDS = 120.0
+# See Scheduler._heartbeat_once's docstring: this is the gap discovered 2026-08-18 --
+# _reserve_capacity_by_backend() reads comfy_workers with NO fallback in postgres mode,
+# but nothing was writing to that table, so capacity was always 0 and every job stayed
+# stuck in 'queued' forever. 5s keeps worker status reasonably fresh without hammering
+# each ComfyUI instance's /queue endpoint on every 1s dispatch tick.
+DEFAULT_HEARTBEAT_INTERVAL_S = 5.0
+HEARTBEAT_HTTP_TIMEOUT_S = 3.0
 
 
 class Scheduler:
@@ -55,6 +68,7 @@ class Scheduler:
         session_factory=None,
         poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
+        heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
         owner_id: str | None = None,
     ) -> None:
         self.job_queue = job_queue
@@ -63,6 +77,7 @@ class Scheduler:
         self.session_factory = session_factory
         self.poll_interval_s = poll_interval_s
         self.lease_seconds = lease_seconds
+        self.heartbeat_interval_s = heartbeat_interval_s
         self.owner_id = owner_id or f"scheduler-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
         self._shutdown = asyncio.Event()
         self._inflight: set[asyncio.Task] = set()
@@ -173,6 +188,120 @@ class Scheduler:
             self._inflight.add(task)
             task.add_done_callback(self._inflight.discard)
 
+    @staticmethod
+    def _worker_name(base_url: str) -> str:
+        """Deterministic, stable-across-restarts name derived from the worker's own
+        base_url (config-driven, not a random id per process) -- comfy_workers.name has
+        a UNIQUE constraint, so re-running this heartbeat against the SAME worker always
+        UPSERTs the SAME row instead of accumulating duplicates every restart."""
+        return base_url.replace("http://", "").replace("https://", "").replace("/", "-").rstrip("-")
+
+    async def _heartbeat_once(self) -> None:
+        """UPSERTs one comfy_workers row per configured worker base_url, reflecting
+        whether it currently answers /queue and whether it's mid-execution.
+
+        Closes the gap discovered 2026-08-18 (Chet's DGX Spark): with queue_backend=
+        postgres, _reserve_capacity_by_backend() computes ComfyUI capacity ONLY from
+        comfy_workers rows with status='online' -- there is no fallback to
+        default_comfy_active_slots like the in-memory-queue path has. Nothing in this
+        repo previously wrote to comfy_workers at all, so the table stayed permanently
+        empty and every job sat in 'queued' forever, even though ComfyUI itself was
+        healthy and idle. A manual SQL INSERT unblocks a single test run but goes stale
+        the moment a real worker dies -- this loop is the durable fix.
+
+        Deliberately coarse for a first pass: max_slots is hardcoded to 1 (each ComfyUI
+        process here executes one prompt at a time; see Settings.comfy_worker_base_urls_csv's
+        docstring on the single-GPU/MPS caveat -- this does NOT attempt to read real GPU
+        VRAM, since GB10/DGX Spark's NVML reporting is unreliable, see MPS_RUNBOOK.md).
+        running_slots is 1 if ComfyUI's own /queue reports anything in queue_running,
+        else 0 -- good enough for _reserve_capacity_by_backend's slot arithmetic without
+        needing this process to track individual job->worker assignment itself.
+        """
+        if self.session_factory is None or self.settings.comfy_mode == "mock":
+            return  # nothing to register in memory-queue/mock-comfy dev mode
+
+        worker_urls = self.settings.comfy_worker_base_urls or (
+            [self.settings.comfy_base_url] if self.settings.comfy_base_url else []
+        )
+        if not worker_urls:
+            return
+
+        async with httpx.AsyncClient(timeout=HEARTBEAT_HTTP_TIMEOUT_S) as client:
+            for base_url in worker_urls:
+                name = self._worker_name(base_url)
+                status = "offline"
+                running_slots = 0
+                try:
+                    resp = await client.get(f"{base_url}/queue")
+                    resp.raise_for_status()
+                    data = resp.json()
+                    running_slots = 1 if data.get("queue_running") else 0
+                    status = "online"
+                except Exception:
+                    logger.warning(
+                        "scheduler[%s]: heartbeat probe failed for worker=%s (marking offline)",
+                        self.owner_id,
+                        base_url,
+                        exc_info=True,
+                    )
+
+                try:
+                    async with self.session_factory() as session, session.begin():
+                        await session.execute(
+                            text(
+                                """
+                                INSERT INTO comfy_workers
+                                    (id, name, endpoint_ref, status, max_slots,
+                                     reserved_slots, running_slots, last_heartbeat_at)
+                                VALUES
+                                    (gen_random_uuid(), :name, :endpoint_ref, :status, 1,
+                                     0, :running_slots, now())
+                                ON CONFLICT (name) DO UPDATE SET
+                                    endpoint_ref = excluded.endpoint_ref,
+                                    status = excluded.status,
+                                    running_slots = excluded.running_slots,
+                                    last_heartbeat_at = excluded.last_heartbeat_at
+                                """
+                            ),
+                            {
+                                "name": name,
+                                "endpoint_ref": base_url,
+                                "status": status,
+                                "running_slots": running_slots,
+                            },
+                        )
+                except Exception:
+                    # comfy_workers.id needs pgcrypto's gen_random_uuid() (Postgres 13+
+                    # has it built in; older/custom installs may not) -- log and move on
+                    # rather than crashing the whole heartbeat pass over one bad row.
+                    logger.exception(
+                        "scheduler[%s]: failed to upsert comfy_workers row for %s", self.owner_id, name
+                    )
+
+    async def run_heartbeat_forever(self) -> None:
+        if self.session_factory is None or self.settings.comfy_mode == "mock":
+            logger.info(
+                "scheduler[%s]: worker heartbeat loop not needed (queue_backend=memory or "
+                "comfy_mode=mock) -- capacity uses default_comfy_active_slots instead",
+                self.owner_id,
+            )
+            return
+        logger.info(
+            "scheduler[%s]: starting worker heartbeat loop (interval=%.1fs)",
+            self.owner_id,
+            self.heartbeat_interval_s,
+        )
+        while not self._shutdown.is_set():
+            try:
+                await self._heartbeat_once()
+            except Exception:
+                logger.exception("scheduler[%s]: heartbeat pass failed", self.owner_id)
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=self.heartbeat_interval_s)
+            except asyncio.TimeoutError:
+                pass
+        logger.info("scheduler[%s]: heartbeat loop shut down", self.owner_id)
+
     async def run_forever(self) -> None:
         logger.info(
             "scheduler[%s]: starting main loop (poll_interval=%.1fs, lease=%.0fs)",
@@ -225,22 +354,27 @@ async def main() -> None:
         session_factory = get_session_factory()
     job_queue: JobQueue = build_job_queue(settings, session_factory=session_factory)
 
-    # NOTE (still a gap, unrelated to the JobQueue backend above): this standalone
-    # entrypoint always dispatches against MockComfyUIClient, unlike app/main.py's
-    # `_build_state`, which wires a real live/multi-worker ComfyUI client or Gemini from
-    # settings. A live-mode deployment running this process standalone (queue_backend=
-    # postgres, APP_COMFY_MODE=live) would currently claim real jobs and "dispatch" them
-    # to the mock instead of real ComfyUI -- extracting `_build_state`'s comfy_client
-    # wiring into a shared factory (mirroring build_job_queue above) is the next
-    # increment before relying on this process in production; not done here to keep this
-    # change scoped to the job-queue durability gap.
-    comfy_client: ComfyUIClient = MockComfyUIClient()
+    # settings.storage_backend must agree with the API process's -- see
+    # Settings.storage_backend's docstring: a generated image uploaded by THIS process
+    # (scheduler dispatches, but the LiveComfyUIClient/GeminiImageComfyUIClient upload
+    # happens as part of that dispatch) must be visible to whichever process later
+    # serves GET /v1/jobs/{id}/asset.
+    storage = S3ObjectStorage(settings) if settings.storage_backend == "s3" else InMemoryObjectStorage()
+    # Same real client app/main.py's API process builds -- see
+    # app/adapters/comfyui/factory.py's module docstring for why this standalone
+    # entrypoint used to hardcode MockComfyUIClient here and why that was a live risk
+    # once queue_backend=postgres made this process the one actually dispatching jobs.
+    comfy_client: ComfyUIClient = build_comfy_client(settings, storage)
 
     scheduler = Scheduler(
         job_queue=job_queue, comfy_client=comfy_client, settings=settings, session_factory=session_factory
     )
     _install_signal_handlers(scheduler)
-    await scheduler.run_forever()
+    # Both loops share the same `_shutdown` Event (request_shutdown() sets it once for
+    # both), so SIGTERM/SIGINT still drains in-flight dispatches AND stops the heartbeat
+    # loop together -- see run_heartbeat_forever()'s no-op early return when
+    # queue_backend=memory/comfy_mode=mock, so this is always safe to start.
+    await asyncio.gather(scheduler.run_forever(), scheduler.run_heartbeat_forever())
 
 
 if __name__ == "__main__":

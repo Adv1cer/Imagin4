@@ -32,6 +32,17 @@ class Settings(BaseSettings):
     # three agree on which backend is active from the same Settings value.
     queue_backend: Literal["memory", "postgres"] = "memory"
 
+    # Object storage backend, same shape/reasoning as queue_backend directly above:
+    # "memory" = InMemoryObjectStorage, process-local -- a generated image is only
+    #   visible to whichever process uploaded it. Fine for tests/local smoke-testing.
+    # "s3" = S3ObjectStorage (app/adapters/storage/s3.py) against settings.s3_* (MinIO in
+    #   dev, real S3 in cloud) -- REQUIRED once queue_backend=postgres runs the
+    #   scheduler/reconciler as separate containers/processes from the API, or a
+    #   generated image succeeds but 404s when the API tries to serve it back (see
+    #   GET /v1/jobs/{id}/asset) -- this is exactly as load-bearing as queue_backend for
+    #   making that split-process deployment actually work, not an independent knob.
+    storage_backend: Literal["memory", "s3"] = "memory"
+
     # Redis
     redis_url: str = "redis://localhost:6379/0"
     redis_connect_timeout_s: float = 0.5

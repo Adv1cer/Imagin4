@@ -32,9 +32,12 @@ import signal
 import uuid
 from datetime import datetime, timezone
 
-from app.adapters.comfyui import ComfyUIClient, MockComfyUIClient
+from app.adapters.comfyui import ComfyUIClient
+from app.adapters.comfyui.factory import build_comfy_client
 from app.adapters.queue import JobQueue, QueuedJob
 from app.adapters.queue.factory import build_job_queue
+from app.adapters.storage import InMemoryObjectStorage
+from app.adapters.storage.s3 import S3ObjectStorage
 from app.core.config import Settings, get_settings
 from app.domain.jobs.retry import BackoffConfig, compute_backoff_seconds, is_retryable
 
@@ -176,16 +179,17 @@ async def main() -> None:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
 
-    # See scheduler.py's main() -- same settings.queue_backend switch, same still-open
-    # comfy_client wiring gap (this always dispatches against MockComfyUIClient; a real
-    # live-mode deployment needs the shared comfy_client factory extraction noted there).
+    # See scheduler.py's main() for the same settings.queue_backend/storage_backend
+    # reasoning -- this process must build the SAME real comfy_client/storage the API
+    # and scheduler processes use, not the hardcoded mocks it had before.
     session_factory = None
     if settings.queue_backend == "postgres":
         from app.db.base import get_session_factory
 
         session_factory = get_session_factory()
     job_queue: JobQueue = build_job_queue(settings, session_factory=session_factory)
-    comfy_client: ComfyUIClient = MockComfyUIClient()
+    storage = S3ObjectStorage(settings) if settings.storage_backend == "s3" else InMemoryObjectStorage()
+    comfy_client: ComfyUIClient = build_comfy_client(settings, storage)
 
     reconciler = Reconciler(job_queue=job_queue, comfy_client=comfy_client, settings=settings)
     _install_signal_handlers(reconciler)
