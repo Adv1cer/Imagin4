@@ -75,9 +75,30 @@ class RouteDecisionError(ValueError):
     fail safe (see chat_router.py: falls back to CLARIFICATION, never guesses a tool)."""
 
 
+_VALID_REASON_CODES = frozenset(r.value for r in ReasonCode)
+_FALLBACK_REASON_CODE = ReasonCode.AMBIGUOUS_VISUAL_DELIVERABLE.value
+
+
 def parse_route_decision(raw: object) -> RouteDecision:
     if not isinstance(raw, dict):
         raise RouteDecisionError(f"expected a JSON object, got {type(raw).__name__}")
+    if raw.get("reason_code") not in _VALID_REASON_CODES:
+        # reason_code is a purely cosmetic/audit label -- app/domain/chat/
+        # decision_service.py's decide_next_step never reads it, and billing/execution
+        # are derived solely from `intent` (see derive_billing_category above). Coerce
+        # rather than reject: a self-hosted model's guided-decoding backend can enforce
+        # a short enum (`intent`, 5 short values) correctly while still missing a
+        # longer, more distinctive enum (`reason_code`, 6 multi-word values) -- observed
+        # live against qwen-brain (2026-08): a well-formed, correctly-classified
+        # CLARIFICATION decision came back with reason_code="ambiguous_mode", a value
+        # outside this schema's enum entirely. Discarding an otherwise-valid decision
+        # over this single cosmetic field would only make the router look less capable
+        # than it actually is (falls back to a generic clarification question instead
+        # of using the model's own, more specific one) without buying any real safety --
+        # unlike `intent`, `exact_text`, `missing_fields`, and `clarification_question`,
+        # which stay strictly validated below since real behavior/billing depends on
+        # them.
+        raw = {**raw, "reason_code": _FALLBACK_REASON_CODE}
     try:
         return RouteDecision.model_validate(raw)
     except ValidationError as exc:
