@@ -390,9 +390,20 @@ services:
   #
   # ⚠️ VRAM: do not run this alongside all 4 comfyui-worker-* on the one shared GB10 GPU
   # -- see docker/comfyui-worker/MPS_RUNBOOK.md and the still-open 2-vs-4-worker decision
-  # in .env. gpu-memory-utilization=0.3 (~38GB of 128GB unified memory) is an untested
-  # estimate, not a benchmarked number -- watch `docker compose logs -f qwen-brain` on
-  # first boot for an OOM before assuming it's fine.
+  # in .env. Confirmed via `nvidia-smi` (2026-08-18, Chet's DGX, alongside 2 IDLE
+  # comfyui-workers) that VRAM headroom was never actually the blocker at
+  # gpu-memory-utilization=0.3 -- the real crash was `ValueError: max_num_seqs (256)
+  # exceeds available Mamba cache blocks (46)`: Qwen3.5's hybrid Mamba/Gated-DeltaNet
+  # layers need one reserved cache block per concurrent decode sequence, and the ~2.36GiB
+  # left over after loading the ~28.5GiB FP8 weights inside a 0.3-utilization budget
+  # (~36.5GiB of 121.69GiB total) only fit 46 of them, short of vLLM's default
+  # max_num_seqs=256. gpu-memory-utilization=0.4 (~48.7GiB budget, ~20GiB left after
+  # weights) comfortably clears that -- chosen over just lowering max_num_seqs because
+  # idle comfyui-workers were only using ~170MiB VRAM each at measurement time (they
+  # load their model into VRAM per-job, not at container start), leaving ~98GiB
+  # genuinely free; 0.4 still leaves ~73GiB for both workers once they're actually
+  # generating. Re-check `nvidia-smi` under real concurrent load (brain + both workers
+  # generating at once) before trusting this is final -- not benchmarked under load yet.
   qwen-brain:
     image: vllm/vllm-openai:latest
     profiles: ["brain"]
@@ -406,7 +417,7 @@ services:
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
     command:
       - "--model=Qwen/Qwen3.8-27B-FP8"
-      - "--gpu-memory-utilization=0.3"
+      - "--gpu-memory-utilization=0.4"
       - "--max-model-len=8192"
     volumes:
       - /tmp/nvidia-mps:/tmp/nvidia-mps
