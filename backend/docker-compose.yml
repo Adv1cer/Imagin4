@@ -415,10 +415,26 @@ services:
       # Qwen3.8-27B-FP8 is a gated/rate-limited repo on some accounts -- set in .env if
       # you hit a 401/403 pull error; harmless empty value otherwise.
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    # --reasoning-parser/--default-chat-template-kwargs (2026-08): Qwen3.8-27B-FP8
+    # shares Qwen3.5's chat template, which defaults "thinking" mode ON -- confirmed
+    # live that this breaks app/adapters/qwen.py's route_intent() two different ways:
+    # (1) guided_json's constrained decoding has to fight the model's instinct to open
+    # with a <think> block, which can push grammar compilation/generation past even a
+    # 90s client timeout; (2) when it does "think", the emitted answer sometimes lands
+    # entirely in the response's reasoning_content field with content left empty --
+    # a known vLLM/Qwen3.5 issue (see
+    # https://discuss.vllm.ai/t/qwen3-5-only-output-reasoning-and-no-content/2523 and
+    # https://github.com/vllm-project/vllm/issues/38894), and our client only ever reads
+    # `message.content` (see QwenTextClient._chat). This app has no use for chain-of-
+    # thought (classification/short replies only) -- disabling thinking server-side
+    # avoids both failure modes for every call, not just route_intent, without touching
+    # app/adapters/qwen.py's request payloads.
     command:
       - "--model=Qwen/Qwen3.8-27B-FP8"
       - "--gpu-memory-utilization=0.4"
       - "--max-model-len=8192"
+      - "--reasoning-parser=qwen3"
+      - '--default-chat-template-kwargs={"enable_thinking": false}'
     volumes:
       - /tmp/nvidia-mps:/tmp/nvidia-mps
       - /tmp/nvidia-mps-log:/tmp/nvidia-mps-log
