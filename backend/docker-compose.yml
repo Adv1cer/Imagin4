@@ -91,6 +91,13 @@ services:
       # defaults AUTH_TYPE to md5, so without this pgbouncer rejects the upstream login with
       # "wrong password type". Must match Postgres's actual encryption method.
       AUTH_TYPE: scram-sha-256
+      # 2026-08-18: added while diagnosing the burst-test `query_wait_timeout` incident --
+      # without this, `psql -U imaginv pgbouncer -c "SHOW POOLS;"` fails with "FATAL: not
+      # allowed" because no one is authorized to use pgbouncer's admin console (the special
+      # `pgbouncer` virtual database) by default. Lets our own app user run SHOW
+      # POOLS/SERVERS/CLIENTS/CONFIG against `psql -h pgbouncer -p 5432 -U imaginv
+      # pgbouncer` for exactly this kind of live diagnosis.
+      ADMIN_USERS: imaginv
     ports:
       - "6432:5432"
     # No reliable healthcheck binary (pg_isready/nc) ships inside this image, so we don't
