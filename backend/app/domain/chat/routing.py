@@ -78,10 +78,25 @@ class RouteDecisionError(ValueError):
 _VALID_REASON_CODES = frozenset(r.value for r in ReasonCode)
 _FALLBACK_REASON_CODE = ReasonCode.AMBIGUOUS_VISUAL_DELIVERABLE.value
 
+# exact_text/missing_fields: RouteDecision defaults these to [] when the key is absent
+# entirely (Field(default_factory=list)) -- but a guided-decoding backend running at
+# temperature=1.0 (qwen-brain's default, see docker-compose.yml's qwen-brain command
+# comment) doesn't always pick the empty-array token sequence for "nothing here" and
+# instead emits a literal JSON `null`, observed live (2026-08) even though the schema
+# declares these fields `"type": "array"` with no null option. Treating an explicit
+# null exactly like an absent key is safe: both mean the same thing semantically ("no
+# exact text" / "no missing fields") and neither is a field billing/security ever
+# depends on.
+_NULLABLE_LIST_FIELDS = ("exact_text", "missing_fields")
+
 
 def parse_route_decision(raw: object) -> RouteDecision:
     if not isinstance(raw, dict):
         raise RouteDecisionError(f"expected a JSON object, got {type(raw).__name__}")
+    raw = dict(raw)
+    for field in _NULLABLE_LIST_FIELDS:
+        if raw.get(field) is None:
+            raw[field] = []
     if raw.get("reason_code") not in _VALID_REASON_CODES:
         # reason_code is a purely cosmetic/audit label -- app/domain/chat/
         # decision_service.py's decide_next_step never reads it, and billing/execution

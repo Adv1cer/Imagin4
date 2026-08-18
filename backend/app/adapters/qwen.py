@@ -153,7 +153,18 @@ class QwenTextClient:
         `route_timeout_s` (well above the general-purpose `self._timeout_s`) is used
         for this call specifically to give first-time grammar compilation room even so
         -- vLLM caches the compiled grammar after the first call, so subsequent
-        route_intent calls are fast."""
+        route_intent calls are fast.
+
+        Explicitly overrides `temperature` down to 0.1 (qwen-brain's own
+        generation_config.json otherwise defaults every call to temperature=1.0, see
+        docker-compose.yml's qwen-brain command comment) -- confirmed live (2026-08)
+        that this high a temperature makes guided_json's schema compliance genuinely
+        flaky between two back-to-back, byte-identical requests: sometimes a perfectly
+        formed decision, sometimes an array field emitted as JSON `null` instead of
+        `[]`, sometimes a `reason_code` value invented outside the schema's enum
+        (parse_route_decision tolerates both of the latter, but there's no reason to
+        court either when this is a closed-set classification task with no need for
+        creative sampling)."""
         from app.domain.chat.routing import ROUTE_DECISION_JSON_SCHEMA_VLLM, ROUTER_SYSTEM_INSTRUCTION
 
         system_instruction = extra_system_instruction or ROUTER_SYSTEM_INSTRUCTION
@@ -165,7 +176,7 @@ class QwenTextClient:
             raw_text = await self._chat(
                 messages,
                 route_timeout_s,
-                extra_body={"guided_json": ROUTE_DECISION_JSON_SCHEMA_VLLM},
+                extra_body={"guided_json": ROUTE_DECISION_JSON_SCHEMA_VLLM, "temperature": 0.1},
             )
             return json.loads(raw_text)
         except Exception as exc:
