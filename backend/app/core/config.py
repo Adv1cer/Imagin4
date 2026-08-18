@@ -152,6 +152,53 @@ class Settings(BaseSettings):
     comfy_cfg_scale: float = 4.0
     comfy_negative_prompt: str = ""
 
+    # Second, optional "model profile" -- see app/domain/jobs/comfy_profiles.py for why
+    # this exists (2026-08-19): an external agentflow team's own master-prompt/UI
+    # decides, per user role, whether a job should use the "student" model above (the
+    # default, comfy_* fields, unchanged) or this better/slower "personnel" one, and
+    # sends us that decision as `inputs.model_profile: "personnel"` on
+    # POST /v1/generations -- validated against a small server-side allowlist, never a
+    # raw filename from the caller (same invariant as comfy_checkpoint_name above).
+    # Leave comfy_personnel_checkpoint_name AND comfy_personnel_diffusion_model_name
+    # both empty (the default) to not register this tier at all -- a request for
+    # model_profile="personnel" then fails admission with 400 "unknown model_profile"
+    # instead of silently reusing the student model. Same field shape/meaning as the
+    # comfy_* block above; see those fields' comments for what each one does.
+    comfy_personnel_checkpoint_name: str = ""
+    comfy_personnel_model_family: Literal["checkpoint", "qwen_image"] = "checkpoint"
+    comfy_personnel_diffusion_model_name: str = ""
+    comfy_personnel_clip_name: str = ""
+    comfy_personnel_vae_name: str = ""
+    comfy_personnel_model_sampling_shift: float = 3.1
+    comfy_personnel_sampler_name: str = "euler"
+    comfy_personnel_scheduler: str = "normal"
+    comfy_personnel_steps: int = 30
+    comfy_personnel_cfg_scale: float = 7.0
+    comfy_personnel_negative_prompt: str = ""
+
+    # Per-request field overrides on top of whichever model_profile was resolved -- see
+    # app/domain/jobs/comfy_overrides.py for the full design/rationale. Every *_CSV
+    # allowlist below is empty by default, which means that field CANNOT be overridden
+    # at all (a request that tries gets 400 "overrides are not enabled..."); list the
+    # exact filenames actually installed on your ComfyUI worker(s) to open it up --
+    # there is no discovery from our side, same caveat as comfy_checkpoint_name etc.
+    # model_family is deliberately NOT in this list -- see the module docstring for why
+    # (switching families changes the whole graph shape, not a per-field tweak).
+    comfy_allowed_checkpoints_csv: str = ""
+    comfy_allowed_diffusion_models_csv: str = ""
+    comfy_allowed_clips_csv: str = ""
+    comfy_allowed_vaes_csv: str = ""
+    comfy_allowed_samplers_csv: str = ""
+    comfy_allowed_schedulers_csv: str = ""
+    # Bounds for the numeric overrides (steps/cfg_scale) -- see the 2026-08-18
+    # burst-test incident notes in app/core/rate_limit.py for why "no cap" on
+    # compute-cost-per-job is a proven real risk on this deployment, not theoretical.
+    comfy_override_min_steps: int = 1
+    comfy_override_max_steps: int = 50
+    comfy_override_min_cfg_scale: float = 1.0
+    comfy_override_max_cfg_scale: float = 15.0
+    comfy_override_max_negative_prompt_chars: int = 2000
+
     @property
     def comfy_worker_base_urls(self) -> list[str]:
         return [u.strip() for u in self.comfy_worker_base_urls_csv.split(",") if u.strip()]

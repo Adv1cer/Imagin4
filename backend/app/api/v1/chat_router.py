@@ -82,6 +82,8 @@ from app.domain.chat.routing import (
 )
 from app.domain.jobs.admission import (
     IdempotencyConflictError,
+    InvalidComfyOverrideError,
+    UnknownModelProfileError,
     UnknownWorkflowError,
     admit_generation_job,
 )
@@ -384,7 +386,12 @@ async def process_routed_message(
                 # enqueueing a second one for what was really one user action.
                 idempotency_key=f"router-general-image-{user_msg.id}",
             )
-        except (UnknownWorkflowError, IdempotencyConflictError):
+        except (
+        UnknownWorkflowError,
+        UnknownModelProfileError,
+        InvalidComfyOverrideError,
+        IdempotencyConflictError,
+    ):
             logger.error("chat_router: image_basic admission failed unexpectedly conv=%s", conv.id)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -417,7 +424,12 @@ async def process_routed_message(
             # enqueueing (and billing) a second one for what was really one user action.
             idempotency_key=f"router-paid-image-{user_msg.id}",
         )
-    except (UnknownWorkflowError, IdempotencyConflictError):
+    except (
+        UnknownWorkflowError,
+        UnknownModelProfileError,
+        InvalidComfyOverrideError,
+        IdempotencyConflictError,
+    ):
         logger.error(
             "chat_router: %s admission failed unexpectedly conv=%s", workflow_name, conv.id
         )
@@ -634,7 +646,12 @@ async def confirm_pending_action(
             # returns the same job rather than creating a second paid generation.
             idempotency_key=f"pending-action-{row.id}",
         )
-    except (UnknownWorkflowError, IdempotencyConflictError):
+    except (
+        UnknownWorkflowError,
+        UnknownModelProfileError,
+        InvalidComfyOverrideError,
+        IdempotencyConflictError,
+    ):
         logger.error("chat_router: paid admission failed unexpectedly pending_action=%s", row.id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

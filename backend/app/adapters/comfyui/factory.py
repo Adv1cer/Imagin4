@@ -31,6 +31,8 @@ from app.adapters.comfyui.multi_worker import MultiWorkerComfyUIClient
 from app.adapters.routing_comfyui import CompositeComfyUIClient
 from app.adapters.storage import ObjectStorage
 from app.core.config import Settings
+from app.domain.jobs.comfy_overrides import build_allowlists
+from app.domain.jobs.comfy_profiles import build_profiles
 
 logger = logging.getLogger("imaginv")
 
@@ -42,6 +44,15 @@ def build_comfy_client(settings: Settings, storage: ObjectStorage) -> ComfyUICli
         comfyui_client: ComfyUIClient = MockComfyUIClient(storage=storage)
     else:
         worker_urls = settings.comfy_worker_base_urls or [settings.comfy_base_url]
+        # See app/domain/jobs/comfy_profiles.py -- "student" always exists (mirrors the
+        # comfy_* fields below exactly), "personnel" only if configured. Passed into every
+        # worker client so a submission's model_profile picks its checkpoint/steps/cfg
+        # per request instead of only ever using the fields below.
+        profiles = build_profiles(settings)
+        # See app/domain/jobs/comfy_overrides.py -- empty *_CSV settings (the default)
+        # means every field starts non-overridable; list actual worker filenames in
+        # .env to open specific fields up to per-request model_overrides.
+        override_allowlists = build_allowlists(settings)
 
         def _build_live_client(base_url: str) -> LiveComfyUIClient:
             return LiveComfyUIClient(
@@ -59,6 +70,8 @@ def build_comfy_client(settings: Settings, storage: ObjectStorage) -> ComfyUICli
                 cfg_scale=settings.comfy_cfg_scale,
                 negative_prompt=settings.comfy_negative_prompt,
                 request_timeout_s=settings.comfy_request_timeout_s,
+                profiles=profiles,
+                override_allowlists=override_allowlists,
             )
 
         live_clients = [_build_live_client(url) for url in worker_urls]
@@ -66,7 +79,7 @@ def build_comfy_client(settings: Settings, storage: ObjectStorage) -> ComfyUICli
             live_clients[0] if len(live_clients) == 1 else MultiWorkerComfyUIClient(live_clients)
         )
         logger.info(
-            "comfyui: live mode, workers=%s family=%s diffusion_model=%s",
+            "comfyui: live mode, workers=%s family=%s diffusion_model=%s model_profiles=%s",
             worker_urls,
             settings.comfy_model_family,
             (
@@ -74,6 +87,7 @@ def build_comfy_client(settings: Settings, storage: ObjectStorage) -> ComfyUICli
                 if settings.comfy_model_family == "qwen_image"
                 else settings.comfy_checkpoint_name
             ),
+            sorted(profiles.keys()),
         )
 
     gemini_text_client = None

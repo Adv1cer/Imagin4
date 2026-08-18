@@ -12,6 +12,8 @@ import pytest
 
 from app.adapters.comfyui.live import LiveComfyUIClient, _resolve_dimensions
 from app.adapters.storage import InMemoryObjectStorage
+from app.domain.jobs.comfy_overrides import OverrideAllowlists
+from app.domain.jobs.comfy_profiles import ComfyProfile
 
 BASE_URL = "http://comfy.test:8188"
 
@@ -129,6 +131,178 @@ async def test_submit_qwen_image_family_builds_split_file_graph() -> None:
     # 16:9 at 1K per Qwen-Image's own documented aspect-ratio table (1664x928).
     assert (graph["58"]["inputs"]["width"], graph["58"]["inputs"]["height"]) == (1664, 928)
     assert "CheckpointLoaderSimple" not in json.dumps(graph)
+
+
+@pytest.mark.asyncio
+async def test_model_profile_selects_a_different_checkpoint_and_quality_settings() -> None:
+    """A submission carrying workflow_payload["model_profile"] must use THAT profile's
+    checkpoint/steps/cfg, not the client's own default-profile constructor args -- this
+    is the mechanism app/domain/jobs/admission.py's model_profile validation exists to
+    feed (see app/domain/jobs/comfy_profiles.py)."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"prompt_id": "p1"})
+
+    personnel = ComfyProfile(
+        key="personnel",
+        checkpoint_name="personnel_model.safetensors",
+        model_family="checkpoint",
+        sampler_name="dpmpp_2m",
+        scheduler="karras",
+        steps=40,
+        cfg_scale=8.5,
+        negative_prompt="blurry",
+    )
+    client = LiveComfyUIClient(
+        base_url=BASE_URL,
+        storage=InMemoryObjectStorage(),
+        checkpoint_name="student_model.safetensors",
+        steps=20,
+        cfg_scale=7.0,
+        transport=httpx.MockTransport(handler),
+        profiles={"personnel": personnel},
+    )
+
+    await client.submit(
+        {"prompt": "a cat", "aspect_ratio": "1:1", "resolution": "1K", "model_profile": "personnel"}
+    )
+
+    graph = captured["body"]["prompt"]
+    assert graph["4"]["inputs"]["ckpt_name"] == "personnel_model.safetensors"
+    assert graph["3"]["inputs"]["steps"] == 40
+    assert graph["3"]["inputs"]["cfg"] == 8.5
+    assert graph["3"]["inputs"]["sampler_name"] == "dpmpp_2m"
+    assert graph["7"]["inputs"]["text"] == "blurry"
+
+
+@pytest.mark.asyncio
+async def test_missing_or_unknown_model_profile_falls_back_to_the_default() -> None:
+    """No model_profile at all (every pre-2026-08-19 caller) or one that isn't in the
+    configured profiles dict must still use the client's own constructor args, not
+    error out -- admission.py is what enforces the allowlist; this class stays
+    permissive/defensive so a direct/test caller that bypasses admission can't crash
+    the whole submit() call over a profile-selection detail."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"prompt_id": "p1"})
+
+    client = LiveComfyUIClient(
+        base_url=BASE_URL,
+        storage=InMemoryObjectStorage(),
+        checkpoint_name="student_model.safetensors",
+        transport=httpx.MockTransport(handler),
+        profiles={
+            "personnel": ComfyProfile(key="personnel", checkpoint_name="personnel_model.safetensors")
+        },
+    )
+
+    await client.submit(
+        {"prompt": "a cat", "aspect_ratio": "1:1", "resolution": "1K", "model_profile": "nonexistent"}
+    )
+
+    graph = captured["body"]["prompt"]
+    assert graph["4"]["inputs"]["ckpt_name"] == "student_model.safetensors"
+
+
+@pytest.mark.asyncio
+async def test_model_overrides_apply_allowlisted_fields_on_top_of_the_profile() -> None:
+    """A submission's model_overrides must win over the resolved profile's own values
+    for whichever fields it sets AND are allowlisted -- steps here, not cfg (not
+    allowlisted in this test's OverrideAllowlists), so cfg must stay the profile's."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"prompt_id": "p1"})
+
+    allowlists = OverrideAllowlists(
+        checkpoints=frozenset(),
+        diffusion_models=frozenset(),
+        clips=frozenset(),
+        vaes=frozenset(),
+        samplers=frozenset(),
+        schedulers=frozenset(),
+        min_steps=1,
+        max_steps=50,
+        min_cfg_scale=1.0,
+        max_cfg_scale=15.0,
+        max_negative_prompt_chars=500,
+    )
+    client = LiveComfyUIClient(
+        base_url=BASE_URL,
+        storage=InMemoryObjectStorage(),
+        checkpoint_name="student_model.safetensors",
+        steps=20,
+        cfg_scale=7.0,
+        transport=httpx.MockTransport(handler),
+        override_allowlists=allowlists,
+    )
+
+    await client.submit(
+        {
+            "prompt": "a cat",
+            "aspect_ratio": "1:1",
+            "resolution": "1K",
+            "model_overrides": {"steps": 35},
+        }
+    )
+
+    graph = captured["body"]["prompt"]
+    assert graph["3"]["inputs"]["steps"] == 35
+    assert graph["3"]["inputs"]["cfg"] == 7.0
+    assert graph["4"]["inputs"]["ckpt_name"] == "student_model.safetensors"
+
+
+@pytest.mark.asyncio
+async def test_model_overrides_dropped_when_not_allowlisted_or_out_of_range() -> None:
+    """An override for a non-allowlisted checkpoint, or an out-of-range steps value,
+    must be dropped entirely (fall back to the profile's own value) rather than
+    partially applied or crashing submit() -- admission.py is the real enforcement
+    point (400 before the job is even queued); this is defense in depth."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"prompt_id": "p1"})
+
+    allowlists = OverrideAllowlists(
+        checkpoints=frozenset({"only_this_one.safetensors"}),
+        diffusion_models=frozenset(),
+        clips=frozenset(),
+        vaes=frozenset(),
+        samplers=frozenset(),
+        schedulers=frozenset(),
+        min_steps=1,
+        max_steps=50,
+        min_cfg_scale=1.0,
+        max_cfg_scale=15.0,
+        max_negative_prompt_chars=500,
+    )
+    client = LiveComfyUIClient(
+        base_url=BASE_URL,
+        storage=InMemoryObjectStorage(),
+        checkpoint_name="student_model.safetensors",
+        steps=20,
+        transport=httpx.MockTransport(handler),
+        override_allowlists=allowlists,
+    )
+
+    await client.submit(
+        {
+            "prompt": "a cat",
+            "aspect_ratio": "1:1",
+            "resolution": "1K",
+            "model_overrides": {"checkpoint_name": "not_in_allowlist.safetensors", "steps": 99999},
+        }
+    )
+
+    graph = captured["body"]["prompt"]
+    assert graph["4"]["inputs"]["ckpt_name"] == "student_model.safetensors"
+    assert graph["3"]["inputs"]["steps"] == 20
 
 
 @pytest.mark.asyncio

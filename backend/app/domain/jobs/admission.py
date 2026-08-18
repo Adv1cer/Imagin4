@@ -15,6 +15,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from app.adapters.queue import JobQueue, QueuedJob
+from app.core.config import get_settings
+from app.domain.jobs.comfy_overrides import (
+    InvalidComfyOverrideError,
+    build_allowlists,
+    validate_overrides,
+)
+from app.domain.jobs.comfy_profiles import (
+    UnknownModelProfileError,
+    build_profiles,
+    resolve_profile_key,
+)
 from app.domain.jobs.idempotency import (
     IdempotencyOutcome,
     canonical_payload_hash,
@@ -22,7 +33,14 @@ from app.domain.jobs.idempotency import (
 )
 from app.domain.jobs.workflow_registry import UnknownWorkflowError, resolve_workflow
 
-__all__ = ["AdmissionResult", "IdempotencyConflictError", "admit_generation_job", "UnknownWorkflowError"]
+__all__ = [
+    "AdmissionResult",
+    "IdempotencyConflictError",
+    "InvalidComfyOverrideError",
+    "UnknownModelProfileError",
+    "admit_generation_job",
+    "UnknownWorkflowError",
+]
 
 
 class IdempotencyConflictError(ValueError):
@@ -51,11 +69,38 @@ async def admit_generation_job(
     workflow through), applies idempotency-key replay/conflict semantics identical to
     POST /v1/generations, and enqueues a new QueuedJob if this is genuinely new.
 
-    Raises `UnknownWorkflowError` for an unrecognized workflow and
+    Raises `UnknownWorkflowError` for an unrecognized workflow,
+    `UnknownModelProfileError` for an unrecognized `inputs["model_profile"]`,
+    `InvalidComfyOverrideError` for an invalid/out-of-range/not-allowlisted
+    `inputs["model_overrides"]` entry (both ComfyUI-only, see
+    app/domain/jobs/comfy_profiles.py and app/domain/jobs/comfy_overrides.py), and
     `IdempotencyConflictError` for a key reused with a different payload; callers map
-    those to their own appropriate HTTP status (400 / 409 in the existing endpoints).
+    those to their own appropriate HTTP status (400 / 400 / 400 / 409 in the existing
+    endpoints).
     """
-    resolve_workflow(workflow_name, workflow_version)  # raises UnknownWorkflowError
+    workflow = resolve_workflow(workflow_name, workflow_version)  # raises UnknownWorkflowError
+
+    if workflow.backend == "comfyui":
+        # Poster/infographic (backend == "gemini") never reaches this -- model_profile
+        # and model_overrides are ComfyUI-only concepts, there's nothing to pick a
+        # model between when the job doesn't touch ComfyUI at all. Resolves +
+        # normalizes so every downstream consumer (LiveComfyUIClient, the persisted
+        # input_payload used for idempotency hashing/replay) sees concrete, already-
+        # validated values, never a missing/blank/unchecked one -- same reasoning as
+        # resolve_profile_key's own docstring.
+        settings = get_settings()
+        profiles = build_profiles(settings)
+        resolved_key = resolve_profile_key(
+            inputs.get("model_profile"), profiles
+        )  # raises UnknownModelProfileError
+        validated_overrides = validate_overrides(
+            inputs.get("model_overrides"), build_allowlists(settings)
+        )  # raises InvalidComfyOverrideError
+        inputs = {
+            **inputs,
+            "model_profile": resolved_key,
+            "model_overrides": validated_overrides,
+        }
 
     kind = workflow_name
     existing = None

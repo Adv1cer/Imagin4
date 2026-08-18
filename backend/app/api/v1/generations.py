@@ -16,6 +16,8 @@ from app.api.deps import check_admission_capacity, get_current_user, get_job_que
 from app.db.models import User
 from app.domain.jobs.admission import (
     IdempotencyConflictError,
+    InvalidComfyOverrideError,
+    UnknownModelProfileError,
     UnknownWorkflowError,
     admit_generation_job,
 )
@@ -27,6 +29,17 @@ class GenerationCreate(BaseModel):
     workflow_name: str
     workflow_version: str
     conversation_id: str | None = None
+    # Free-form, but admit_generation_job validates known keys server-side rather than
+    # forwarding them unchecked. For a ComfyUI-backed workflow, `inputs` may include
+    # `model_profile` (e.g. "student"/"personnel" -- see
+    # app/domain/jobs/comfy_profiles.py) to select which server-configured model/
+    # quality tier generates this job; omitted or None resolves to "student". May also
+    # include `model_overrides` (see app/domain/jobs/comfy_overrides.py) -- an object of
+    # individual field overrides (checkpoint_name/diffusion_model_name/clip_name/
+    # vae_name/sampler_name/scheduler/steps/cfg_scale/negative_prompt) layered on top of
+    # the resolved profile, each checked against a server-side allowlist/range before
+    # use. Callers still never supply arbitrary values that bypass that allowlist, and
+    # never pick model_family directly (see that module's docstring for why).
     inputs: dict
 
 
@@ -71,6 +84,10 @@ async def create_generation(
         )
     except UnknownWorkflowError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unknown workflow")
+    except UnknownModelProfileError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unknown model_profile")
+    except InvalidComfyOverrideError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     except IdempotencyConflictError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
