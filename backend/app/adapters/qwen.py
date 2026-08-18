@@ -129,7 +129,21 @@ class QwenTextClient:
         vLLM's `guided_json` extra_body param (structured-output/constrained decoding,
         the vLLM-specific equivalent of Gemini's response_schema) so the model is forced
         to emit JSON matching ROUTE_DECISION_JSON_SCHEMA rather than merely being asked
-        nicely to via the prompt."""
+        nicely to via the prompt.
+
+        DELIBERATELY does NOT also set `response_format={"type": "json_object"}`
+        alongside `guided_json` (an earlier version of this method sent both).
+        Confirmed live against qwen-brain (2026-08): sending both together made vLLM
+        silently honor only the generic "any valid JSON" constraint from
+        `response_format` and drop the actual `guided_json` schema constraint entirely
+        -- the call still returned 200 OK with parseable JSON, but with wrong shape
+        (e.g. `exact_text`/`missing_fields` as null instead of `[]`, `reason_code` set
+        to a value outside ROUTE_DECISION_JSON_SCHEMA's enum) causing
+        parse_route_decision to raise RouteDecisionError on every single call. vLLM's
+        own structured-outputs examples only ever pass `guided_json` alone (see
+        https://docs.vllm.ai/en/latest/features/structured_outputs/), which is
+        sufficient by itself to force valid-JSON-matching-schema output -- no
+        `response_format` needed on top."""
         from app.domain.chat.routing import ROUTE_DECISION_JSON_SCHEMA, ROUTER_SYSTEM_INSTRUCTION
 
         system_instruction = extra_system_instruction or ROUTER_SYSTEM_INSTRUCTION
@@ -140,7 +154,6 @@ class QwenTextClient:
             raw_text = await self._chat(
                 messages,
                 self._timeout_s,
-                response_format={"type": "json_object"},
                 extra_body={"guided_json": ROUTE_DECISION_JSON_SCHEMA},
             )
             return json.loads(raw_text)
