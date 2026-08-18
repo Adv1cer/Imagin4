@@ -90,11 +90,42 @@ def build_comfy_client(settings: Settings, storage: ObjectStorage) -> ComfyUICli
             sorted(profiles.keys()),
         )
 
-    gemini_text_client = None
-    if settings.gemini_api_key:
+    # Text-brain client used ONLY for prompt design (comfy_prompt_designer below +
+    # poster/infographic's prompt_designer) -- separate instance from
+    # app.state.gemini_text_client (chat replies/routing, wired in app/main.py), same
+    # split app/main.py's own comment documents. Originally Gemini-only; extended
+    # 2026-08 to fall back to self-hosted Qwen (settings.brain_backend == "qwen")
+    # since removing APP_GEMINI_API_KEY previously left this step silently disabled --
+    # confirmed live as the root cause of "เจนแมวได้คน" (asked for a cat, ComfyUI drew a
+    # person): with no prompt designer wired, the raw/untranslated Thai request text
+    # (e.g. "เจนรูป แมว", including the instruction word, not just the subject) was sent
+    # straight into CLIPTextEncode. SDXL-family CLIP encoders are trained overwhelmingly
+    # on English captions, so non-English text is close to noise to them -- the
+    # checkpoint then falls back to its own strongest prior instead of following the
+    # prompt, which for a portrait-oriented checkpoint (e.g. the "personnel" profile,
+    # named/tuned for staff-photo-style output) is a human face regardless of what was
+    # actually asked for. Wiring a real prompt-design step (Gemini or Qwen, whichever is
+    # configured) fixes this by translating/cleaning the prompt into English before it
+    # ever reaches ComfyUI, the same way it always did when Gemini was configured.
+    prompt_design_client = None
+    if settings.brain_backend == "qwen":
+        from app.adapters.qwen import QwenTextClient
+
+        prompt_design_client = QwenTextClient(
+            base_url=settings.qwen_base_url,
+            model=settings.qwen_text_model,
+            timeout_s=settings.qwen_request_timeout_s,
+            research_timeout_s=settings.qwen_research_timeout_s,
+        )
+        logger.info(
+            "qwen: wired for comfy/poster prompt design (base_url=%s, model=%s)",
+            settings.qwen_base_url,
+            settings.qwen_text_model,
+        )
+    elif settings.gemini_api_key:
         from app.adapters.gemini import GeminiTextClient
 
-        gemini_text_client = GeminiTextClient(
+        prompt_design_client = GeminiTextClient(
             api_key=settings.gemini_api_key,
             model=settings.gemini_text_model,
             timeout_s=settings.gemini_request_timeout_s,
@@ -105,8 +136,14 @@ def build_comfy_client(settings: Settings, storage: ObjectStorage) -> ComfyUICli
         )
     else:
         logger.info(
-            "gemini: APP_GEMINI_API_KEY not set -- comfy/poster prompt design step skipped"
+            "gemini: APP_GEMINI_API_KEY not set and brain_backend != 'qwen' -- comfy/"
+            "poster prompt design step skipped"
         )
+
+    # Kept as a local alias -- everything below this line already refers to
+    # `gemini_text_client`, and the object may now actually be a QwenTextClient; the
+    # variable name is legacy (same reasoning as app/main.py's app.state.gemini_text_client).
+    gemini_text_client = prompt_design_client
 
     prompt_designer = gemini_text_client.design_image_prompt if gemini_text_client else None
 
