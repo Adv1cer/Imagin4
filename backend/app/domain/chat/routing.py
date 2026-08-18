@@ -116,6 +116,49 @@ ROUTE_DECISION_JSON_SCHEMA: dict = {
     ],
 }
 
+# vLLM-specific variant of ROUTE_DECISION_JSON_SCHEMA, for app.adapters.qwen's
+# `guided_json` constrained-decoding call (see QwenTextClient.route_intent).
+# ROUTE_DECISION_JSON_SCHEMA above uses `"nullable": True`, which is Gemini/OpenAPI-3.0
+# schema syntax (required for the google-genai response_schema call in
+# app.adapters.gemini) -- it is NOT a recognized standard-JSON-Schema keyword, and
+# vLLM's guided-decoding compilers (xgrammar, falling back to the much slower outlines
+# backend when xgrammar can't handle a given schema -- see
+# https://vllm.ai/blog/2025-01-14-struct-decode-intro) do not understand it. Confirmed
+# live against qwen-brain (2026-08): using ROUTE_DECISION_JSON_SCHEMA as-is for
+# guided_json made grammar compilation slow enough to blow past a 30s client timeout
+# (httpx.ReadTimeout) -- consistent with xgrammar rejecting the unrecognized `nullable`
+# keyword and falling back to outlines. Nullability is expressed the standard way here
+# instead (`"type": ["string", "null"]`), and `additionalProperties: False` is added
+# explicitly (Gemini never emits extra keys on its own, but nothing guarantees that of
+# vLLM's guided-decoding backends, and RouteDecision's `extra="forbid"` would otherwise
+# reject an output that was actually fine except for one stray key).
+ROUTE_DECISION_JSON_SCHEMA_VLLM: dict = {
+    "type": "object",
+    "properties": {
+        "intent": {
+            "type": "string",
+            "enum": [i.value for i in Intent],
+        },
+        "normalized_prompt": {"type": "string"},
+        "exact_text": {"type": "array", "items": {"type": "string"}},
+        "missing_fields": {"type": "array", "items": {"type": "string"}},
+        "clarification_question": {"type": ["string", "null"]},
+        "reason_code": {
+            "type": "string",
+            "enum": [r.value for r in ReasonCode],
+        },
+    },
+    "required": [
+        "intent",
+        "normalized_prompt",
+        "exact_text",
+        "missing_fields",
+        "clarification_question",
+        "reason_code",
+    ],
+    "additionalProperties": False,
+}
+
 # Condensed, auditable version of the classification rules -- NOT chain-of-thought (the
 # model isn't asked to explain itself, only to pick reason_code from the fixed enum
 # above). Kept here (not inline in the adapter) so the classification policy is reviewable

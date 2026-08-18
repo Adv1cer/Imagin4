@@ -143,18 +143,29 @@ class QwenTextClient:
         own structured-outputs examples only ever pass `guided_json` alone (see
         https://docs.vllm.ai/en/latest/features/structured_outputs/), which is
         sufficient by itself to force valid-JSON-matching-schema output -- no
-        `response_format` needed on top."""
-        from app.domain.chat.routing import ROUTE_DECISION_JSON_SCHEMA, ROUTER_SYSTEM_INSTRUCTION
+        `response_format` needed on top.
+
+        Uses ROUTE_DECISION_JSON_SCHEMA_VLLM (not the Gemini-flavored
+        ROUTE_DECISION_JSON_SCHEMA) -- see that constant's docstring in routing.py:
+        vLLM's guided-decoding grammar compiler doesn't understand Gemini's `nullable`
+        keyword, and an unrecognized keyword can trigger a slow fallback path
+        (xgrammar -> outlines) that blows past this client's own timeout. A generous
+        `route_timeout_s` (well above the general-purpose `self._timeout_s`) is used
+        for this call specifically to give first-time grammar compilation room even so
+        -- vLLM caches the compiled grammar after the first call, so subsequent
+        route_intent calls are fast."""
+        from app.domain.chat.routing import ROUTE_DECISION_JSON_SCHEMA_VLLM, ROUTER_SYSTEM_INSTRUCTION
 
         system_instruction = extra_system_instruction or ROUTER_SYSTEM_INSTRUCTION
         messages = _history_to_messages(history, system=system_instruction)
         if len(messages) <= 1:  # only the system message, no real turns
             raise RuntimeError("qwen_error:EmptyHistory")
+        route_timeout_s = max(self._timeout_s, 90.0)
         try:
             raw_text = await self._chat(
                 messages,
-                self._timeout_s,
-                extra_body={"guided_json": ROUTE_DECISION_JSON_SCHEMA},
+                route_timeout_s,
+                extra_body={"guided_json": ROUTE_DECISION_JSON_SCHEMA_VLLM},
             )
             return json.loads(raw_text)
         except Exception as exc:
