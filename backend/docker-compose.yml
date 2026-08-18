@@ -399,6 +399,20 @@ services:
       - ./load_tests:/scripts:ro
     environment:
       BASE_URL: http://api:8000
+      # Pass-through from host shell -- `docker compose run` does NOT forward arbitrary
+      # host env vars into the container by itself; without an explicit declaration here
+      # (even just naming the var with a default), something like
+      # `LOADTEST_AUTH=bearer docker compose run --rm k6 ...` is silently ignored and k6
+      # falls back to hundred_concurrent_burst.js's own default (session mode) -- this
+      # bit Chet on 2026-08-18 (ran with LOADTEST_AUTH=bearer prefixed, but the burst
+      # test still did 100 concurrent POST /v1/auth/login calls and hit the
+      # already-documented login-capacity 500s). `${VAR:-default}` syntax means these
+      # still work with no host env set at all (falls back to the script's own default).
+      LOADTEST_AUTH: ${LOADTEST_AUTH:-session}
+      LOADTEST_POLL_TIMEOUT_S: ${LOADTEST_POLL_TIMEOUT_S:-600}
+      LOADTEST_USER_COUNT: ${LOADTEST_USER_COUNT:-100}
+      LOADTEST_PASSWORD: ${LOADTEST_PASSWORD:-correct-horse-battery-staple}
+      LOADTEST_KEYS_FILE: ${LOADTEST_KEYS_FILE:-./loadtest_api_keys.json}
     depends_on:
       - api
 
