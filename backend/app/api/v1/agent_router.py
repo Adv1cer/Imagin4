@@ -87,13 +87,43 @@ class AgentMessageIn(BaseModel):
     # app/domain/jobs/comfy_profiles.py) for whichever GENERAL_IMAGE job this message
     # routes to, if any -- agentflow already knows the requesting end-user's role and is
     # the intended owner of this decision (see that module's docstring). None/omitted ->
-    # "student", same as before this field existed. Deliberately NOT paired with
-    # model_overrides or an Idempotency-Key requirement -- this endpoint stays "send a
-    # message, get an image"; a caller needing raw per-request step/cfg control should
-    # use POST /v1/generations instead. An unrecognized value fails the job with a clear
-    # error (see admit_generation_job's UnknownModelProfileError handling below), not a
-    # silent fallback to "student".
+    # "student", same as before this field existed. An unrecognized value fails the job
+    # with a clear error (see admit_generation_job's UnknownModelProfileError handling
+    # below), not a silent fallback to "student".
     model_profile: str | None = Field(default=None, max_length=64)
+    # 2026-08-19 (Chet + Opal): optional per-request ComfyUI param overrides (steps/
+    # cfg_scale/etc -- same shape as POST /v1/generations' inputs.model_overrides, see
+    # app/domain/jobs/comfy_overrides.py). Still validated against the server-side
+    # allowlist/range by admit_generation_job -- a bounded escape hatch, not arbitrary
+    # passthrough. Omitted/None -> the resolved model_profile's own tuned .env defaults
+    # apply, unchanged from before this field existed. Still no Idempotency-Key needed
+    # here -- this endpoint always derives its own key per message (see
+    # process_routed_message's docstring).
+    model_overrides: dict | None = None
+    # 2026-08-19 (Chet + Opal): see process_routed_message's docstring
+    # (app/api/v1/chat_router.py) for the full reasoning. On its own this only skips the
+    # ComfyUI-side design step (comfy_prompt_designer) -- it does NOT stop route_intent
+    # from rewriting `text` into `normalized_prompt` first. Combine with
+    # `assume_image=True` below for a caller (e.g. one running its own web-search-backed
+    # prompt engineering upstream) that wants `text` to reach ComfyUI byte-for-byte
+    # untouched.
+    skip_prompt_design: bool = False
+    # 2026-08-19 (Chet + Opal): when True, skips route_intent/decide_next_step entirely
+    # and always enqueues `text` as a GENERAL_IMAGE job verbatim -- for a caller that has
+    # already classified this message as "ready to generate" upstream (e.g. agentflow's
+    # own Intent Router node) and finds route_intent's re-classification + prompt rewrite
+    # pure redundant cost/latency on top of its own. Default False preserves every
+    # existing caller's behavior (route_intent still decides chat vs image vs
+    # needs-clarification, as before this field existed). Pair with
+    # skip_prompt_design=True to get a fully untouched prompt end-to-end; using this
+    # alone still lets qwen-brain's comfy_prompt_designer rewrite `text` one step later.
+    assume_image: bool = False
+    # 2026-08-19 (Chet + Opal): only consulted when assume_image=True -- with
+    # route_intent skipped there's no RouteDecision.exact_text to draw literal on-image
+    # text (signs/captions) from, so a caller wanting that must pass it directly here.
+    # Ignored when assume_image=False (route_intent's own decision.exact_text is used
+    # instead, unchanged from before this field existed).
+    exact_text: list[str] | None = None
 
 
 async def _wait_for_terminal_state(
@@ -193,7 +223,17 @@ async def agent_message(
         session, conv, "user", {"text": payload.text}, payload.client_message_id
     )
     result = await process_routed_message(
-        session, conv, user, queue, gemini, user_msg, model_profile=payload.model_profile
+        session,
+        conv,
+        user,
+        queue,
+        gemini,
+        user_msg,
+        model_profile=payload.model_profile,
+        model_overrides=payload.model_overrides,
+        skip_prompt_design=payload.skip_prompt_design,
+        assume_image=payload.assume_image,
+        exact_text=payload.exact_text,
     )
 
     if payload.wait and result.job is not None:

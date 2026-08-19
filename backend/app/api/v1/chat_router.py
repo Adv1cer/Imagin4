@@ -281,6 +281,10 @@ async def process_routed_message(
     gemini,
     user_msg: ChatMessage,
     model_profile: str | None = None,
+    model_overrides: dict | None = None,
+    skip_prompt_design: bool = False,
+    assume_image: bool = False,
+    exact_text: list[str] | None = None,
 ) -> SmartMessageOut:
     """The actual routing pipeline: classify intent, best-effort research, map through
     the pure decision layer, then respond/enqueue. Shared by both entry points that can
@@ -304,12 +308,97 @@ async def process_routed_message(
     and was always meant to be the one making this access-control decision (see
     comfy_profiles.py's module docstring). /conversations/{id}/smart-message (the
     session-authenticated FE chat) never passes one, so it keeps behaving exactly as
-    before (always "student"). Deliberately NOT a per-request model_overrides knob here
-    -- this endpoint stays "send a message, get an image", with steps/cfg fully backend-
-    controlled via each profile's own tuned .env values; a caller that needs raw
-    per-request step/cfg control still has to use POST /v1/generations (which is also
-    the only place Idempotency-Key is required -- this function's callers already derive
-    a deterministic key per user_msg.id below, so no header is needed here)."""
+    before (always "student").
+
+    `model_overrides` (2026-08-19, Chet + Opal, extending the above): optional, same
+    dict shape as POST /v1/generations' `inputs.model_overrides` (see
+    app/domain/jobs/comfy_overrides.py -- steps/cfg_scale/etc, each still checked
+    against the server-side allowlist/range by admit_generation_job same as ever).
+    Originally left out on purpose ("this endpoint stays send-a-message-get-an-image"),
+    but re-added as an OPTIONAL per-request escape hatch once it became clear callers
+    sometimes do need one-off step/cfg control without wanting to deal with
+    Idempotency-Key at all -- omitting it keeps every existing caller's behavior
+    unchanged (falls back to the resolved profile's own tuned defaults, same as before
+    this parameter existed).
+
+    `skip_prompt_design` (2026-08-19, Chet + Opal): passed straight into
+    inputs.skip_prompt_design -- see app/adapters/routing_comfyui.py's submit() for what
+    it does. Default False keeps every existing caller's behavior (qwen-brain's
+    comfy_prompt_designer still runs); a caller whose own prompt is already
+    finished/web-search-grounded (a real capability qwen-brain's design step lacks --
+    see app/adapters/qwen.py's research_missing_fields) can set it True to skip that
+    rewrite.
+
+    `assume_image` (2026-08-19, Chet + Opal): when True, skips route_intent/
+    decide_next_step ENTIRELY and always treats this message as a ready-to-enqueue
+    GENERAL_IMAGE request, using `user_msg`'s own text as the prompt verbatim (subject
+    only to `skip_prompt_design`, same as the normal EnqueueGeneralImage path below).
+    Exists for callers that already run their own classification upstream (e.g.
+    agentflow's own Intent Router node deciding "generation" vs "needs clarification"
+    before ever calling this endpoint) -- for them, route_intent is pure redundant cost/
+    latency, and worse, it REWRITES the prompt via `normalized_prompt` even when
+    skip_prompt_design=True (that flag only ever affected the second, ComfyUI-side
+    design step -- see routing_comfyui.py's submit()), silently discarding whatever
+    prompt engineering / web-search grounding the caller's own AI agent already did.
+    Default False preserves every existing caller's behavior unchanged. The two flags
+    are checked independently, not coupled -- a caller might legitimately want
+    assume_image (skip classification) but still want qwen's design step (e.g. a caller
+    with no web search of its own); pair both True for a fully untouched prompt
+    end-to-end.
+
+    `exact_text` (2026-08-19, Chet + Opal): only consulted when assume_image=True --
+    with route_intent skipped there's no RouteDecision.exact_text to draw literal
+    on-image text (signs/captions) from, so a caller wanting that must pass it directly.
+    Ignored when assume_image=False (route_intent's own decision.exact_text is used
+    instead, unchanged from before this parameter existed)."""
+    if assume_image:
+        prompt_text = (
+            str(user_msg.content.get("text", "")) if isinstance(user_msg.content, dict) else ""
+        )
+        logger.info(
+            "chat_router: conv=%s user=%s assume_image=True -- skipping route_intent, "
+            "enqueuing image_basic directly (skip_prompt_design=%s)",
+            conv.id,
+            user.id,
+            skip_prompt_design,
+        )
+        try:
+            result = await admit_generation_job(
+                queue=queue,
+                user_id=user.id,
+                workflow_name="image_basic",
+                workflow_version="v1",
+                inputs={
+                    "prompt": prompt_text,
+                    "exact_text": exact_text or [],
+                    "model_profile": model_profile,
+                    "model_overrides": model_overrides,
+                    "skip_prompt_design": skip_prompt_design,
+                },
+                # Same determinism story as the EnqueueGeneralImage branch below: one
+                # user message -> one job, replay-safe on retry.
+                idempotency_key=f"router-general-image-{user_msg.id}",
+            )
+        except (
+            UnknownWorkflowError,
+            UnknownModelProfileError,
+            InvalidComfyOverrideError,
+            IdempotencyConflictError,
+        ):
+            logger.error(
+                "chat_router: image_basic admission failed unexpectedly (assume_image) conv=%s",
+                conv.id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="failed to start image generation",
+            )
+        return SmartMessageOut(
+            type="image_job",
+            user_message=MessageOut.from_model(user_msg),
+            job=GenerationOut(id=result.id, state=result.state, kind=result.kind),
+        )
+
     history = await _load_history(session, conv.id)
 
     validation_outcome = "ok"
@@ -399,6 +488,8 @@ async def process_routed_message(
                     "prompt": step.prompt,
                     "exact_text": step.exact_text,
                     "model_profile": model_profile,
+                    "model_overrides": model_overrides,
+                    "skip_prompt_design": skip_prompt_design,
                 },
                 # Deterministic per user message: a client retrying the same HTTP call
                 # (e.g. after a dropped response) replays the same job instead of

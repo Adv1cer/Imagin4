@@ -104,7 +104,18 @@ class CompositeComfyUIClient:
             return ComfySubmitResult(prompt_id=prompt_id)
 
         payload = workflow_payload
-        if backend_name == "comfyui" and self._comfy_prompt_designer is not None:
+        # 2026-08-19 (Chet + Opal): opt-in escape hatch -- a caller that already wrote a
+        # finished, ready-to-render prompt itself (e.g. agentflow's own AI Agent node,
+        # which has a real web-search tool qwen-brain's comfy_prompt_designer does NOT
+        # have -- see app/adapters/qwen.py's research_missing_fields, which just raises
+        # NotImplemented) can set inputs.skip_prompt_design=true to stop qwen-brain from
+        # rewriting/overwriting that work. Defaults to False (unchanged behavior for
+        # every existing caller that doesn't set it) -- the design step stays the safety
+        # net for callers who DON'T do their own prompt engineering, which is exactly
+        # what caught "asked for a cat, got a person" earlier (raw untranslated prompt
+        # reaching ComfyUI, see this class's docstring / module history).
+        skip_prompt_design = bool(workflow_payload.get("skip_prompt_design"))
+        if backend_name == "comfyui" and self._comfy_prompt_designer is not None and not skip_prompt_design:
             base_prompt = str(workflow_payload.get("prompt") or "").strip()
             exact_text = [
                 t.strip()

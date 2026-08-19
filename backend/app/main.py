@@ -31,6 +31,7 @@ from app.api.v1 import (
     health,
     jobs,
     metrics,
+    model_profiles,
 )
 from app.core.config import get_settings
 from app.core.rate_limit import AdmissionGate
@@ -207,6 +208,7 @@ def create_app() -> FastAPI:
     app.include_router(conversations.router, prefix="/v1")
     app.include_router(generations.router, prefix="/v1")
     app.include_router(jobs.router, prefix="/v1")
+    app.include_router(model_profiles.router, prefix="/v1")
     app.include_router(chat_router.router, prefix="/v1")
     app.include_router(agent_router.router, prefix="/v1")
     app.include_router(metrics.router)  # unprefixed: GET /metrics
