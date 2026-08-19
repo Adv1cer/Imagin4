@@ -280,6 +280,7 @@ async def process_routed_message(
     queue: JobQueue,
     gemini,
     user_msg: ChatMessage,
+    model_profile: str | None = None,
 ) -> SmartMessageOut:
     """The actual routing pipeline: classify intent, best-effort research, map through
     the pure decision layer, then respond/enqueue. Shared by both entry points that can
@@ -294,7 +295,21 @@ async def process_routed_message(
 
     Callers are responsible for auth, resolving/creating `conv`, and persisting
     `user_msg` (via _append_message) before calling this -- this function only takes it
-    from there. `gemini` must already be confirmed non-None by the caller."""
+    from there. `gemini` must already be confirmed non-None by the caller.
+
+    `model_profile` (2026-08-19, Chet + Opal): optional ComfyUI model tier ("student"/
+    "personnel", see app/domain/jobs/comfy_profiles.py) for the EnqueueGeneralImage path
+    only. Only /v1/agent/message actually threads a real value through -- the caller
+    there is agentflow's own backend, which already knows the requesting end-user's role
+    and was always meant to be the one making this access-control decision (see
+    comfy_profiles.py's module docstring). /conversations/{id}/smart-message (the
+    session-authenticated FE chat) never passes one, so it keeps behaving exactly as
+    before (always "student"). Deliberately NOT a per-request model_overrides knob here
+    -- this endpoint stays "send a message, get an image", with steps/cfg fully backend-
+    controlled via each profile's own tuned .env values; a caller that needs raw
+    per-request step/cfg control still has to use POST /v1/generations (which is also
+    the only place Idempotency-Key is required -- this function's callers already derive
+    a deterministic key per user_msg.id below, so no header is needed here)."""
     history = await _load_history(session, conv.id)
 
     validation_outcome = "ok"
@@ -380,7 +395,11 @@ async def process_routed_message(
                 user_id=user.id,
                 workflow_name="image_basic",
                 workflow_version="v1",
-                inputs={"prompt": step.prompt, "exact_text": step.exact_text},
+                inputs={
+                    "prompt": step.prompt,
+                    "exact_text": step.exact_text,
+                    "model_profile": model_profile,
+                },
                 # Deterministic per user message: a client retrying the same HTTP call
                 # (e.g. after a dropped response) replays the same job instead of
                 # enqueueing a second one for what was really one user action.

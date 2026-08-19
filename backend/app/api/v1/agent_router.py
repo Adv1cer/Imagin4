@@ -83,6 +83,17 @@ class AgentMessageIn(BaseModel):
     # docstring for why this exists and why it's opt-in.
     wait: bool = False
     wait_timeout_s: float | None = Field(default=None, gt=0)
+    # 2026-08-19 (Chet + Opal): optional ComfyUI model tier ("student"/"personnel", see
+    # app/domain/jobs/comfy_profiles.py) for whichever GENERAL_IMAGE job this message
+    # routes to, if any -- agentflow already knows the requesting end-user's role and is
+    # the intended owner of this decision (see that module's docstring). None/omitted ->
+    # "student", same as before this field existed. Deliberately NOT paired with
+    # model_overrides or an Idempotency-Key requirement -- this endpoint stays "send a
+    # message, get an image"; a caller needing raw per-request step/cfg control should
+    # use POST /v1/generations instead. An unrecognized value fails the job with a clear
+    # error (see admit_generation_job's UnknownModelProfileError handling below), not a
+    # silent fallback to "student".
+    model_profile: str | None = Field(default=None, max_length=64)
 
 
 async def _wait_for_terminal_state(
@@ -181,7 +192,9 @@ async def agent_message(
     user_msg = await _append_message(
         session, conv, "user", {"text": payload.text}, payload.client_message_id
     )
-    result = await process_routed_message(session, conv, user, queue, gemini, user_msg)
+    result = await process_routed_message(
+        session, conv, user, queue, gemini, user_msg, model_profile=payload.model_profile
+    )
 
     if payload.wait and result.job is not None:
         # NOTE: this holds the request's checked-out DB connection (from get_db_session)
