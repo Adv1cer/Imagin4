@@ -285,6 +285,8 @@ async def process_routed_message(
     skip_prompt_design: bool = False,
     assume_image: bool = False,
     exact_text: list[str] | None = None,
+    aspect_ratio: str | None = None,
+    resolution: str | None = None,
 ) -> SmartMessageOut:
     """The actual routing pipeline: classify intent, best-effort research, map through
     the pure decision layer, then respond/enqueue. Shared by both entry points that can
@@ -350,7 +352,15 @@ async def process_routed_message(
     with route_intent skipped there's no RouteDecision.exact_text to draw literal
     on-image text (signs/captions) from, so a caller wanting that must pass it directly.
     Ignored when assume_image=False (route_intent's own decision.exact_text is used
-    instead, unchanged from before this parameter existed)."""
+    instead, unchanged from before this parameter existed).
+
+    `aspect_ratio` / `resolution` (2026-08-19, Chet + Opal): passed straight into
+    inputs.aspect_ratio / inputs.resolution -- see app/adapters/comfyui/live.py's
+    _resolve_dimensions() for how they're consumed. No validation needed here: any
+    unrecognized value there already falls back to a safe default ("1:1"/"1K") via a
+    plain dict .get(..., default), so unlike model_overrides there's no invalid input to
+    reject. Applies on both the assume_image path and the normal EnqueueGeneralImage
+    path below."""
     if assume_image:
         prompt_text = (
             str(user_msg.content.get("text", "")) if isinstance(user_msg.content, dict) else ""
@@ -374,6 +384,8 @@ async def process_routed_message(
                     "model_profile": model_profile,
                     "model_overrides": model_overrides,
                     "skip_prompt_design": skip_prompt_design,
+                    "aspect_ratio": aspect_ratio,
+                    "resolution": resolution,
                 },
                 # Same determinism story as the EnqueueGeneralImage branch below: one
                 # user message -> one job, replay-safe on retry.
@@ -490,6 +502,8 @@ async def process_routed_message(
                     "model_profile": model_profile,
                     "model_overrides": model_overrides,
                     "skip_prompt_design": skip_prompt_design,
+                    "aspect_ratio": aspect_ratio,
+                    "resolution": resolution,
                 },
                 # Deterministic per user message: a client retrying the same HTTP call
                 # (e.g. after a dropped response) replays the same job instead of

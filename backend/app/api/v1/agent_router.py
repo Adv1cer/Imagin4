@@ -124,6 +124,17 @@ class AgentMessageIn(BaseModel):
     # Ignored when assume_image=False (route_intent's own decision.exact_text is used
     # instead, unchanged from before this field existed).
     exact_text: list[str] | None = None
+    # 2026-08-19 (Chet + Opal): output size, for the EnqueueGeneralImage path only (same
+    # scope as model_profile/model_overrides above). Unlike model_overrides' steps/
+    # cfg_scale, these two are NOT validated against a configured allowlist -- they don't
+    # need one: app/adapters/comfyui/live.py's _resolve_dimensions() already falls back
+    # to a safe default ("1:1"/"1K") for any unrecognized value with a plain dict
+    # .get(..., default), so there's no invalid/out-of-range input to reject in the first
+    # place. This was already reachable via POST /v1/generations (inputs is a free-form
+    # dict there) -- these two fields just expose the same existing capability here,
+    # since agentflow's flow uses this endpoint, not /v1/generations.
+    aspect_ratio: str | None = None
+    resolution: str | None = None
 
 
 async def _wait_for_terminal_state(
@@ -234,6 +245,8 @@ async def agent_message(
         skip_prompt_design=payload.skip_prompt_design,
         assume_image=payload.assume_image,
         exact_text=payload.exact_text,
+        aspect_ratio=payload.aspect_ratio,
+        resolution=payload.resolution,
     )
 
     if payload.wait and result.job is not None:

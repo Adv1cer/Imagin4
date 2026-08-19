@@ -23,10 +23,13 @@ model_profile only, never mixed-and-matched per field.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
 from app.domain.jobs.comfy_profiles import ComfyProfile
+
+logger = logging.getLogger("imaginv.comfy_overrides")
 
 # workflow_payload["model_overrides"] key -> which OverrideAllowlists attribute checks it.
 _STRING_ALLOWLIST_FIELDS: dict[str, str] = {
@@ -77,9 +80,13 @@ def build_allowlists(settings: Any) -> OverrideAllowlists:
 
 
 class InvalidComfyOverrideError(ValueError):
-    """Raised for an unrecognized override key, a string value not in its allowlist, or
-    a numeric value outside its configured range. Callers map this to HTTP 400, same
-    treatment as UnknownModelProfileError."""
+    """Raised for an unrecognized override key, `model_overrides` not being an object, or
+    a string field (checkpoint/vae/clip/sampler/scheduler) not in its allowlist. Callers
+    map this to HTTP 400, same treatment as UnknownModelProfileError.
+
+    NOT raised for a malformed/out-of-range `steps` or `cfg_scale` -- see
+    validate_overrides' comment on those two fields for why (2026-08-19, Chet + Opal):
+    they're silently dropped (profile default applies) and logged instead."""
 
 
 def validate_overrides(overrides: Any, allowlists: OverrideAllowlists) -> dict[str, Any]:
@@ -111,28 +118,61 @@ def validate_overrides(overrides: Any, allowlists: OverrideAllowlists) -> dict[s
             raise InvalidComfyOverrideError(f"{field}={value!r} is not in the allowlist")
         validated[field] = value
 
+    # steps/cfg_scale (2026-08-19, Chet + Opal, revised): unlike the string allowlist
+    # fields above and the "unknown key"/"not an object" checks, an out-of-range or
+    # malformed numeric override does NOT raise here anymore -- it's silently DROPPED
+    # (falls back to whatever the resolved model_profile already had for that field, via
+    # apply_overrides below only ever replace()-ing keys present in `validated`), and
+    # logged at warning level for visibility. Product decision: these two numeric knobs
+    # are commonly filled in by an upstream LLM node (agentflow's own "decide steps/cfg"
+    # step) rather than typed by a human, so an occasional bad guess is expected/routine,
+    # not something that should hard-fail the whole generation with a 500. Contrast with
+    # the string allowlist fields above (checkpoint/vae/clip/etc), which stay hard
+    # failures on purpose -- a bad guess there risks silently loading a
+    # latent-space-incompatible file combo (see this module's docstring / the original
+    # 2026-08 "asked for a cat, got a person" incident), a worse outcome than just using
+    # the profile's tuned default.
     if "steps" in overrides:
         try:
             steps = int(overrides["steps"])
         except (TypeError, ValueError):
-            raise InvalidComfyOverrideError("steps must be an integer")
-        if not (allowlists.min_steps <= steps <= allowlists.max_steps):
-            raise InvalidComfyOverrideError(
-                f"steps must be between {allowlists.min_steps} and {allowlists.max_steps}"
+            logger.warning(
+                "comfy_overrides: steps=%r is not an integer -- ignoring, using profile "
+                "default",
+                overrides["steps"],
             )
-        validated["steps"] = steps
+        else:
+            if allowlists.min_steps <= steps <= allowlists.max_steps:
+                validated["steps"] = steps
+            else:
+                logger.warning(
+                    "comfy_overrides: steps=%s outside allowed range [%s, %s] -- "
+                    "ignoring, using profile default",
+                    steps,
+                    allowlists.min_steps,
+                    allowlists.max_steps,
+                )
 
     if "cfg_scale" in overrides:
         try:
             cfg = float(overrides["cfg_scale"])
         except (TypeError, ValueError):
-            raise InvalidComfyOverrideError("cfg_scale must be a number")
-        if not (allowlists.min_cfg_scale <= cfg <= allowlists.max_cfg_scale):
-            raise InvalidComfyOverrideError(
-                f"cfg_scale must be between {allowlists.min_cfg_scale} and "
-                f"{allowlists.max_cfg_scale}"
+            logger.warning(
+                "comfy_overrides: cfg_scale=%r is not a number -- ignoring, using "
+                "profile default",
+                overrides["cfg_scale"],
             )
-        validated["cfg_scale"] = cfg
+        else:
+            if allowlists.min_cfg_scale <= cfg <= allowlists.max_cfg_scale:
+                validated["cfg_scale"] = cfg
+            else:
+                logger.warning(
+                    "comfy_overrides: cfg_scale=%s outside allowed range [%s, %s] -- "
+                    "ignoring, using profile default",
+                    cfg,
+                    allowlists.min_cfg_scale,
+                    allowlists.max_cfg_scale,
+                )
 
     if "negative_prompt" in overrides:
         validated["negative_prompt"] = str(overrides["negative_prompt"])[
