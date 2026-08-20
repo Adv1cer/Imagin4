@@ -210,3 +210,7 @@ export const PROMPT_BANK: TestPrompt[] = [
 export function pickPrompt(index: number): TestPrompt {
   return PROMPT_BANK[index % PROMPT_BANK.length]
 }
+
+export function getPromptById(id: string): TestPrompt | undefined {
+  return PROMPT_BANK.find((p) => p.id === id)
+}

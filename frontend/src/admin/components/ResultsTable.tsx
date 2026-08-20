@@ -30,17 +30,19 @@ export function ResultsTable({ results }: Props) {
 
   return (
     <div className="max-h-[480px] overflow-auto rounded-lg border border-gray-200 bg-white">
-      <table className="w-full min-w-[900px] text-left text-xs">
+      <table className="w-full min-w-[1080px] text-left text-xs">
         <thead className="sticky top-0 bg-gray-50 text-gray-500">
           <tr>
             <th className="px-2 py-1.5 font-medium">#</th>
             <th className="px-2 py-1.5 font-medium">user</th>
             <th className="px-2 py-1.5 font-medium">prompt</th>
             <th className="px-2 py-1.5 font-medium">status</th>
+            <th className="px-2 py-1.5 font-medium">worker</th>
             <th className="px-2 py-1.5 font-medium">http</th>
             <th className="px-2 py-1.5 font-medium">submit</th>
             <th className="px-2 py-1.5 font-medium">gen time</th>
             <th className="px-2 py-1.5 font-medium">polls</th>
+            <th className="px-2 py-1.5 font-medium">images</th>
             <th className="px-2 py-1.5 font-medium">job id</th>
             <th className="px-2 py-1.5 font-medium">error</th>
           </tr>
@@ -59,10 +61,14 @@ export function ResultsTable({ results }: Props) {
                   {r.finalState && r.finalState !== r.outcome ? ` (${r.finalState})` : ''}
                 </span>
               </td>
+              <td className="px-2 py-1 font-mono text-gray-500" title={r.workerName ?? ''}>
+                {r.workerName ?? '—'}
+              </td>
               <td className="px-2 py-1 font-mono text-gray-600">{r.httpStatus ?? '—'}</td>
               <td className="px-2 py-1 font-mono text-gray-600">{fmtMs(r.submitLatencyMs)}</td>
               <td className="px-2 py-1 font-mono font-medium text-gray-800">{fmtMs(r.totalGenerationMs)}</td>
               <td className="px-2 py-1 font-mono text-gray-500">{r.pollCount}</td>
+              <td className="px-2 py-1 font-mono text-gray-500">{r.outputCount || '—'}</td>
               <td className="px-2 py-1 font-mono text-gray-400" title={r.jobId ?? ''}>
                 {r.jobId ? `${r.jobId.slice(0, 8)}…` : '—'}
               </td>

@@ -118,6 +118,8 @@ function freshResult(seq: number, vu: VirtualUser, prompt: TestPrompt, scheduled
     errorCode: null,
     errorDetail: null,
     outcome: 'pending',
+    workerName: null,
+    outputCount: 0,
   }
 }
 
@@ -163,7 +165,13 @@ async function runOneRequest(
     onUpdate({ ...result })
 
     if (TERMINAL_JOB_STATES.has(data.job.state)) {
-      finalize(result, dispatchedAt, data.job.state, data.job.error_code ?? null, data.job.error_detail ?? null)
+      // POST /v1/agent/message's own job field (GenerationOut) is the slimmer shape and
+      // doesn't carry worker_name/result -- only GET /v1/jobs/{id} does. This branch only
+      // fires if the backend somehow resolves a job synchronously within the POST call
+      // itself (not observed against this backend's ~300s Qwen-Image jobs in practice);
+      // worker attribution for it would need one extra GET, which isn't worth adding for
+      // a path that's normally unreachable.
+      finalize(result, dispatchedAt, data.job.state, data.job.error_code ?? null, data.job.error_detail ?? null, null, 0)
       onUpdate({ ...result })
       return
     }
@@ -183,8 +191,13 @@ async function runOneRequest(
       try {
         const jobResp = await getJob(baseUrl, vu.token, jobId)
         const job = jobResp.data
+        // Worker attribution is known as soon as the job is dispatched, well before it
+        // reaches a terminal state -- surface it on every poll (not just the final one)
+        // so the gallery/table can show "which worker" while a job is still generating.
+        if (job?.worker_name) result.workerName = job.worker_name
         if (job && TERMINAL_JOB_STATES.has(job.state)) {
-          finalize(result, dispatchedAt, job.state, job.error_code, job.error_detail)
+          const outputs = (job.result as { outputs?: unknown[] } | null)?.outputs
+          finalize(result, dispatchedAt, job.state, job.error_code, job.error_detail, job.worker_name ?? null, outputs?.length ?? 0)
           onUpdate({ ...result })
           return
         }
@@ -221,6 +234,8 @@ function finalize(
   state: string,
   errorCode: string | null,
   errorDetail: string | null,
+  workerName: string | null,
+  outputCount: number,
 ) {
   result.finalState = state
   result.errorCode = errorCode
@@ -228,6 +243,8 @@ function finalize(
   result.completedAtMs = performance.now()
   result.totalGenerationMs = result.completedAtMs - dispatchedAt
   result.outcome = state === 'succeeded' ? 'succeeded' : 'failed'
+  if (workerName) result.workerName = workerName
+  result.outputCount = outputCount
 }
 
 export function computeSchedule(cfg: ScenarioConfig): { seq: number; delayMs: number }[] {

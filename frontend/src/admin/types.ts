@@ -47,7 +47,14 @@ export const DEFAULT_SCENARIO: ScenarioConfig = {
   spreadWithinBatch: false,
   poolConcurrency: 10,
   pollIntervalMs: 1500,
-  maxWaitMs: 120_000,
+  // Real Qwen-Image jobs on this backend were observed taking 270-320s end-to-end even
+  // on an otherwise-idle worker (see comfyui-worker-1/-2 container logs, 2026-08-20 test
+  // run: "Prompt executed in 311.95 seconds"). 120s was too short and produced a wall of
+  // false "poll_timeout" rows for jobs that were still genuinely running server-side --
+  // the admin tool just stopped watching them. 600s gives headroom above the observed
+  // worst case; raise it further if you're intentionally testing deep queue backlog with
+  // more requests than there are ComfyUI workers to drain them.
+  maxWaitMs: 600_000,
   submitTimeoutMs: 15_000,
 }
 
@@ -82,6 +89,12 @@ export interface RequestResult {
   errorCode: string | null
   errorDetail: string | null
   outcome: RequestOutcome
+  /** Which comfyui-worker-N instance handled this job (see backend/app/api/v1/jobs.py's
+   *  JobOut.worker_name) -- null until the first successful poll response that includes
+   *  it, or permanently null against an unpatched backend that doesn't return the field. */
+  workerName: string | null
+  /** Number of generated images in the job's terminal result.outputs[] -- 0 until known. */
+  outputCount: number
 }
 
 export function isTerminalOutcome(o: RequestOutcome): boolean {

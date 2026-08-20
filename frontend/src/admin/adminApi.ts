@@ -52,7 +52,13 @@ export interface JobStatusResponse {
   current_attempt: number
   error_code: string | null
   error_detail: string | null
-  result: unknown
+  result: { outputs?: { object_key: string; mime_type: string }[] } | Record<string, unknown> | null
+  // Populated by a small additive backend change (see backend/app/api/v1/jobs.py's
+  // JobOut.worker_name) that decodes which comfyui-worker-N instance handled this job's
+  // current/latest attempt. Requires the backend the admin page is pointed at to have
+  // that field deployed -- older/unpatched backends simply omit the key, which JSON
+  // parses as undefined here, so this stays optional rather than required.
+  worker_name?: string | null
 }
 
 export interface ModelProfilesResponse {
@@ -168,6 +174,41 @@ export function getModelProfiles(
   timeoutMs = 10_000,
 ): Promise<{ status: number; data: ModelProfilesResponse | null }> {
   return rawFetch<ModelProfilesResponse>(baseUrl, '/v1/model-profiles', token, { timeoutMs })
+}
+
+// GET /v1/jobs/{id}/asset streams raw image bytes (not JSON), so it needs its own fetch
+// path rather than rawFetch<T>'s JSON parsing. A plain <img src="..."> can't be pointed
+// at this URL directly since it requires the Authorization header (no way to attach one
+// to an <img> tag) -- callers fetch the bytes as a Blob and build an object URL instead
+// (see admin/components/Gallery.tsx).
+export async function getJobAssetBlob(
+  baseUrl: string,
+  token: string,
+  jobId: string,
+  index: number,
+  timeoutMs = 30_000,
+): Promise<Blob> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  let response: Response
+  try {
+    response = await fetch(`${normalizeBaseUrl(baseUrl)}/v1/jobs/${jobId}/asset?index=${index}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      signal: controller.signal,
+      credentials: 'omit',
+    })
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new AdminApiError('timeout', `Fetching asset for job ${jobId} timed out after ${timeoutMs}ms`)
+    }
+    throw new AdminApiError('network', `Network error fetching asset for job ${jobId} (CORS or connectivity).`)
+  } finally {
+    clearTimeout(timer)
+  }
+  if (!response.ok) {
+    throw new AdminApiError('http', `HTTP ${response.status} fetching asset for job ${jobId}`, response.status)
+  }
+  return response.blob()
 }
 
 export const TERMINAL_JOB_STATES = new Set(['succeeded', 'failed', 'cancelled'])

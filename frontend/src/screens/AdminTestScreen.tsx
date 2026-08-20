@@ -3,6 +3,7 @@ import { ConfigPanel } from '../admin/components/ConfigPanel'
 import { ScenarioPanel } from '../admin/components/ScenarioPanel'
 import { StatsPanel } from '../admin/components/StatsPanel'
 import { ResultsTable } from '../admin/components/ResultsTable'
+import { Gallery } from '../admin/components/Gallery'
 import type { ModelProfilesResponse } from '../admin/adminApi'
 import { DEFAULT_REQUEST_OPTIONS, runScenario, totalForMode, type RunHandle, type VirtualUser } from '../admin/scenarios'
 import { DEFAULT_SCENARIO, type RequestResult } from '../admin/types'
@@ -34,6 +35,7 @@ export function AdminTestScreen() {
   const [startedAtMs, setStartedAtMs] = useState<number | null>(null)
   const [finishedAtMs, setFinishedAtMs] = useState<number | null>(null)
   const [nowMs, setNowMs] = useState(0)
+  const [view, setView] = useState<'table' | 'gallery'>('table')
 
   const resultsRef = useRef<(RequestResult | undefined)[]>([])
   const [, forceTick] = useReducer((x: number) => x + 1, 0)
@@ -41,6 +43,10 @@ export function AdminTestScreen() {
   const runHandleRef = useRef<RunHandle | null>(null)
 
   const virtualUsers = useMemo(() => parseTokens(tokensRaw), [tokensRaw])
+  const tokensById = useMemo(
+    () => Object.fromEntries(virtualUsers.map((vu) => [vu.id, vu.token])),
+    [virtualUsers],
+  )
 
   const scheduleRerender = useCallback(() => {
     if (pendingRerender.current) return
@@ -179,7 +185,32 @@ export function AdminTestScreen() {
           running={running}
         />
 
-        <ResultsTable results={resultsRef.current} />
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setView('table')}
+            className={`rounded px-3 py-1.5 text-xs font-medium ${
+              view === 'table' ? 'bg-gray-900 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'
+            } border border-gray-300`}
+          >
+            ตาราง
+          </button>
+          <button
+            type="button"
+            onClick={() => setView('gallery')}
+            className={`rounded px-3 py-1.5 text-xs font-medium ${
+              view === 'gallery' ? 'bg-gray-900 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'
+            } border border-gray-300`}
+          >
+            🖼 Gallery
+          </button>
+        </div>
+
+        {view === 'table' ? (
+          <ResultsTable results={resultsRef.current} />
+        ) : (
+          <Gallery results={resultsRef.current} baseUrl={baseUrl} tokensById={tokensById} />
+        )}
 
         <footer className="pt-2 text-[11px] leading-relaxed text-gray-400">
           หมายเหตุ: หน้านี้เรียก backend ตรงๆ ด้วย bearer API key จาก browser tab นี้ — ถ้าเจอ "Network error" ให้เช็ค
