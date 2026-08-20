@@ -184,7 +184,31 @@ def validate_overrides(overrides: Any, allowlists: OverrideAllowlists) -> dict[s
 
 def apply_overrides(profile: ComfyProfile, validated_overrides: dict[str, Any]) -> ComfyProfile:
     """Layers already-validated overrides onto a resolved profile. Never call with raw,
-    unvalidated input -- see validate_overrides above."""
+    unvalidated input -- see validate_overrides above.
+
+    `negative_prompt` (2026-08-19, Chet + Opal) is deliberately NOT a plain replace like
+    every other field here -- it's CONCATENATED with the profile's own configured
+    negative_prompt (APP_COMFY_*_NEGATIVE_PROMPT in .env), caller's terms appended after
+    a comma. Why: the profile's negative_prompt is meant as an always-applied floor
+    (color-cast/quality terms an operator wants on every single job regardless of what
+    any caller sends -- see the 2026-08 "photos coming out yellow-tinted" incident this
+    was added for), not a default that silently vanishes the moment a caller supplies
+    its own value. A plain replace() here would mean one caller forgetting to include
+    those baseline terms (or a future caller that never learned about them) drops
+    protection for that job with no visible signal. Every other override field (steps/
+    cfg_scale/checkpoint_name/etc) has no such "floor" concept -- a profile's tuned
+    steps/cfg are a *starting point* a caller is meant to be able to fully override, not
+    a safety net -- so those stay plain replace via the dict below."""
     if not validated_overrides:
         return profile
-    return replace(profile, **validated_overrides)
+    overrides = dict(validated_overrides)
+    if "negative_prompt" in overrides:
+        caller_terms = overrides.pop("negative_prompt").strip()
+        baseline_terms = profile.negative_prompt.strip()
+        if caller_terms and baseline_terms:
+            overrides["negative_prompt"] = f"{baseline_terms}, {caller_terms}"
+        else:
+            overrides["negative_prompt"] = caller_terms or baseline_terms
+    if not overrides:
+        return profile
+    return replace(profile, **overrides)

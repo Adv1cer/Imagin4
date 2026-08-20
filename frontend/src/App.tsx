@@ -3,10 +3,19 @@ import { useAuth } from './hooks/useAuth'
 import { LoginScreen } from './screens/LoginScreen'
 import { RegisterScreen } from './screens/RegisterScreen'
 import { ChatScreen } from './screens/ChatScreen'
+import { AdminTestScreen } from './screens/AdminTestScreen'
 
 function App() {
   const { status, user, login, register, logout } = useAuth()
   const [authView, setAuthView] = useState<'login' | 'register'>('login')
+
+  // No routing library is installed (see package.json) -- this is intentionally the
+  // simplest possible route: /admin is a standalone load-test console that manages its
+  // own auth (bearer API keys typed into the page, see admin/adminApi.ts), independent
+  // of the cookie-session login flow below, so it's checked before that flow runs at all.
+  if (window.location.pathname.startsWith('/admin')) {
+    return <AdminTestScreen />
+  }
 
   if (status === 'checking') {
     return (
