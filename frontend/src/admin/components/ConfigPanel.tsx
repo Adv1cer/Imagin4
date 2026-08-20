@@ -150,6 +150,13 @@ export function ConfigPanel({
           />
           skip_prompt_design
         </label>
+        {reqOpts.skipPromptDesign && (
+          <p className="basis-full text-[11px] text-amber-700">
+            ⚠️ skip_prompt_design=true ข้าม guardrail ที่ป้องกันไม่ให้โมเดลเจนเป็น collage/หลายคนในภาพเดียว
+            (`COMFY_PROMPT_DESIGN_SYSTEM_INSTRUCTION` สั่งชัดเจนว่าห้ามขยายเป็น grid/contact sheet) — เหมาะกับการวัด
+            throughput ดิบๆ เท่านั้น ถ้าต้องการดูคุณภาพภาพจริงให้ปิดตัวเลือกนี้
+          </p>
+        )}
         <label className="flex items-center gap-1.5 text-xs text-gray-700">
           <input
             type="checkbox"

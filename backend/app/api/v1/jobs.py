@@ -12,10 +12,12 @@ from pydantic import BaseModel
 
 from app.adapters.queue import JobQueue
 from app.adapters.storage import ObjectStorage
-from app.api.deps import get_app_settings, get_current_user, get_job_queue, get_storage
-from app.core.config import Settings
+from app.api.deps import get_current_user, get_job_queue, get_storage
+from app.core.config import get_settings
 from app.db.models import User
+from app.domain.jobs.admission import estimate_wait_seconds
 from app.domain.jobs.ownership import NotOwnerError, assert_owner
+from app.domain.jobs.workflow_registry import backend_for_kind, kinds_for_backend
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -33,42 +35,33 @@ class JobOut(BaseModel):
     # backend handled the job and why it failed without reading server logs.
     error_detail: str | None = None
     result: dict | None = None
-    # Which comfyui-worker-N instance this job's CURRENT (or most recent) attempt was
-    # dispatched to, e.g. "comfyui-worker-2:8188" -- None if the job hasn't been
-    # dispatched yet, was routed to a non-ComfyUI backend (e.g. Gemini), or the encoding
-    # is otherwise unrecognized. Purely additive/derived (no new column, no new query) --
-    # see _worker_name_from_prompt_id's docstring for where the underlying data lives.
-    worker_name: str | None = None
+    # 2026-08-20 (see app/domain/jobs/admission.py:estimate_wait_seconds): a LIVE,
+    # aging-aware position within this job's own backend's queue, recomputed on every
+    # GET -- unlike GenerationOut's queue_position (a snapshot taken once, at admission
+    # time), this one tracks the job as it moves up the queue. Both None once the job
+    # has left `queued`/`retry_wait` (dispatched/running/terminal) -- see
+    # JobQueue.queue_rank's docstring for why a stale position is worse than none.
+    queue_position: int | None = None
+    estimated_wait_seconds: float | None = None
+    # 2026-08-20, see app/domain/jobs/admission.py's AdmissionResult.is_preview
+    # docstring -- read directly off input_payload (no extra query needed, unlike the
+    # queue_position/ETA fields above) since QueuedJob already carries it.
+    is_preview: bool = False
 
 
-def _worker_name_from_prompt_id(prompt_id: str | None, worker_base_urls: list[str]) -> str | None:
-    """Decodes the `"<worker_index>:<real_prompt_id>"` tag that
-    `MultiWorkerComfyUIClient.submit()` stamps onto `QueuedJob.prompt_id` (see
-    app/adapters/comfyui/multi_worker.py's module docstring) back into a human-readable
-    worker name.
-
-    Deliberately duplicates `Scheduler._worker_name`'s exact string transform
-    (app/services/scheduler.py) rather than importing it -- that module pulls in the
-    full scheduler/DB-session machinery, which this read-only status endpoint has no
-    other reason to depend on. Keep the two in sync if the naming scheme ever changes;
-    a mismatch here only degrades the displayed name, it can't corrupt job state.
-
-    Returns None for: no prompt_id yet (job still queued/never dispatched), a prompt_id
-    with no recognizable "<index>:" prefix (e.g. a non-ComfyUI backend's own id format),
-    or an index outside the currently-configured worker list (stale id from a since-
-    shrunk APP_COMFY_WORKER_BASE_URLS_CSV).
-    """
-    if not prompt_id:
-        return None
-    index_str, sep, _real_id = prompt_id.partition(":")
-    if not sep:
-        return None
-    try:
-        index = int(index_str)
-        base_url = worker_base_urls[index]
-    except (ValueError, IndexError):
-        return None
-    return base_url.replace("http://", "").replace("https://", "").replace("/", "-").rstrip("-")
+async def _live_queue_eta(queue: JobQueue, job) -> tuple[int | None, float | None]:
+    """Shared by get_job/cancel_job below. `hasattr` guard matches this module's
+    existing fail-open style (see app/domain/jobs/admission.py's own convention) --
+    a JobQueue that doesn't implement queue_rank just doesn't get live ETA fields."""
+    if job.state not in ("queued", "retry_wait") or not hasattr(queue, "queue_rank"):
+        return None, None
+    backend = backend_for_kind(job.kind)
+    if backend is None:
+        return None, None
+    position = await queue.queue_rank(job.id, kinds_for_backend(backend))
+    if position is None:
+        return None, None
+    return position, estimate_wait_seconds(position, backend, get_settings())
 
 
 async def _get_owned_job(queue: JobQueue, job_id: str, user: User):
@@ -91,9 +84,9 @@ async def get_job(
     job_id: str,
     queue: JobQueue = Depends(get_job_queue),
     user: User = Depends(get_current_user),
-    settings: Settings = Depends(get_app_settings),
 ) -> JobOut:
     job = await _get_owned_job(queue, job_id, user)
+    position, eta = await _live_queue_eta(queue, job)
     return JobOut(
         id=str(job.id),
         state=job.state,
@@ -102,7 +95,9 @@ async def get_job(
         error_code=job.error_code,
         error_detail=job.error_detail,
         result=job.result,
-        worker_name=_worker_name_from_prompt_id(job.prompt_id, settings.comfy_worker_base_urls),
+        queue_position=position,
+        estimated_wait_seconds=eta,
+        is_preview=bool((job.input_payload or {}).get("is_preview", False)),
     )
 
 
@@ -111,11 +106,16 @@ async def cancel_job(
     job_id: str,
     queue: JobQueue = Depends(get_job_queue),
     user: User = Depends(get_current_user),
-    settings: Settings = Depends(get_app_settings),
 ) -> JobOut:
     job = await _get_owned_job(queue, job_id, user)
     await queue.cancel(job.id)
     job = await queue.get(job.id)
+    # A cancelled job is terminal, so this always resolves to (None, None) via the same
+    # state-check _live_queue_eta itself does -- calling it (rather than hardcoding None
+    # here) just means a future state_machine change (e.g. a genuine cancelling->
+    # cancelled path, see app/adapters/queue/postgres.py's module docstring) can't
+    # silently leave this endpoint out of sync with get_job.
+    position, eta = await _live_queue_eta(queue, job)
     return JobOut(
         id=str(job.id),
         state=job.state,
@@ -124,7 +124,9 @@ async def cancel_job(
         error_code=job.error_code,
         error_detail=job.error_detail,
         result=job.result,
-        worker_name=_worker_name_from_prompt_id(job.prompt_id, settings.comfy_worker_base_urls),
+        queue_position=position,
+        estimated_wait_seconds=eta,
+        is_preview=bool((job.input_payload or {}).get("is_preview", False)),
     )
 
 

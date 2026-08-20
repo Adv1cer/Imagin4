@@ -99,7 +99,21 @@ class Scheduler:
         call to Google and doesn't compete for this machine's GPU at all, so it gets its
         own independent cap (default_gemini_active_slots) regardless of which path is
         used for ComfyUI capacity -- there is no "gemini_workers" registry table, Gemini
-        isn't a fleet of instances to select between."""
+        isn't a fleet of instances to select between.
+
+        Gap closed 2026-08-20 (Chet's DGX Spark): with N `comfy_workers` rows online,
+        `available` below used to sum to N, uncapped by `default_comfy_active_slots` --
+        so 2 configured workers meant the scheduler happily claimed+dispatched 2 jobs at
+        once even though `default_comfy_active_slots` defaults to 1 specifically BECAUSE
+        workers sharing one physical GPU don't scale linearly (see that field's docstring
+        and MultiWorkerComfyUIClient's module docstring). Admin load-test logs confirmed
+        this isn't just "less predictable" -- it's slower: step time roughly 5x'd when both
+        workers sampled at once (~4.9s/it solo vs ~24.3s/it overlapped) on GB10's shared,
+        bandwidth-constrained memory, so 2-at-once finished LESS total work per wall-clock
+        second than serializing. `min(available, ...)` below makes default_comfy_active_slots
+        the real ceiling in live/postgres mode too, not just the in-memory-queue fallback a
+        few lines up -- only raise it past 1 after benchmarking a setup where concurrent
+        dispatch is actually true, e.g. one physical GPU per worker."""
         gemini_capacity = self.settings.default_gemini_active_slots
 
         if self.session_factory is None:
@@ -134,7 +148,11 @@ class Scheduler:
             for s in snapshots
             if s.status == "online"
         )
-        return {"comfyui": max(available, 0), "gemini": gemini_capacity}
+        # Ceiling applied regardless of how many workers are online -- see this method's
+        # docstring ("Gap closed 2026-08-20") for why an uncapped sum here is wrong on a
+        # shared-GPU box.
+        capped = min(available, self.settings.default_comfy_active_slots)
+        return {"comfyui": max(capped, 0), "gemini": gemini_capacity}
 
     async def _dispatch(self, job: QueuedJob) -> None:
         """Marks the job running and submits it to ComfyUI. Any failure here is
@@ -164,14 +182,25 @@ class Scheduler:
         if capacity <= 0:
             return []
         kinds = kinds_for_backend(backend)
+        # max_active_per_user (2026-08-20, see Settings.max_active_jobs_per_user's
+        # docstring and JobQueue.claim_next's): applied to BOTH backend lanes, not just
+        # ComfyUI -- one user shouldn't be able to occupy every Gemini slot either, same
+        # "Admission / fairness defaults" intent as the CapacityExceededError check at
+        # admission time (app/domain/jobs/admission.py), just enforced here at CLAIM
+        # time for the case that check doesn't cover: a user with several already-queued
+        # jobs and worker_capacity > 1 in a single tick.
+        max_active_per_user = self.settings.max_active_jobs_per_user
         if hasattr(self.job_queue, "claim_next_with_lease"):
             return await self.job_queue.claim_next_with_lease(
                 worker_capacity=capacity,
                 lease_owner=self.owner_id,
                 lease_seconds=self.lease_seconds,
                 kinds=kinds,
+                max_active_per_user=max_active_per_user,
             )
-        return await self.job_queue.claim_next(worker_capacity=capacity, kinds=kinds)
+        return await self.job_queue.claim_next(
+            worker_capacity=capacity, kinds=kinds, max_active_per_user=max_active_per_user
+        )
 
     async def _tick(self) -> None:
         capacity_by_backend = await self._reserve_capacity_by_backend()

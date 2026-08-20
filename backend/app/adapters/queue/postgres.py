@@ -88,7 +88,19 @@ from app.domain.jobs.workflow_registry import list_workflows
 # inline it directly into `state NOT IN :terminal_states` without extra round-trips.
 _TERMINAL_STATES = ("succeeded", "failed", "cancelled")
 
+# Mirrors the states app/domain/jobs/admission.py's CapacityExceededError check counts
+# as "backlog" -- jobs claimed (dispatched/running) are deliberately excluded, see that
+# exception's docstring for why Settings.max_active_jobs_per_user isn't covered here.
+_BACKLOG_STATES = ("queued", "retry_wait")
+
 _DEFAULT_UNLEASED_LEASE_SECONDS = 300.0
+
+# Mirrors Settings.aging_increment_per_minute's own default (see _claim's params below
+# for why this adapter hardcodes it rather than importing app.core.config -- kept
+# dependency-free of the app layer to stay easy to unit-test in isolation). Pulled out
+# as a named constant (2026-08-20) so `_claim` and the new `queue_rank` below can't
+# silently drift apart on which aging rate they each assume.
+_AGING_INCREMENT_PER_MINUTE = 0.5
 
 # Reused by get()/list_active()/claim*() -- LEFT JOIN LATERAL pulls the latest
 # job_attempts row (by attempt_no) per job, so callers see the CURRENT attempt's
@@ -180,13 +192,13 @@ class PostgresJobQueue:
                              :priority, :effective_priority, :idempotency_key, :input_payload,
                              :current_attempt, :max_attempts, :queued_at)
                         """
-                # Raw text() params default to NullType -- without an explicit JSONB
-                # type here, SQLAlchemy skips the JSON-serialize bind processor and
-                # hands asyncpg a raw Python dict, which its binary jsonb encoder
-                # rejects with `AttributeError: 'dict' object has no attribute
-                # 'encode'` (confirmed via Chet's actual integration-test run against a
-                # real Postgres, 2026-08-17 -- this was NOT caught before that, since
-                # this sandbox has no Docker to run the integration suite against).
+                    # Raw text() params default to NullType -- without an explicit JSONB
+                    # type here, SQLAlchemy skips the JSON-serialize bind processor and
+                    # hands asyncpg a raw Python dict, which its binary jsonb encoder
+                    # rejects with `AttributeError: 'dict' object has no attribute
+                    # 'encode'` (confirmed via Chet's actual integration-test run against a
+                    # real Postgres, 2026-08-17 -- this was NOT caught before that, since
+                    # this sandbox has no Docker to run the integration suite against).
                 ).bindparams(bindparam("input_payload", type_=JSONB)),
                 {
                     "id": job.id,
@@ -216,12 +228,65 @@ class PostgresJobQueue:
             row = result.first()
             return _row_to_queued_job(row) if row is not None else None
 
+    # Fixed, arbitrary constant -- namespaces the advisory lock below to this one
+    # feature (pg_advisory_xact_lock's keyspace is global to the whole database, so any
+    # future unrelated use of advisory locks elsewhere must pick a different constant).
+    _CLAIM_ACTIVE_CAP_LOCK_KEY = 872234198
+
+    async def _finalize_claimed_row(
+        self, session, row, lease_owner: str, lease_expires_at
+    ) -> QueuedJob:
+        """Shared by both claim paths below: records the job_attempts row for this
+        attempt and the `dispatched` event, then builds the QueuedJob DTO the caller
+        returns. Factored out so the new per-user-capped path (which claims one row per
+        SQL round-trip instead of one batch) doesn't duplicate this bookkeeping."""
+        attempt_no = row.current_attempt + 1
+        await session.execute(
+            text("""
+                    INSERT INTO job_attempts
+                        (job_id, attempt_no, state, lease_owner, lease_expires_at,
+                         submitted_at)
+                    VALUES
+                        (:job_id, :attempt_no, 'dispatched', :lease_owner,
+                         :lease_expires_at, now())
+                    ON CONFLICT (job_id, attempt_no) DO UPDATE SET
+                        lease_owner = excluded.lease_owner,
+                        lease_expires_at = excluded.lease_expires_at
+                    """),
+            {
+                "job_id": row.id,
+                "attempt_no": attempt_no,
+                "lease_owner": lease_owner,
+                "lease_expires_at": lease_expires_at,
+            },
+        )
+        await self._append_event(session, row.id, "dispatched", {"attempt_no": attempt_no})
+        return QueuedJob(
+            id=row.id,
+            user_id=row.user_id,
+            kind=row.kind,
+            state=row.state,
+            priority=row.priority,
+            effective_priority=row.effective_priority,
+            input_payload=row.input_payload,
+            idempotency_key=row.idempotency_key,
+            queued_at=row.queued_at,
+            current_attempt=row.current_attempt,
+            max_attempts=row.max_attempts,
+            assigned_worker_id=row.assigned_worker_id,
+            error_code=row.error_code,
+            error_detail=row.error_detail_sanitized,
+            lease_owner=lease_owner,
+            lease_expires_at=lease_expires_at,
+        )
+
     async def _claim(
         self,
         worker_capacity: int,
         kinds: frozenset[str] | None,
         lease_owner: str,
         lease_seconds: float,
+        max_active_per_user: int = 0,
     ) -> list[QueuedJob]:
         if worker_capacity <= 0:
             return []
@@ -238,96 +303,127 @@ class PostgresJobQueue:
         # subquery (the pattern used by Que/pg-boss/River and virtually every "Postgres
         # as a queue" reference implementation), which does NOT have this gap.
         kinds_clause = "AND kind IN :kinds" if kinds is not None else ""
-        stmt = text(
-            f"""
+
+        lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+
+        if max_active_per_user <= 0:
+            # Unchanged from before 2026-08-20 -- single multi-row claim, zero added
+            # risk for every caller that doesn't opt into the per-user cap below.
+            stmt = text(f"""
+                UPDATE generation_jobs g
+                SET state = 'dispatched'
+                WHERE g.id IN (
+                    SELECT id
+                    FROM generation_jobs
+                    WHERE state IN ('queued', 'retry_wait')
+                    {kinds_clause}
+                    ORDER BY
+                        (priority + (extract(epoch from (now() - queued_at)) / 60.0)
+                            * :aging_increment) DESC,
+                        queued_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT :capacity
+                )
+                RETURNING g.id, g.user_id, g.kind, g.state, g.priority, g.effective_priority,
+                          g.input_payload, g.idempotency_key, g.queued_at, g.current_attempt,
+                          g.max_attempts, g.assigned_worker_id, g.error_code,
+                          g.error_detail_sanitized
+                """)
+            if kinds is not None:
+                stmt = stmt.bindparams(bindparam("kinds", expanding=True))
+            # aging_increment_per_minute is a Settings value in the app layer; this
+            # adapter has no Settings reference of its own (kept dependency-free of
+            # app.core.config to stay easy to unit-test) -- 0.5 matches
+            # Settings.aging_increment_per_minute's own default.
+            params: dict[str, Any] = {
+                "capacity": worker_capacity,
+                "aging_increment": _AGING_INCREMENT_PER_MINUTE,
+            }
+            if kinds is not None:
+                params["kinds"] = list(kinds)
+
+            async with self.session_factory() as session, session.begin():
+                result = await session.execute(stmt, params)
+                claimed_rows = result.fetchall()
+                return [
+                    await self._finalize_claimed_row(session, row, lease_owner, lease_expires_at)
+                    for row in claimed_rows
+                ]
+
+        # max_active_per_user > 0: one row per SQL round-trip (up to worker_capacity),
+        # each re-evaluating a correlated "how many of this candidate's OWN jobs are
+        # already dispatched/running" subquery -- see Settings.max_active_jobs_per_user's
+        # docstring for why this is enforced here (claim time) rather than only at
+        # admission (CapacityExceededError only caps the QUEUED backlog, not how many of
+        # one user's jobs can be simultaneously active when worker_capacity > 1).
+        #
+        # The advisory lock below is NOT optional: without it, two concurrent scheduler
+        # transactions can each run the correlated subquery, both see "0 active for user
+        # X" under READ COMMITTED (neither sees the other's still-uncommitted UPDATE),
+        # and both claim a job for X -- verified against a real local Postgres 16 with
+        # concurrent asyncio tasks before this code was written (the same class of bug
+        # the 2026-08-17 note above describes, just one level up: THIS query already
+        # avoids double-claiming the same ROW via FOR UPDATE SKIP LOCKED, but nothing
+        # protected the separate "how many active does this USER have" count without
+        # this lock). Xact-scoped (`_xact_lock`, not session-level) -- released
+        # automatically on COMMIT/ROLLBACK, never needs an explicit unlock call. Only
+        # taken on this path -- callers with max_active_per_user<=0 (unchanged default
+        # for every existing caller) never pay for it.
+        single_stmt = text(f"""
             UPDATE generation_jobs g
             SET state = 'dispatched'
-            WHERE g.id IN (
+            WHERE g.id = (
                 SELECT id
                 FROM generation_jobs
                 WHERE state IN ('queued', 'retry_wait')
                 {kinds_clause}
+                AND (
+                    SELECT count(*) FROM generation_jobs g2
+                    WHERE g2.user_id = generation_jobs.user_id
+                      AND g2.state IN ('dispatched', 'running')
+                ) < :max_active_per_user
                 ORDER BY
                     (priority + (extract(epoch from (now() - queued_at)) / 60.0)
                         * :aging_increment) DESC,
                     queued_at ASC
                 FOR UPDATE SKIP LOCKED
-                LIMIT :capacity
+                LIMIT 1
             )
             RETURNING g.id, g.user_id, g.kind, g.state, g.priority, g.effective_priority,
                       g.input_payload, g.idempotency_key, g.queued_at, g.current_attempt,
                       g.max_attempts, g.assigned_worker_id, g.error_code,
                       g.error_detail_sanitized
-            """
-        )
+            """)
         if kinds is not None:
-            stmt = stmt.bindparams(bindparam("kinds", expanding=True))
-
-        # aging_increment_per_minute is a Settings value in the app layer; this adapter
-        # has no Settings reference of its own (kept dependency-free of app.core.config
-        # to stay easy to unit-test), so callers needing non-default aging should extend
-        # the constructor -- 0.5 matches Settings.aging_increment_per_minute's own
-        # default, so behavior is correct out of the box even without wiring it through.
-        params: dict[str, Any] = {"capacity": worker_capacity, "aging_increment": 0.5}
+            single_stmt = single_stmt.bindparams(bindparam("kinds", expanding=True))
+        single_params: dict[str, Any] = {
+            "aging_increment": _AGING_INCREMENT_PER_MINUTE,
+            "max_active_per_user": max_active_per_user,
+        }
         if kinds is not None:
-            params["kinds"] = list(kinds)
+            single_params["kinds"] = list(kinds)
 
-        lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
-
+        claimed_jobs: list[QueuedJob] = []
         async with self.session_factory() as session, session.begin():
-            result = await session.execute(stmt, params)
-            claimed_rows = result.fetchall()
-            claimed_jobs: list[QueuedJob] = []
-            for row in claimed_rows:
-                attempt_no = row.current_attempt + 1
-                await session.execute(
-                    text(
-                        """
-                            INSERT INTO job_attempts
-                                (job_id, attempt_no, state, lease_owner, lease_expires_at,
-                                 submitted_at)
-                            VALUES
-                                (:job_id, :attempt_no, 'dispatched', :lease_owner,
-                                 :lease_expires_at, now())
-                            ON CONFLICT (job_id, attempt_no) DO UPDATE SET
-                                lease_owner = excluded.lease_owner,
-                                lease_expires_at = excluded.lease_expires_at
-                            """
-                    ),
-                    {
-                        "job_id": row.id,
-                        "attempt_no": attempt_no,
-                        "lease_owner": lease_owner,
-                        "lease_expires_at": lease_expires_at,
-                    },
-                )
-                await self._append_event(
-                    session, row.id, "dispatched", {"attempt_no": attempt_no}
-                )
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": self._CLAIM_ACTIVE_CAP_LOCK_KEY},
+            )
+            for _ in range(worker_capacity):
+                result = await session.execute(single_stmt, single_params)
+                row = result.first()
+                if row is None:
+                    break
                 claimed_jobs.append(
-                    QueuedJob(
-                        id=row.id,
-                        user_id=row.user_id,
-                        kind=row.kind,
-                        state=row.state,
-                        priority=row.priority,
-                        effective_priority=row.effective_priority,
-                        input_payload=row.input_payload,
-                        idempotency_key=row.idempotency_key,
-                        queued_at=row.queued_at,
-                        current_attempt=row.current_attempt,
-                        max_attempts=row.max_attempts,
-                        assigned_worker_id=row.assigned_worker_id,
-                        error_code=row.error_code,
-                        error_detail=row.error_detail_sanitized,
-                        lease_owner=lease_owner,
-                        lease_expires_at=lease_expires_at,
-                    )
+                    await self._finalize_claimed_row(session, row, lease_owner, lease_expires_at)
                 )
         return claimed_jobs
 
     async def claim_next(
-        self, worker_capacity: int = 1, kinds: frozenset[str] | None = None
+        self,
+        worker_capacity: int = 1,
+        kinds: frozenset[str] | None = None,
+        max_active_per_user: int = 0,
     ) -> list[QueuedJob]:
         """job_attempts.lease_owner/lease_expires_at are NOT NULL in this schema (unlike
         InMemoryJobQueue's nullable dataclass fields), so an "unleased" claim still needs
@@ -336,7 +432,11 @@ class PostgresJobQueue:
         always use claim_next_with_lease (see app/services/scheduler.py, which prefers
         it via `hasattr` whenever available -- true for this adapter)."""
         return await self._claim(
-            worker_capacity, kinds, lease_owner="unleased", lease_seconds=_DEFAULT_UNLEASED_LEASE_SECONDS
+            worker_capacity,
+            kinds,
+            lease_owner="unleased",
+            lease_seconds=_DEFAULT_UNLEASED_LEASE_SECONDS,
+            max_active_per_user=max_active_per_user,
         )
 
     async def claim_next_with_lease(
@@ -345,15 +445,21 @@ class PostgresJobQueue:
         lease_owner: str,
         lease_seconds: float,
         kinds: frozenset[str] | None = None,
+        max_active_per_user: int = 0,
     ) -> list[QueuedJob]:
-        return await self._claim(worker_capacity, kinds, lease_owner=lease_owner, lease_seconds=lease_seconds)
+        return await self._claim(
+            worker_capacity,
+            kinds,
+            lease_owner=lease_owner,
+            lease_seconds=lease_seconds,
+            max_active_per_user=max_active_per_user,
+        )
 
     async def list_active(self) -> list[QueuedJob]:
         async with self.session_factory() as session:
             result = await session.execute(
                 text(
-                    _SELECT_JOB_WITH_LATEST_ATTEMPT
-                    + " WHERE g.state IN ('dispatched', 'running')"
+                    _SELECT_JOB_WITH_LATEST_ATTEMPT + " WHERE g.state IN ('dispatched', 'running')"
                 )
             )
             return [_row_to_queued_job(row) for row in result.fetchall()]
@@ -361,31 +467,27 @@ class PostgresJobQueue:
     async def mark_running(self, job_id: uuid.UUID) -> None:
         async with self.session_factory() as session, session.begin():
             await session.execute(
-                text(
-                    """
+                text("""
                         UPDATE generation_jobs
                         SET state = 'running', started_at = now()
                         WHERE id = :id AND state NOT IN :terminal
-                        """
-                ).bindparams(bindparam("terminal", expanding=True)),
+                        """).bindparams(bindparam("terminal", expanding=True)),
                 {"id": job_id, "terminal": list(_TERMINAL_STATES)},
             )
-                # No stale-prompt_id clear needed here (unlike InMemoryJobQueue) -- the
-                # current attempt's job_attempts row already has comfy_prompt_id = NULL
-                # until set_prompt_id() is called for THIS attempt_no; a prior attempt's
-                # prompt_id lives on a DIFFERENT row entirely. See module docstring.
+            # No stale-prompt_id clear needed here (unlike InMemoryJobQueue) -- the
+            # current attempt's job_attempts row already has comfy_prompt_id = NULL
+            # until set_prompt_id() is called for THIS attempt_no; a prior attempt's
+            # prompt_id lives on a DIFFERENT row entirely. See module docstring.
 
     async def mark_succeeded(self, job_id: uuid.UUID, result: dict) -> None:
         async with self.session_factory() as session, session.begin():
             updated = await session.execute(
-                text(
-                    """
+                text("""
                         UPDATE generation_jobs
                         SET state = 'succeeded', finished_at = now()
                         WHERE id = :id AND state NOT IN :terminal
                         RETURNING id
-                        """
-                ).bindparams(bindparam("terminal", expanding=True)),
+                        """).bindparams(bindparam("terminal", expanding=True)),
                 {"id": job_id, "terminal": list(_TERMINAL_STATES)},
             )
             if updated.first() is None:
@@ -400,15 +502,13 @@ class PostgresJobQueue:
     ) -> None:
         async with self.session_factory() as session, session.begin():
             updated = await session.execute(
-                text(
-                    """
+                text("""
                         UPDATE generation_jobs
                         SET state = 'failed', finished_at = now(),
                             error_code = :error_code, error_detail_sanitized = :error_detail
                         WHERE id = :id AND state NOT IN :terminal
                         RETURNING id
-                        """
-                ).bindparams(bindparam("terminal", expanding=True)),
+                        """).bindparams(bindparam("terminal", expanding=True)),
                 {
                     "id": job_id,
                     "terminal": list(_TERMINAL_STATES),
@@ -430,15 +530,13 @@ class PostgresJobQueue:
     ) -> None:
         async with self.session_factory() as session, session.begin():
             updated = await session.execute(
-                text(
-                    """
+                text("""
                     UPDATE generation_jobs
                     SET state = 'retry_wait', current_attempt = current_attempt + 1,
                         error_code = :error_code, error_detail_sanitized = :error_detail
                     WHERE id = :id AND state NOT IN :terminal
                     RETURNING id
-                    """
-                ).bindparams(bindparam("terminal", expanding=True)),
+                    """).bindparams(bindparam("terminal", expanding=True)),
                 {
                     "id": job_id,
                     "terminal": list(_TERMINAL_STATES),
@@ -452,22 +550,23 @@ class PostgresJobQueue:
                 session, job_id, state="retry_wait", finished=True, error_code=error_code
             )
             await self._append_event(
-                session, job_id, "job_retry_scheduled", {"error_code": error_code, "detail": error_detail}
+                session,
+                job_id,
+                "job_retry_scheduled",
+                {"error_code": error_code, "detail": error_detail},
             )
 
     async def set_prompt_id(self, job_id: uuid.UUID, prompt_id: str) -> None:
         async with self.session_factory() as session, session.begin():
             await session.execute(
-                text(
-                    """
+                text("""
                         UPDATE job_attempts
                         SET comfy_prompt_id = :prompt_id
                         WHERE job_id = :job_id
                           AND attempt_no = (
                               SELECT max(attempt_no) FROM job_attempts WHERE job_id = :job_id
                           )
-                        """
-                ),
+                        """),
                 {"job_id": job_id, "prompt_id": prompt_id},
             )
 
@@ -477,14 +576,12 @@ class PostgresJobQueue:
         # running->cancelling->cancelled path.
         async with self.session_factory() as session, session.begin():
             updated = await session.execute(
-                text(
-                    """
+                text("""
                         UPDATE generation_jobs
                         SET state = 'cancelled', cancel_requested_at = now(), finished_at = now()
                         WHERE id = :id AND state NOT IN :terminal
                         RETURNING id
-                        """
-                ).bindparams(bindparam("terminal", expanding=True)),
+                        """).bindparams(bindparam("terminal", expanding=True)),
                 {"id": job_id, "terminal": list(_TERMINAL_STATES)},
             )
             if updated.first() is None:
@@ -506,23 +603,112 @@ class PostgresJobQueue:
             row = result.first()
             return _row_to_queued_job(row) if row is not None else None
 
+    async def count_user_backlog(self, user_id: uuid.UUID) -> int:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                text("""
+                    SELECT count(*) FROM generation_jobs
+                    WHERE user_id = :user_id AND state IN :backlog_states
+                    """).bindparams(bindparam("backlog_states", expanding=True)),
+                {"user_id": user_id, "backlog_states": list(_BACKLOG_STATES)},
+            )
+            return int(result.scalar_one())
+
+    async def count_global_backlog(self) -> int:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                text(
+                    "SELECT count(*) FROM generation_jobs WHERE state IN :backlog_states"
+                ).bindparams(bindparam("backlog_states", expanding=True)),
+                {"backlog_states": list(_BACKLOG_STATES)},
+            )
+            return int(result.scalar_one())
+
+    async def count_backlog_for_kinds(self, kinds: frozenset[str] | None = None) -> int:
+        kinds_clause = "AND kind IN :kinds" if kinds is not None else ""
+        stmt = text(f"""
+            SELECT count(*) FROM generation_jobs
+            WHERE state IN :backlog_states
+            {kinds_clause}
+            """).bindparams(bindparam("backlog_states", expanding=True))
+        params: dict[str, Any] = {"backlog_states": list(_BACKLOG_STATES)}
+        if kinds is not None:
+            stmt = stmt.bindparams(bindparam("kinds", expanding=True))
+            params["kinds"] = list(kinds)
+        async with self.session_factory() as session:
+            result = await session.execute(stmt, params)
+            return int(result.scalar_one())
+
+    async def queue_rank(
+        self, job_id: uuid.UUID, kinds: frozenset[str] | None = None
+    ) -> int | None:
+        """Precise, aging-aware position: counts same-`kinds` backlog rows that rank
+        AHEAD of `job_id` under the exact same `priority + age_minutes * aging_increment`
+        formula `_claim` itself orders by (see that method's "Fairness/aging" note in the
+        module docstring) -- deliberately NOT just `effective_priority` (the static
+        column stamped at enqueue time), since that would drift from the real claim
+        order as jobs age differently. Two round-trips (fetch the target row, then count
+        against it) rather than one self-join query, for readability -- this is a
+        read-only status lookup on the GET /v1/jobs/{id} hot path, not claim-time
+        contention-sensitive code, so the extra round-trip is a fine trade."""
+        async with self.session_factory() as session:
+            target = (
+                await session.execute(
+                    text("SELECT state, priority, queued_at FROM generation_jobs WHERE id = :id"),
+                    {"id": job_id},
+                )
+            ).first()
+            if target is None or target.state not in _BACKLOG_STATES:
+                return None
+
+            kinds_clause = "AND kind IN :kinds" if kinds is not None else ""
+            stmt = text(f"""
+                SELECT count(*) FROM generation_jobs
+                WHERE state IN :backlog_states
+                {kinds_clause}
+                AND (
+                    (priority + (extract(epoch from (now() - queued_at)) / 60.0)
+                        * :aging_increment)
+                    > (:target_priority + (extract(epoch from (now() - :target_queued_at)) / 60.0)
+                        * :aging_increment)
+                    OR (
+                        (priority + (extract(epoch from (now() - queued_at)) / 60.0)
+                            * :aging_increment)
+                        = (:target_priority + (extract(epoch from (now() - :target_queued_at)) / 60.0)
+                            * :aging_increment)
+                        AND queued_at < :target_queued_at
+                    )
+                )
+                """).bindparams(bindparam("backlog_states", expanding=True))
+            params: dict[str, Any] = {
+                "backlog_states": list(_BACKLOG_STATES),
+                "aging_increment": _AGING_INCREMENT_PER_MINUTE,
+                "target_priority": target.priority,
+                "target_queued_at": target.queued_at,
+            }
+            if kinds is not None:
+                stmt = stmt.bindparams(bindparam("kinds", expanding=True))
+                params["kinds"] = list(kinds)
+            result = await session.execute(stmt, params)
+            return int(result.scalar_one())
+
     # -- internal helpers -----------------------------------------------------------
 
-    async def _append_event(self, session, job_id: uuid.UUID, event_type: str, payload: dict) -> None:
+    async def _append_event(
+        self, session, job_id: uuid.UUID, event_type: str, payload: dict
+    ) -> None:
         # See enqueue()'s comment on bindparam(type_=JSONB) -- same fix needed here,
         # and this one helper is shared by every mark_*/cancel/claim call site, so this
         # single bindparams() call was the fix for 7 of the 8 failing integration tests.
         await session.execute(
-            text(
-                """
+            text("""
                 INSERT INTO job_events (job_id, sequence_no, event_type, payload)
                 VALUES (
                     :job_id,
                     coalesce((SELECT max(sequence_no) FROM job_events WHERE job_id = :job_id), 0) + 1,
                     :event_type, :payload
                 )
-                """
-            ).bindparams(bindparam("payload", type_=JSONB)),
+                """).bindparams(bindparam("payload", type_=JSONB)),
             {"job_id": job_id, "event_type": event_type, "payload": payload},
         )
 
@@ -549,14 +735,12 @@ class PostgresJobQueue:
         if extra_metrics is not None:
             set_clauses.append("metrics = metrics || :extra_metrics")
             params["extra_metrics"] = extra_metrics
-        stmt = text(
-            f"""
+        stmt = text(f"""
             UPDATE job_attempts
             SET {", ".join(set_clauses)}
             WHERE job_id = :job_id
               AND attempt_no = (SELECT max(attempt_no) FROM job_attempts WHERE job_id = :job_id)
-            """
-        )
+            """)
         if extra_metrics is not None:
             # See enqueue()'s comment on bindparam(type_=JSONB) -- same fix, needed here
             # too since `metrics || :extra_metrics` is a jsonb || jsonb concat and

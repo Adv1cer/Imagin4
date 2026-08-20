@@ -70,6 +70,28 @@ def list_workflows() -> list[WorkflowDefinition]:
     return list(_REGISTRY.values())
 
 
+def backend_for_kind(kind: str) -> str | None:
+    """The backend ("comfyui"/"gemini") that `kind` (== workflow name, e.g.
+    QueuedJob.kind) routes to -- the reverse direction of kinds_for_backend, needed by
+    the 2026-08-20 queue_position/estimated_wait_seconds feature (see
+    app/domain/jobs/admission.py:estimate_wait_seconds and GET /v1/jobs/{id} in
+    app/api/v1/jobs.py) to pick the right capacity divisor
+    (Settings.default_comfy_active_slots vs default_gemini_active_slots) for a given
+    job. Same "only ever look at whichever definition is registered, multiple versions
+    disagreeing on backend isn't supported" simplifying assumption as kinds_for_backend
+    and CompositeComfyUIClient._resolve_backend above -- picks the first match.
+
+    Returns None if `kind` isn't a registered workflow name at all. Callers reach this
+    well after app/domain/jobs/admission.py's own resolve_workflow validation already
+    accepted the kind, so None here should not normally happen in practice -- treat it
+    defensively (skip the ETA fields) rather than raising.
+    """
+    for w in _REGISTRY.values():
+        if w.name == kind:
+            return w.backend
+    return None
+
+
 def kinds_for_backend(backend: str) -> frozenset[str]:
     """All registered workflow *names* (== QueuedJob.kind) whose current version routes
     to `backend` ("comfyui" or "gemini") -- used by app/services/scheduler.py to claim

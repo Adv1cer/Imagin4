@@ -65,20 +65,61 @@ class Settings(BaseSettings):
     def cors_allow_origins(self) -> list[str]:
         return [o.strip() for o in self.cors_allow_origins_csv.split(",") if o.strip()]
 
-    # Admission / fairness defaults
+    # Admission / fairness defaults.
+    #
+    # Enforcement status (2026-08-20, see app/domain/jobs/admission.py's
+    # CapacityExceededError docstring): max_queued_jobs_per_user and global_queue_cap
+    # ARE enforced, at admission time -- a new job is rejected (CapacityExceededError,
+    # mapped to HTTP 429) if it would push either counter over its limit. This is what
+    # stops one user's large batch of jobs from sitting ahead of every other user's jobs
+    # in Scheduler._claim's queued_at-ordered claim query indefinitely: capped backlog
+    # size means a heavy user must wait for their own jobs to clear before submitting
+    # more, self-throttling instead of crowding everyone else out. <= 0 disables the
+    # respective check entirely (unlimited).
+    #
+    # max_active_jobs_per_user (2026-08-20, added same day as the two above): enforced
+    # at CLAIM time, not admission -- Scheduler._claim_for_backend passes this value as
+    # JobQueue.claim_next_with_lease's `max_active_per_user`, which skips a candidate
+    # job whose user already has this many jobs in dispatched/running state (see that
+    # param's docstring, and app/adapters/queue/postgres.py's `_claim` for the SQL --
+    # tested against a real local Postgres 16, including a concurrent-claim race test,
+    # given that method's documented history of subtle concurrency bugs). Matters most
+    # once GPU concurrency > 1 (see default_comfy_active_slots above) or for the Gemini
+    # lane (default_gemini_active_slots=3) -- at ComfyUI concurrency 1 there's only ever
+    # one active job for ANYONE at a time regardless of this setting.
     max_active_jobs_per_user: int = 1
     max_queued_jobs_per_user: int = 3
     global_queue_cap: int = 5000
+    # Rough ETA estimate powering GenerationOut/JobOut's `estimated_wait_seconds`
+    # (2026-08-20, see app/domain/jobs/admission.py:estimate_wait_seconds) --
+    # `(queue_position // active_slots_for_backend) * estimated_job_duration_s`. This is
+    # NOT measured from real completion times anywhere in this codebase yet, just a flat
+    # per-job assumption -- 60s is a rough placeholder for one ComfyUI txt2img/img2img
+    # job at the default comfy_steps=20. Benchmark your own actual wall-clock time per
+    # job (see default_comfy_active_slots' comment above re: DGX Spark GPU-contention
+    # benchmarking) and tune this to match your deployment. Deliberately a single knob,
+    # not split per-backend (a Gemini poster job likely takes a different real duration
+    # than a ComfyUI one) -- this is meant to be "better than silence" for a client
+    # deciding whether to wait or come back later, not a scheduling promise.
+    estimated_job_duration_s: float = 60.0
     # How many image_basic jobs the scheduler may claim+dispatch concurrently. Only
     # meaningful up to how many independent ComfyUI execution engines actually exist to
     # run them -- see comfy_worker_base_urls_csv above. With a single ComfyUI process
     # (comfy_worker_base_urls_csv empty), keep this at 1 until benchmarked otherwise: a
     # single GPU can't run two full generations in parallel just because two jobs were
-    # dispatched to the same process. With N workers configured, this can go up to N (one
-    # in-flight job per worker) -- but per the same single-GPU caveat, if those N workers
-    # share one physical GPU, more concurrent jobs does not mean proportionally faster
-    # completion, only more overlap of otherwise-idle time (I/O, model loading, etc.).
-    # Benchmark actual wall-clock throughput at each step rather than assuming.
+    # dispatched to the same process. With N workers configured, this can in principle go
+    # up to N (one in-flight job per worker) -- but per the same single-GPU caveat, if
+    # those N workers share one physical GPU, more concurrent jobs does not mean
+    # proportionally faster completion, only more overlap of otherwise-idle time (I/O,
+    # model loading, etc.). Benchmark actual wall-clock throughput at each step rather
+    # than assuming.
+    #
+    # Hard ceiling, not just a suggestion (2026-08-20): Scheduler._reserve_capacity_by_
+    # backend now clamps live/postgres-mode capacity to this value too (previously it only
+    # summed each online comfy_workers row's slots, uncapped -- see that method's
+    # docstring for the "Gap closed" note and the ~5x step-time regression that showed up
+    # on Chet's DGX Spark when 2 workers sharing one GB10 sampled at the same time). Only
+    # raise this past 1 after confirming your workers don't actually share a physical GPU.
     default_comfy_active_slots: int = 1
     # SEPARATE from the ComfyUI slot count above on purpose: ComfyUI dispatch is
     # GPU-bound (one local device, one job at a time until benchmarked otherwise -- see
@@ -348,8 +389,37 @@ class Settings(BaseSettings):
     # Redis across every API replica), not per-process: size it to the shared PgBouncer/
     # Postgres capacity (pgbouncer DEFAULT_POOL_SIZE in docker-compose.yml), not to a
     # single replica's own db_pool_size + db_max_overflow. 0 disables the gate.
+    # Preview/final two-stage generation (2026-08-20, see PR discussion following
+    # Chet's 100-user architecture proposal: "separate preview (low steps/resolution,
+    # fast/distilled model) vs final (full quality) generation"). See
+    # app/domain/jobs/admission.py:admit_generation_job's `inputs.preview` handling and
+    # POST /v1/generations/{id}/finalize in app/api/v1/generations.py for the actual
+    # flow. SCOPE NOTE, read before assuming this matches the full proposal: this only
+    # fast-forwards the STEPS knob (an existing, allowlisted per-request override --
+    # see app/domain/jobs/comfy_overrides.py) down to preview_steps. It deliberately
+    # does NOT touch resolution/width/height (no such knob is plumbed through to the
+    # ComfyUI graph builder anywhere in this codebase -- app/adapters/comfyui/live.py's
+    # graph templates are fixed-resolution) and does NOT lock a random seed for
+    # preview/final visual consistency (no seed control exists in ComfyProfile
+    # either) -- both would require real ComfyUI-graph surgery, deliberately out of
+    # scope for this increment. A preview and its later finalize therefore render the
+    # SAME prompt at DIFFERENT random seeds, not a visually-identical-but-lower-quality
+    # pair -- documented here as an explicit, known trade-off, not a bug to silently
+    # "fix" later without planning the graph change (width/height + seed passthrough)
+    # first.
+    preview_enabled: bool = True
+    preview_steps: int = 6
+
     admission_max_inflight: int = 150
     admission_gate_ttl_s: int = 60
+    # `Retry-After` header value on the 503 AdmissionGate itself returns (2026-08-20,
+    # see app/api/deps.py:check_admission_capacity) -- deliberately a small FIXED
+    # guess, not derived from admission_gate_ttl_s (that's how long a LEAKED/stale
+    # counter takes to self-heal, an unrelated worst case -- see AdmissionGate's own
+    # docstring). Under normal operation the in-flight counter churns as fast as
+    # requests complete, so a short fixed retry is the right advice almost all the
+    # time; a client that's still shed after retrying can simply retry again.
+    admission_gate_retry_after_s: int = 5
 
 
 @lru_cache

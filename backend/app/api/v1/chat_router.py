@@ -81,8 +81,10 @@ from app.domain.chat.routing import (
     parse_route_decision,
 )
 from app.domain.jobs.admission import (
+    CapacityExceededError,
     IdempotencyConflictError,
     InvalidComfyOverrideError,
+    PreviewNotSupportedError,
     UnknownModelProfileError,
     UnknownWorkflowError,
     admit_generation_job,
@@ -162,9 +164,7 @@ class SmartMessageOut(BaseModel):
 # Settings.brain_backend actually has active -- the two sets never overlap (qwen_* vs
 # gemini_* prefixes), so the union is always safe.
 _OVERLOAD_REASONS = GEMINI_OVERLOAD_ERROR_CODES | QWEN_OVERLOAD_ERROR_CODES
-_OVERLOAD_CLARIFICATION_QUESTION = (
-    "ขอโทษค่ะ ตอนนี้ระบบ AI มีผู้ใช้งานหนาแน่นชั่วคราว กรุณาลองส่งข้อความเดิมอีกครั้งในอีกสักครู่นะคะ 🙏"
-)
+_OVERLOAD_CLARIFICATION_QUESTION = "ขอโทษค่ะ ตอนนี้ระบบ AI มีผู้ใช้งานหนาแน่นชั่วคราว กรุณาลองส่งข้อความเดิมอีกครั้งในอีกสักครู่นะคะ 🙏"
 _GENERIC_CLARIFICATION_QUESTION = (
     "ขอโทษค่ะ ตอนนี้ระบบแยกแยะคำขอไม่ได้ ช่วยบอกอีกครั้งได้ไหมคะว่าต้องการแชทคุยเฉยๆ, "
     "สร้างภาพทั่วไป, ทำโปสเตอร์ หรือทำอินโฟกราฟิกคะ?"
@@ -182,7 +182,9 @@ def _fallback_clarification(reason: str) -> RouteDecision:
     process_routed_message's except-block, which is the only caller that can produce the
     latter."""
     question = (
-        _OVERLOAD_CLARIFICATION_QUESTION if reason in _OVERLOAD_REASONS else _GENERIC_CLARIFICATION_QUESTION
+        _OVERLOAD_CLARIFICATION_QUESTION
+        if reason in _OVERLOAD_REASONS
+        else _GENERIC_CLARIFICATION_QUESTION
     )
     return RouteDecision(
         intent=Intent.CLARIFICATION,
@@ -391,10 +393,25 @@ async def process_routed_message(
                 # user message -> one job, replay-safe on retry.
                 idempotency_key=f"router-general-image-{user_msg.id}",
             )
+        except CapacityExceededError as exc:
+            # Expected/load-dependent, not a bug -- see CapacityExceededError's
+            # docstring. logger.info, not .error, so this doesn't page anyone.
+            logger.info(
+                "chat_router: image_basic admission capacity-limited (assume_image) "
+                "conv=%s reason=%s",
+                conv.id,
+                exc.reason,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=exc.reason,
+                headers={"Retry-After": str(exc.retry_after_s)},
+            )
         except (
             UnknownWorkflowError,
             UnknownModelProfileError,
             InvalidComfyOverrideError,
+            PreviewNotSupportedError,
             IdempotencyConflictError,
         ):
             logger.error(
@@ -408,7 +425,13 @@ async def process_routed_message(
         return SmartMessageOut(
             type="image_job",
             user_message=MessageOut.from_model(user_msg),
-            job=GenerationOut(id=result.id, state=result.state, kind=result.kind),
+            job=GenerationOut(
+                id=result.id,
+                state=result.state,
+                kind=result.kind,
+                queue_position=result.queue_position,
+                estimated_wait_seconds=result.estimated_wait_seconds,
+            ),
         )
 
     history = await _load_history(session, conv.id)
@@ -432,7 +455,9 @@ async def process_routed_message(
         # small, controlled set of safe codes, never raw exception/response text, so
         # matching on it here doesn't violate the "no raw exception text" rule.
         sanitized_code = str(exc) if isinstance(exc, RuntimeError) else ""
-        validation_outcome = sanitized_code if sanitized_code in _OVERLOAD_REASONS else "llm_call_failed"
+        validation_outcome = (
+            sanitized_code if sanitized_code in _OVERLOAD_REASONS else "llm_call_failed"
+        )
         logger.warning(
             "chat_router: routing call failed conv=%s user=%s error_category=%s sanitized=%s",
             conv.id,
@@ -510,12 +535,24 @@ async def process_routed_message(
                 # enqueueing a second one for what was really one user action.
                 idempotency_key=f"router-general-image-{user_msg.id}",
             )
+        except CapacityExceededError as exc:
+            logger.info(
+                "chat_router: image_basic admission capacity-limited conv=%s reason=%s",
+                conv.id,
+                exc.reason,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=exc.reason,
+                headers={"Retry-After": str(exc.retry_after_s)},
+            )
         except (
-        UnknownWorkflowError,
-        UnknownModelProfileError,
-        InvalidComfyOverrideError,
-        IdempotencyConflictError,
-    ):
+            UnknownWorkflowError,
+            UnknownModelProfileError,
+            InvalidComfyOverrideError,
+            PreviewNotSupportedError,
+            IdempotencyConflictError,
+        ):
             logger.error("chat_router: image_basic admission failed unexpectedly conv=%s", conv.id)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -524,7 +561,13 @@ async def process_routed_message(
         return SmartMessageOut(
             type="image_job",
             user_message=MessageOut.from_model(user_msg),
-            job=GenerationOut(id=result.id, state=result.state, kind=result.kind),
+            job=GenerationOut(
+                id=result.id,
+                state=result.state,
+                kind=result.kind,
+                queue_position=result.queue_position,
+                estimated_wait_seconds=result.estimated_wait_seconds,
+            ),
         )
 
     # EnqueuePaidImage -- POSTER or INFOGRAPHIC. Enqueued immediately, no chat
@@ -548,10 +591,23 @@ async def process_routed_message(
             # enqueueing (and billing) a second one for what was really one user action.
             idempotency_key=f"router-paid-image-{user_msg.id}",
         )
+    except CapacityExceededError as exc:
+        logger.info(
+            "chat_router: %s admission capacity-limited conv=%s reason=%s",
+            workflow_name,
+            conv.id,
+            exc.reason,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=exc.reason,
+            headers={"Retry-After": str(exc.retry_after_s)},
+        )
     except (
         UnknownWorkflowError,
         UnknownModelProfileError,
         InvalidComfyOverrideError,
+        PreviewNotSupportedError,
         IdempotencyConflictError,
     ):
         logger.error(
@@ -572,7 +628,13 @@ async def process_routed_message(
     return SmartMessageOut(
         type="image_job",
         user_message=MessageOut.from_model(user_msg),
-        job=GenerationOut(id=result.id, state=result.state, kind=result.kind),
+        job=GenerationOut(
+            id=result.id,
+            state=result.state,
+            kind=result.kind,
+            queue_position=result.queue_position,
+            estimated_wait_seconds=result.estimated_wait_seconds,
+        ),
     )
 
 
@@ -770,10 +832,22 @@ async def confirm_pending_action(
             # returns the same job rather than creating a second paid generation.
             idempotency_key=f"pending-action-{row.id}",
         )
+    except CapacityExceededError as exc:
+        logger.info(
+            "chat_router: paid admission capacity-limited pending_action=%s reason=%s",
+            row.id,
+            exc.reason,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=exc.reason,
+            headers={"Retry-After": str(exc.retry_after_s)},
+        )
     except (
         UnknownWorkflowError,
         UnknownModelProfileError,
         InvalidComfyOverrideError,
+        PreviewNotSupportedError,
         IdempotencyConflictError,
     ):
         logger.error("chat_router: paid admission failed unexpectedly pending_action=%s", row.id)
@@ -800,7 +874,13 @@ async def confirm_pending_action(
             status="complete",
             created_at=row.created_at,
         ),
-        job=GenerationOut(id=admission.id, state=admission.state, kind=admission.kind),
+        job=GenerationOut(
+            id=admission.id,
+            state=admission.state,
+            kind=admission.kind,
+            queue_position=admission.queue_position,
+            estimated_wait_seconds=admission.estimated_wait_seconds,
+        ),
         pending_action=PendingActionOut.from_model(row),
     )
 

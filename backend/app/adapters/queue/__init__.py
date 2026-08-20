@@ -83,7 +83,10 @@ class JobQueue(Protocol):
     async def get(self, job_id: uuid.UUID) -> QueuedJob | None: ...
 
     async def claim_next(
-        self, worker_capacity: int = 1, kinds: frozenset[str] | None = None
+        self,
+        worker_capacity: int = 1,
+        kinds: frozenset[str] | None = None,
+        max_active_per_user: int = 0,
     ) -> list[QueuedJob]:
         """`kinds`, when given, restricts candidates to jobs whose `kind` is in the set --
         used by the scheduler to claim ComfyUI-backend and Gemini-backend jobs against
@@ -91,7 +94,14 @@ class JobQueue(Protocol):
         app/domain/jobs/workflow_registry.py:kinds_for_backend) so a slow Gemini
         poster/infographic job can't starve an unrelated ComfyUI job's slot or vice
         versa. None (default) means no filtering -- every existing caller keeps its
-        original behavior."""
+        original behavior.
+
+        `max_active_per_user` (2026-08-20, see Settings.max_active_jobs_per_user's
+        docstring): when > 0, a candidate whose user already has that many jobs in
+        `dispatched`/`running` state -- counting jobs claimed earlier in THIS SAME batch
+        too -- is skipped in favor of the next candidate, so one user can't take every
+        slot in a single claim tick. 0 (default) disables this -- unlimited, matching
+        every existing caller's original behavior."""
         ...
 
     async def claim_next_with_lease(
@@ -100,12 +110,13 @@ class JobQueue(Protocol):
         lease_owner: str,
         lease_seconds: float,
         kinds: frozenset[str] | None = None,
+        max_active_per_user: int = 0,
     ) -> list[QueuedJob]:
         """Fairness-ordered claim (same selection as claim_next, including the same
-        `kinds` filter) that additionally stamps a lease_owner/lease_expires_at on each
-        claimed job, so a reconciler can later find dispatched/running jobs whose lease
-        expired without a heartbeat/finalization (crashed scheduler, worker, or lost
-        connection to ComfyUI)."""
+        `kinds` filter and `max_active_per_user` cap) that additionally stamps a
+        lease_owner/lease_expires_at on each claimed job, so a reconciler can later find
+        dispatched/running jobs whose lease expired without a heartbeat/finalization
+        (crashed scheduler, worker, or lost connection to ComfyUI)."""
         ...
 
     async def list_active(self) -> list[QueuedJob]:
@@ -143,6 +154,51 @@ class JobQueue(Protocol):
 
     async def cancel(self, job_id: uuid.UUID) -> bool: ...
 
+    async def count_user_backlog(self, user_id: uuid.UUID) -> int:
+        """How many of this user's OWN jobs currently sit in `queued`/`retry_wait` --
+        what app/domain/jobs/admission.py checks against
+        Settings.max_queued_jobs_per_user before admitting a NEW job (2026-08-20, see
+        CapacityExceededError's docstring there). Deliberately excludes
+        `dispatched`/`running` (Settings.max_active_jobs_per_user is a separate,
+        not-yet-enforced concern -- see that exception's docstring for why)."""
+        ...
+
+    async def count_global_backlog(self) -> int:
+        """Same as count_user_backlog but system-wide, across every user -- what
+        Settings.global_queue_cap bounds."""
+        ...
+
+    async def count_backlog_for_kinds(self, kinds: frozenset[str] | None = None) -> int:
+        """Same `queued`/`retry_wait` backlog count as count_global_backlog, but scoped
+        to `kinds` (None = every kind, matching count_global_backlog exactly) -- used by
+        app/domain/jobs/admission.py's `estimate_wait_seconds` at ADMISSION time to give
+        a brand-new job a `queue_position` before it has a row of its own to rank
+        against (2026-08-20): since every job here is enqueued with priority=0 (pure
+        FIFO within a backend lane), a new job always lands at the back, so "how many
+        same-backend jobs are already queued/retry_wait" IS its position. See
+        `queue_rank` below for the precise, aging-aware LIVE lookup used once the job
+        actually has a row (GET /v1/jobs/{id})."""
+        ...
+
+    async def queue_rank(
+        self, job_id: uuid.UUID, kinds: frozenset[str] | None = None
+    ) -> int | None:
+        """0-indexed count of same-`kinds` `queued`/`retry_wait` jobs that would be
+        claimed BEFORE `job_id` under this queue's own real claim ordering (i.e. the
+        same effective-priority-then-queued_at comparison `claim_next` itself uses --
+        see each adapter's implementation for exactly which ordering that is, since
+        InMemoryJobQueue and PostgresJobQueue don't compute it identically, per
+        app/adapters/queue/postgres.py's module docstring "Fairness/aging" note).
+        `kinds` should be the caller's own backend's kind set (see
+        workflow_registry.kinds_for_backend) so a Gemini job's position isn't inflated
+        by unrelated ComfyUI jobs sharing the same global backlog, or vice versa.
+
+        Returns None if `job_id` doesn't exist, or exists but is no longer in
+        `queued`/`retry_wait` state (already dispatched/running/terminal -- "position in
+        the queue" is meaningless once a job has left it; callers should omit the ETA
+        fields entirely in that case rather than showing a stale number)."""
+        ...
+
 
 class InMemoryJobQueue:
     """Deterministic in-memory JobQueue. Not thread-safe across processes (fine for
@@ -161,7 +217,10 @@ class InMemoryJobQueue:
         return self._jobs.get(job_id)
 
     async def claim_next(
-        self, worker_capacity: int = 1, kinds: frozenset[str] | None = None
+        self,
+        worker_capacity: int = 1,
+        kinds: frozenset[str] | None = None,
+        max_active_per_user: int = 0,
     ) -> list[QueuedJob]:
         claimed: list[QueuedJob] = []
         candidates = sorted(
@@ -172,9 +231,24 @@ class InMemoryJobQueue:
             ),
             key=lambda j: (-j.effective_priority, j.queued_at),
         )
-        for job in candidates[:worker_capacity]:
+        # Pre-existing (dispatched/running) counts, PLUS whatever this same call claims
+        # below -- see the Protocol docstring's "counting jobs claimed earlier in THIS
+        # SAME batch too" note, otherwise a user with 3 queued jobs and capacity=3 would
+        # still get all 3 in one tick even with max_active_per_user=1.
+        active_counts: dict[uuid.UUID, int] = {}
+        if max_active_per_user > 0:
+            for j in self._jobs.values():
+                if j.state in ("dispatched", "running"):
+                    active_counts[j.user_id] = active_counts.get(j.user_id, 0) + 1
+        for job in candidates:
+            if len(claimed) >= worker_capacity:
+                break
+            if max_active_per_user > 0 and active_counts.get(job.user_id, 0) >= max_active_per_user:
+                continue
             job.state = "dispatched"
             claimed.append(job)
+            if max_active_per_user > 0:
+                active_counts[job.user_id] = active_counts.get(job.user_id, 0) + 1
         return claimed
 
     async def claim_next_with_lease(
@@ -183,8 +257,11 @@ class InMemoryJobQueue:
         lease_owner: str,
         lease_seconds: float,
         kinds: frozenset[str] | None = None,
+        max_active_per_user: int = 0,
     ) -> list[QueuedJob]:
-        claimed = await self.claim_next(worker_capacity, kinds=kinds)
+        claimed = await self.claim_next(
+            worker_capacity, kinds=kinds, max_active_per_user=max_active_per_user
+        )
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
         for job in claimed:
             job.lease_owner = lease_owner
@@ -269,4 +346,45 @@ class InMemoryJobQueue:
                 and job.kind == kind
             ):
                 return job
+        return None
+
+    _BACKLOG_STATES = frozenset({"queued", "retry_wait"})
+
+    async def count_user_backlog(self, user_id: uuid.UUID) -> int:
+        return sum(
+            1
+            for j in self._jobs.values()
+            if j.user_id == user_id and j.state in self._BACKLOG_STATES
+        )
+
+    async def count_global_backlog(self) -> int:
+        return sum(1 for j in self._jobs.values() if j.state in self._BACKLOG_STATES)
+
+    async def count_backlog_for_kinds(self, kinds: frozenset[str] | None = None) -> int:
+        return sum(
+            1
+            for j in self._jobs.values()
+            if j.state in self._BACKLOG_STATES and (kinds is None or j.kind in kinds)
+        )
+
+    async def queue_rank(
+        self, job_id: uuid.UUID, kinds: frozenset[str] | None = None
+    ) -> int | None:
+        job = self._jobs.get(job_id)
+        if job is None or job.state not in self._BACKLOG_STATES:
+            return None
+        # Same ordering claim_next itself uses for this adapter -- the STATIC
+        # effective_priority column, not aging-recomputed (see module docstring's
+        # "Fairness/aging" note on PostgresJobQueue for how that adapter differs).
+        candidates = sorted(
+            (
+                j
+                for j in self._jobs.values()
+                if j.state in self._BACKLOG_STATES and (kinds is None or j.kind in kinds)
+            ),
+            key=lambda j: (-j.effective_priority, j.queued_at),
+        )
+        for idx, j in enumerate(candidates):
+            if j.id == job_id:
+                return idx
         return None

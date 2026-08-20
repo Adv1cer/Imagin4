@@ -17,7 +17,7 @@ from app.adapters.comfyui import ComfyUIClient
 from app.adapters.queue import JobQueue
 from app.adapters.storage import ObjectStorage
 from app.core.config import Settings, get_settings
-from app.core.rate_limit import AdmissionGate, check_rate_limit
+from app.core.rate_limit import AdmissionGate, check_rate_limit, seconds_until_window_reset
 from app.db.models import ApiKey, AuthSession, User
 from app.domain.auth.api_keys import KEY_PREFIX, hash_api_key, is_api_key_active
 from app.domain.auth.sessions import hash_token, is_session_valid
@@ -80,9 +80,15 @@ async def check_admission_capacity(request: Request) -> AsyncIterator[None]:
         yield
         return
     if not await gate.try_acquire():
+        # Retry-After (2026-08-20, see Settings.admission_gate_retry_after_s' docstring
+        # for why this is a small fixed guess rather than derived from the gate's TTL) --
+        # previously this 503 gave a client no signal at all for how long to back off,
+        # same gap CapacityExceededError closed for the per-user/global queue caps (see
+        # app/domain/jobs/admission.py).
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server is at capacity, please retry shortly",
+            headers={"Retry-After": str(get_settings().admission_gate_retry_after_s)},
         )
     try:
         yield
@@ -111,9 +117,14 @@ def rate_limited(scope: str, limit_attr: str) -> Callable:
             window_seconds=60,
         )
         if not allowed:
+            # Retry-After (2026-08-20, see app/core/rate_limit.py:seconds_until_window_
+            # reset's docstring) -- this is a FIXED-WINDOW limiter, so "how long until
+            # you can retry" has an exact answer (time left in the current window), not
+            # a guess like AdmissionGate's 503 above.
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many requests, please slow down",
+                headers={"Retry-After": str(seconds_until_window_reset(60))},
             )
 
     return _dependency

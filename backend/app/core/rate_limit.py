@@ -3,11 +3,18 @@ rate limiting.
 
 Both fail OPEN if Redis is unreachable -- Redis is a soft admission optimization here,
 not the source of truth. (Postgres-side per-user/global job caps -- Settings.
-max_active_jobs_per_user / max_queued_jobs_per_user / global_queue_cap -- are meant to be
-the authoritative backstop once implemented; as of 2026-08-18 those settings exist but are
-NOT yet enforced anywhere in app/domain/jobs/admission.py -- see that module's TODO. This
-file does not fix that gap, it only fixes the gap directly responsible for the 100-VU
-burst-test incident below.)
+max_queued_jobs_per_user / global_queue_cap / max_active_jobs_per_user -- are the
+authoritative backstop and, as of 2026-08-20, ALL THREE are enforced: the first two at
+admission time in app/domain/jobs/admission.py:admit_generation_job (see
+CapacityExceededError's docstring there for the incident that closed this gap: a single
+user's large job batch could otherwise sit ahead of every other user's jobs in the
+claim-ordering queue indefinitely, since nothing capped one user's own backlog size), and
+max_active_jobs_per_user at CLAIM time in Scheduler._claim_for_backend / JobQueue.
+claim_next_with_lease's `max_active_per_user` param (app/adapters/queue/postgres.py's
+`_claim` -- tested against a real local Postgres 16, including a concurrent-claim race
+test, given that query's own documented history of concurrency bugs). This file does not
+implement any of that, it only fixes the gap directly responsible for the 100-VU
+burst-test incident below, which is unrelated to per-user fairness.)
 
 Incident context (2026-08-18): a k6 burst of 100 concurrent POST /v1/generations hit a
 single API process whose SQLAlchemy engine had only db_pool_size + db_max_overflow = 10
@@ -35,6 +42,17 @@ logger = logging.getLogger("imaginv.rate_limit")
 def rate_limit_key(scope: str, user_id: str, window_seconds: int = 60) -> str:
     window = int(time.time() // window_seconds)
     return f"rl:{scope}:{user_id}:{window}"
+
+
+def seconds_until_window_reset(window_seconds: int = 60) -> int:
+    """How long until the CURRENT fixed window (see rate_limit_key above) rolls over --
+    used as the `Retry-After` header value on a 429 from `rate_limited()` in
+    app/api/deps.py (2026-08-20: that endpoint previously returned 429 with no
+    Retry-After at all, forcing a client to guess when to retry -- see this module's
+    own docstring for the sibling fix on AdmissionGate's 503). Rounded UP (`+1`) so a
+    client that retries at exactly this many seconds from now lands just past the
+    reset instant, never one tick early into the same still-exhausted window."""
+    return window_seconds - int(time.time() % window_seconds) + 1
 
 
 async def check_rate_limit(
