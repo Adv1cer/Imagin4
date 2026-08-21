@@ -188,6 +188,13 @@ services:
   comfyui-worker-1:
     build: ./docker/comfyui-worker
     restart: unless-stopped
+    # --highvram: keep Qwen-Image / TE / VAE resident on the GPU between prompts instead
+    # of ComfyUI's default DynamicVRAM path re-"preparing" (and often partially
+    # offloading) weights on every got prompt. On a single DGX Spark worker with ~128GB
+    # unified memory this is the right trade -- the FP8 Qwen stack (~20GB UNet + ~8GB TE
+    # + VAE) fits comfortably, and subsequent jobs skip the per-prompt stage cost. Do
+    # NOT add this if you later run multiple workers that each try to keep a full copy
+    # resident on the same physical GPU (see MPS_RUNBOOK.md).
     # --user-directory: ComfyUI keeps per-instance state (notably user/comfyui.db, a
     # SQLite file) under <ComfyUI path>/user by default. Both workers bind-mount the
     # SAME host ComfyUI checkout (models/custom_nodes/output are meant to be shared),
@@ -199,7 +206,7 @@ services:
     # filesystem (not the bind mount) gives every worker private, non-conflicting state
     # -- safe to use the identical path string in both services below since each
     # container's root filesystem is already isolated from the other's.
-    command: ["--user-directory", "/opt/comfyui-user"]
+    command: ["--user-directory", "/opt/comfyui-user", "--highvram"]
     # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
     # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
     # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
@@ -242,7 +249,7 @@ services:
     build: ./docker/comfyui-worker
     restart: unless-stopped
     # See comfyui-worker-1's --user-directory comment above -- same reasoning.
-    command: ["--user-directory", "/opt/comfyui-user"]
+    command: ["--user-directory", "/opt/comfyui-user", "--highvram"]
     # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
     # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
     # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
@@ -292,7 +299,7 @@ services:
     build: ./docker/comfyui-worker
     restart: unless-stopped
     # See comfyui-worker-1's --user-directory comment above -- same reasoning.
-    command: ["--user-directory", "/opt/comfyui-user"]
+    command: ["--user-directory", "/opt/comfyui-user", "--highvram"]
     # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
     # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
     # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
@@ -335,7 +342,7 @@ services:
     build: ./docker/comfyui-worker
     restart: unless-stopped
     # See comfyui-worker-1's --user-directory comment above -- same reasoning.
-    command: ["--user-directory", "/opt/comfyui-user"]
+    command: ["--user-directory", "/opt/comfyui-user", "--highvram"]
     # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
     # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
     # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
