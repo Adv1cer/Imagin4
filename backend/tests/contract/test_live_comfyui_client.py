@@ -334,6 +334,20 @@ async def test_status_running_while_in_queue_not_yet_in_history() -> None:
 
 
 @pytest.mark.asyncio
+async def test_status_unknown_when_missing_from_history_and_queue() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/history/"):
+            return httpx.Response(200, json={})
+        if request.url.path == "/queue":
+            return httpx.Response(200, json={"queue_running": [], "queue_pending": []})
+        raise AssertionError(f"unexpected request {request.url.path}")
+
+    client = _client(handler)
+    status = await client.get_status("p1")
+    assert status.state == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_status_succeeded_downloads_image_and_stores_it() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/history/p1":

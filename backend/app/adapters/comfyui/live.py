@@ -526,12 +526,11 @@ class LiveComfyUIClient:
                 }
                 if prompt_id in all_queued_ids:
                     return ComfyStatus(prompt_id=prompt_id, state="running")
-                # Unknown to both history and queue -- treat as a transient miss (e.g. a
-                # request landed between submit() returning and ComfyUI registering the
-                # job) rather than a hard failure; the reconciler will poll again and,
-                # if this persists past the job's lease, eventually time it out via
-                # worker_lease_expired rather than us guessing wrong here.
-                return ComfyStatus(prompt_id=prompt_id, state="running")
+                # Unknown to both history and queue -- NOT "still running". Treating this
+                # as running forever left jobs stuck when ComfyUI restarted or lost the
+                # prompt (2026-08-20). Reconciler uses lease expiry on "unknown" to
+                # fail/retry; a short race after submit is covered by the still-valid lease.
+                return ComfyStatus(prompt_id=prompt_id, state="unknown")
         except Exception as exc:
             logger.exception("comfyui_live: get_status failed prompt_id=%s", prompt_id)
             # A transport/HTTP failure while polling is treated as still-running rather

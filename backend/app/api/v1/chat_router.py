@@ -392,6 +392,7 @@ async def process_routed_message(
                 # Same determinism story as the EnqueueGeneralImage branch below: one
                 # user message -> one job, replay-safe on retry.
                 idempotency_key=f"router-general-image-{user_msg.id}",
+                conversation_id=conv.id,
             )
         except CapacityExceededError as exc:
             # Expected/load-dependent, not a bug -- see CapacityExceededError's
@@ -534,6 +535,7 @@ async def process_routed_message(
                 # (e.g. after a dropped response) replays the same job instead of
                 # enqueueing a second one for what was really one user action.
                 idempotency_key=f"router-general-image-{user_msg.id}",
+                conversation_id=conv.id,
             )
         except CapacityExceededError as exc:
             logger.info(
@@ -590,6 +592,7 @@ async def process_routed_message(
             # (e.g. after a dropped response) replays the same job instead of
             # enqueueing (and billing) a second one for what was really one user action.
             idempotency_key=f"router-paid-image-{user_msg.id}",
+            conversation_id=conv.id,
         )
     except CapacityExceededError as exc:
         logger.info(
@@ -831,6 +834,7 @@ async def confirm_pending_action(
             # enqueued": a retry lands on admit_generation_job's own replay path and
             # returns the same job rather than creating a second paid generation.
             idempotency_key=f"pending-action-{row.id}",
+            conversation_id=row.conversation_id,
         )
     except CapacityExceededError as exc:
         logger.info(

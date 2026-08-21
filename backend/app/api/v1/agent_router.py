@@ -40,7 +40,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -53,10 +53,12 @@ from app.api.deps import (
     get_db_session,
     get_gemini_text_client,
     get_job_queue,
-    rate_limited,
+    get_redis,
 )
 from app.api.v1.chat_router import SmartMessageOut, process_routed_message
 from app.api.v1.conversations import _append_message
+from app.core.config import get_settings
+from app.core.rate_limit import check_rate_limit, seconds_until_window_reset
 from app.db.models import Conversation, User
 
 router = APIRouter(prefix="/agent", tags=["agent"])
@@ -203,14 +205,17 @@ async def _get_or_create_conversation_by_external_ref(
     response_model=SmartMessageOut,
     status_code=status.HTTP_202_ACCEPTED,
     # Same admit_generation_job path as smart_message -- gate it identically. See
-    # app/core/rate_limit.py.
+    # app/core/rate_limit.py. Per-user rate_limited("message") is intentionally NOT
+    # applied here: agentflow uses one shared API key for many end users, so the
+    # limit is enforced inside the handler keyed by external_conversation_id instead
+    # (2026-08-20).
     dependencies=[
         Depends(check_admission_capacity),
-        Depends(rate_limited("message", "rl_message_per_min")),
     ],
 )
 async def agent_message(
     payload: AgentMessageIn,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
     queue: JobQueue = Depends(get_job_queue),
@@ -227,6 +232,23 @@ async def agent_message(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="external_conversation_id must not be blank",
+        )
+
+    # Per end-user thread, not the shared service account -- otherwise 100–200 campus
+    # users share one rl_message bucket and hit 429 while the GPU queue is still empty.
+    settings = get_settings()
+    allowed = await check_rate_limit(
+        get_redis(request),
+        scope="message",
+        user_id=f"{user.id}:{external_ref}",
+        limit_per_window=settings.rl_message_per_min,
+        window_seconds=60,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests, please slow down",
+            headers={"Retry-After": str(seconds_until_window_reset(60))},
         )
 
     conv = await _get_or_create_conversation_by_external_ref(session, user, external_ref)

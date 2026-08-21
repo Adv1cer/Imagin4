@@ -121,6 +121,16 @@ class Settings(BaseSettings):
     # on Chet's DGX Spark when 2 workers sharing one GB10 sampled at the same time). Only
     # raise this past 1 after confirming your workers don't actually share a physical GPU.
     default_comfy_active_slots: int = 1
+    # Extra ComfyUI jobs the scheduler may have submitted beyond default_comfy_active_slots
+    # so the next prompt already sits in Comfy's queue_pending while the GPU finishes the
+    # current one (2026-08-20). Keep 0 on a single shared GB10/DGX Spark until you have
+    # measured that prefetch does not regress step time the way overlapping sampling did.
+    comfy_pending_buffer: int = 0
+    # How long a dispatched/running job with a prompt_id that Comfy no longer knows about
+    # may wait on a still-valid lease before reconciler fail/retries (see reconciler).
+    # Lease itself defaults to 120s in scheduler/reconciler constants; this setting is
+    # reserved for future stale-without-lease paths and documentation.
+    stale_running_seconds: float = 300.0
     # SEPARATE from the ComfyUI slot count above on purpose: ComfyUI dispatch is
     # GPU-bound (one local device, one job at a time until benchmarked otherwise -- see
     # default_comfy_active_slots' own caveat about single-GPU boxes), but Gemini image
@@ -410,7 +420,7 @@ class Settings(BaseSettings):
     preview_enabled: bool = True
     preview_steps: int = 6
 
-    admission_max_inflight: int = 150
+    admission_max_inflight: int = 200
     admission_gate_ttl_s: int = 60
     # `Retry-After` header value on the 503 AdmissionGate itself returns (2026-08-20,
     # see app/api/deps.py:check_admission_capacity) -- deliberately a small FIXED

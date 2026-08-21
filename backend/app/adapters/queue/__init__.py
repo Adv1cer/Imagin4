@@ -75,6 +75,14 @@ class QueuedJob:
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
     prompt_id: str | None = None
+    # Optional chat/agent conversation this job was admitted for. Used by agentflow's
+    # shared-API-key path so max_queued is enforced per end-user conversation, not the
+    # single service account (2026-08-20).
+    conversation_id: uuid.UUID | None = None
+    # Earliest time a queued/retry_wait job may be claimed -- maps to generation_jobs.
+    # available_at. mark_retry_wait sets this to now+backoff so retries are not
+    # immediately re-claimed (2026-08-20).
+    available_at: datetime | None = None
 
 
 class JobQueue(Protocol):
@@ -123,6 +131,20 @@ class JobQueue(Protocol):
         """Returns jobs currently in `dispatched` or `running` state, for reconciliation."""
         ...
 
+    async def count_active(self, kinds: frozenset[str] | None = None) -> int:
+        """How many jobs are currently `dispatched`/`running`, optionally filtered by
+        `kinds`. Used by Scheduler._reserve_capacity_by_backend so claim budget subtracts
+        in-flight work immediately instead of waiting on the 5s comfy_workers heartbeat
+        (2026-08-20 DGX Spark turnaround fix)."""
+        ...
+
+    async def renew_lease(self, job_id: uuid.UUID, lease_seconds: float) -> None:
+        """Extends lease_expires_at on the latest attempt while ComfyUI still reports
+        the job as genuinely running -- so long gens (> DEFAULT_LEASE_SECONDS) are not
+        treated as orphans, and unknown/lost prompts can still time out when the lease
+        finally expires (2026-08-20)."""
+        ...
+
     async def mark_running(self, job_id: uuid.UUID) -> None:
         """Transitions to `running` for a NEW attempt about to be dispatched. Must also
         clear any previously-set `prompt_id` -- see module docstring's "stale prompt_id"
@@ -135,7 +157,16 @@ class JobQueue(Protocol):
         (succeeded/failed/cancelled) -- see module docstring's "conditional update"
         note. A real (Postgres) implementation should express this as
         `WHERE id=:id AND state NOT IN ('succeeded','failed','cancelled')`, exactly the
-        project's documented "every transition uses a conditional update" invariant."""
+        project's documented "every transition uses a conditional update" invariant.
+
+        Must also clear `error_code`/`error_detail` back to None (2026-08-20, Chet:
+        found via the /admin load-test tool showing a red `comfy_transient` error next
+        to a job whose `state` was already `succeeded`) -- a job that failed once
+        (mark_retry_wait stamps error_code/error_detail) and then succeeded on a LATER
+        attempt would otherwise keep displaying that now-stale error forever, which
+        reads as "this succeeded job is somehow also broken" to any caller/UI that
+        naively shows `error_code` whenever it's non-null instead of gating on
+        `state == 'failed'`."""
         ...
 
     async def mark_failed(
@@ -145,9 +176,15 @@ class JobQueue(Protocol):
         ...
 
     async def mark_retry_wait(
-        self, job_id: uuid.UUID, error_code: str, error_detail: str | None = None
+        self,
+        job_id: uuid.UUID,
+        error_code: str,
+        error_detail: str | None = None,
+        delay_seconds: float | None = None,
     ) -> None:
-        """Same terminal-state guard as mark_succeeded above."""
+        """Same terminal-state guard as mark_succeeded above. When `delay_seconds` is
+        set (or computed by the adapter from backoff defaults), stamps `available_at`
+        so claim_next will not re-select this job until that time."""
         ...
 
     async def set_prompt_id(self, job_id: uuid.UUID, prompt_id: str) -> None: ...
@@ -161,6 +198,13 @@ class JobQueue(Protocol):
         CapacityExceededError's docstring there). Deliberately excludes
         `dispatched`/`running` (Settings.max_active_jobs_per_user is a separate,
         not-yet-enforced concern -- see that exception's docstring for why)."""
+        ...
+
+    async def count_conversation_backlog(self, conversation_id: uuid.UUID) -> int:
+        """Same backlog states as count_user_backlog, scoped to one conversation --
+        agentflow's shared API key admits many end users as one service account, so
+        per-user backlog would otherwise throttle the whole campus as one identity
+        (2026-08-20)."""
         ...
 
     async def count_global_backlog(self) -> int:
@@ -223,11 +267,14 @@ class InMemoryJobQueue:
         max_active_per_user: int = 0,
     ) -> list[QueuedJob]:
         claimed: list[QueuedJob] = []
+        now = datetime.now(timezone.utc)
         candidates = sorted(
             (
                 j
                 for j in self._jobs.values()
-                if j.state in ("queued", "retry_wait") and (kinds is None or j.kind in kinds)
+                if j.state in ("queued", "retry_wait")
+                and (kinds is None or j.kind in kinds)
+                and (j.available_at is None or j.available_at <= now)
             ),
             key=lambda j: (-j.effective_priority, j.queued_at),
         )
@@ -271,6 +318,19 @@ class InMemoryJobQueue:
     async def list_active(self) -> list[QueuedJob]:
         return [j for j in self._jobs.values() if j.state in ("dispatched", "running")]
 
+    async def count_active(self, kinds: frozenset[str] | None = None) -> int:
+        return sum(
+            1
+            for j in self._jobs.values()
+            if j.state in ("dispatched", "running") and (kinds is None or j.kind in kinds)
+        )
+
+    async def renew_lease(self, job_id: uuid.UUID, lease_seconds: float) -> None:
+        job = self._jobs.get(job_id)
+        if job is None or job.state not in ("dispatched", "running"):
+            return
+        job.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+
     # Terminal states: once a job reaches one of these, no further mark_* call may
     # change it -- see module docstring's "CONCURRENCY BUG FIXED HERE" note. Cheap
     # in-process equivalent of a Postgres `WHERE state NOT IN (...)` guard.
@@ -297,6 +357,12 @@ class InMemoryJobQueue:
             job.result = result
             job.lease_owner = None
             job.lease_expires_at = None
+            # Clear any error_code/error_detail left over from an earlier FAILED
+            # attempt of this same job (see the Protocol docstring's 2026-08-20 note)
+            # -- otherwise a job that failed once, then succeeded on retry, keeps
+            # showing a stale red error next to "succeeded" forever.
+            job.error_code = None
+            job.error_detail = None
 
     async def mark_failed(
         self, job_id: uuid.UUID, error_code: str, error_detail: str | None = None
@@ -312,7 +378,11 @@ class InMemoryJobQueue:
             job.lease_expires_at = None
 
     async def mark_retry_wait(
-        self, job_id: uuid.UUID, error_code: str, error_detail: str | None = None
+        self,
+        job_id: uuid.UUID,
+        error_code: str,
+        error_detail: str | None = None,
+        delay_seconds: float | None = None,
     ) -> None:
         if job_id in self._jobs:
             job = self._jobs[job_id]
@@ -324,6 +394,11 @@ class InMemoryJobQueue:
             job.current_attempt += 1
             job.lease_owner = None
             job.lease_expires_at = None
+            if delay_seconds is None:
+                from app.domain.jobs.retry import compute_backoff_seconds
+
+                delay_seconds = compute_backoff_seconds(job.current_attempt)
+            job.available_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
 
     async def set_prompt_id(self, job_id: uuid.UUID, prompt_id: str) -> None:
         if job_id in self._jobs:
@@ -355,6 +430,13 @@ class InMemoryJobQueue:
             1
             for j in self._jobs.values()
             if j.user_id == user_id and j.state in self._BACKLOG_STATES
+        )
+
+    async def count_conversation_backlog(self, conversation_id: uuid.UUID) -> int:
+        return sum(
+            1
+            for j in self._jobs.values()
+            if j.conversation_id == conversation_id and j.state in self._BACKLOG_STATES
         )
 
     async def count_global_backlog(self) -> int:

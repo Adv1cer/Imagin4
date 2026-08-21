@@ -20,7 +20,6 @@ import logging
 import signal
 import socket
 import uuid
-from datetime import datetime, timezone
 
 import httpx
 from sqlalchemy import text
@@ -33,7 +32,6 @@ from app.adapters.storage import InMemoryObjectStorage
 from app.adapters.storage.s3 import S3ObjectStorage
 from app.core.config import Settings, get_settings
 from app.domain.jobs.workflow_registry import kinds_for_backend
-from app.domain.workers.scoring import WorkerSnapshot
 
 logger = logging.getLogger("imaginv.scheduler")
 
@@ -93,31 +91,37 @@ class Scheduler:
         """How many jobs of each backend ("comfyui" / "gemini") may be claimed this tick.
 
         Split on purpose (see Settings.default_gemini_active_slots' docstring in
-        app/core/config.py): ComfyUI dispatch is GPU-bound and capped conservatively
-        (from the live `comfy_workers` registry when one exists, else
-        default_comfy_active_slots); Gemini image generation is just an outbound HTTPS
-        call to Google and doesn't compete for this machine's GPU at all, so it gets its
-        own independent cap (default_gemini_active_slots) regardless of which path is
-        used for ComfyUI capacity -- there is no "gemini_workers" registry table, Gemini
-        isn't a fleet of instances to select between.
+        app/core/config.py): ComfyUI dispatch is GPU-bound and capped conservatively;
+        Gemini is an independent HTTPS lane.
 
         Gap closed 2026-08-20 (Chet's DGX Spark): with N `comfy_workers` rows online,
-        `available` below used to sum to N, uncapped by `default_comfy_active_slots` --
-        so 2 configured workers meant the scheduler happily claimed+dispatched 2 jobs at
-        once even though `default_comfy_active_slots` defaults to 1 specifically BECAUSE
-        workers sharing one physical GPU don't scale linearly (see that field's docstring
-        and MultiWorkerComfyUIClient's module docstring). Admin load-test logs confirmed
-        this isn't just "less predictable" -- it's slower: step time roughly 5x'd when both
-        workers sampled at once (~4.9s/it solo vs ~24.3s/it overlapped) on GB10's shared,
-        bandwidth-constrained memory, so 2-at-once finished LESS total work per wall-clock
-        second than serializing. `min(available, ...)` below makes default_comfy_active_slots
-        the real ceiling in live/postgres mode too, not just the in-memory-queue fallback a
-        few lines up -- only raise it past 1 after benchmarking a setup where concurrent
-        dispatch is actually true, e.g. one physical GPU per worker."""
+        `available` used to sum to N, uncapped by `default_comfy_active_slots` -- 2-at-once
+        on one shared GB10 was ~5x slower per step. Ceiling stays.
+
+        Gap closed 2026-08-20 (turnaround): capacity now subtracts jobs already in
+        `dispatched`/`running` in the JobQueue, and only uses comfy_workers for
+        online/offline -- so a just-finished job frees a slot on the next 1s tick instead
+        of waiting up to ~5s for heartbeat to clear running_slots. Optional
+        `comfy_pending_buffer` lets one extra job sit in Comfy's pending queue (default 0).
+        """
         gemini_capacity = self.settings.default_gemini_active_slots
+        comfy_slots = self.settings.default_comfy_active_slots + max(
+            0, self.settings.comfy_pending_buffer
+        )
+
+        comfy_kinds = kinds_for_backend("comfyui")
+        gemini_kinds = kinds_for_backend("gemini")
+        comfy_active = 0
+        gemini_active = 0
+        if hasattr(self.job_queue, "count_active"):
+            comfy_active = await self.job_queue.count_active(comfy_kinds)
+            gemini_active = await self.job_queue.count_active(gemini_kinds)
 
         if self.session_factory is None:
-            return {"comfyui": self.settings.default_comfy_active_slots, "gemini": gemini_capacity}
+            return {
+                "comfyui": max(0, comfy_slots - comfy_active),
+                "gemini": max(0, gemini_capacity - gemini_active),
+            }
 
         from sqlalchemy import select
 
@@ -127,32 +131,22 @@ class Scheduler:
             result = await session.execute(select(ComfyWorker))
             rows = result.scalars().all()
 
-        now = datetime.now(timezone.utc)
-        snapshots = [
-            WorkerSnapshot(
-                worker_id=str(w.id),
-                status=w.status,
-                capabilities=frozenset((w.capabilities or {}).keys()) or frozenset({"default"}),
-                max_slots=w.max_slots,
-                reserved_slots=w.reserved_slots,
-                running_slots=w.running_slots,
-                local_queue_depth=0,
-                last_heartbeat_at=w.last_heartbeat_at or now,
-                recent_failure_rate=0.0,
-                current_model_loaded=None,
-            )
-            for w in rows
-        ]
-        available = sum(
-            max(0, s.max_slots - s.reserved_slots - s.running_slots)
-            for s in snapshots
-            if s.status == "online"
-        )
-        # Ceiling applied regardless of how many workers are online -- see this method's
-        # docstring ("Gap closed 2026-08-20") for why an uncapped sum here is wrong on a
-        # shared-GPU box.
-        capped = min(available, self.settings.default_comfy_active_slots)
-        return {"comfyui": max(capped, 0), "gemini": gemini_capacity}
+        online = any(w.status == "online" for w in rows)
+        # No online workers (or empty registry before first heartbeat): do not claim
+        # ComfyUI work. Gemini is independent of the GPU fleet.
+        if not online and rows:
+            comfy_budget = 0
+        elif not rows:
+            # Heartbeat hasn't registered anyone yet -- fall back to configured slots
+            # minus in-flight DB jobs rather than stalling forever on an empty table.
+            comfy_budget = max(0, comfy_slots - comfy_active)
+        else:
+            comfy_budget = max(0, comfy_slots - comfy_active)
+
+        return {
+            "comfyui": comfy_budget,
+            "gemini": max(0, gemini_capacity - gemini_active),
+        }
 
     async def _dispatch(self, job: QueuedJob) -> None:
         """Marks the job running and submits it to ComfyUI. Any failure here is

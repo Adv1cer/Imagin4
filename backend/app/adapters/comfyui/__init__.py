@@ -29,7 +29,7 @@ class ComfySubmitResult:
 @dataclass
 class ComfyStatus:
     prompt_id: str
-    state: str  # "running" | "succeeded" | "failed"
+    state: str  # "running" | "succeeded" | "failed" | "unknown"
     outputs: list[dict] | None = None
     error: str | None = None
 

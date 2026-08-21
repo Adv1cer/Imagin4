@@ -161,6 +161,7 @@ async def admit_generation_job(
     workflow_version: str,
     inputs: dict,
     idempotency_key: str,
+    conversation_id: uuid.UUID | None = None,
 ) -> AdmissionResult:
     """Validates `(workflow_name, workflow_version)` against the server-side allowlist
     (app/domain/jobs/workflow_registry.py -- callers never get to pass an arbitrary
@@ -182,6 +183,11 @@ async def admit_generation_job(
     (400 / 400 / 400 / 400 / 409 / 429 in the existing endpoints). A REPLAY never
     raises CapacityExceededError -- it doesn't create a new job, so it can't make
     anyone's backlog worse; only a genuinely NEW admission is checked against the caps.
+
+    When `conversation_id` is provided (agent/smart-message paths), the per-user queued
+    cap is applied to that conversation's backlog instead of the owning user_id -- so a
+    shared agentflow API key does not treat every campus end user as one backlog bucket
+    (2026-08-20).
     """
     workflow = resolve_workflow(workflow_name, workflow_version)  # raises UnknownWorkflowError
 
@@ -274,15 +280,25 @@ async def admit_generation_job(
                 "the generation queue is full system-wide, please retry shortly",
                 retry_after_s=30,
             )
-    if settings.max_queued_jobs_per_user > 0 and hasattr(queue, "count_user_backlog"):
-        user_backlog = await queue.count_user_backlog(user_id)
-        if user_backlog >= settings.max_queued_jobs_per_user:
-            raise CapacityExceededError(
-                f"you already have {user_backlog} job(s) waiting "
-                f"(limit {settings.max_queued_jobs_per_user}) -- "
-                "wait for one to finish before submitting more",
-                retry_after_s=15,
-            )
+    if settings.max_queued_jobs_per_user > 0:
+        if conversation_id is not None and hasattr(queue, "count_conversation_backlog"):
+            conv_backlog = await queue.count_conversation_backlog(conversation_id)
+            if conv_backlog >= settings.max_queued_jobs_per_user:
+                raise CapacityExceededError(
+                    f"this conversation already has {conv_backlog} job(s) waiting "
+                    f"(limit {settings.max_queued_jobs_per_user}) -- "
+                    "wait for one to finish before submitting more",
+                    retry_after_s=15,
+                )
+        elif hasattr(queue, "count_user_backlog"):
+            user_backlog = await queue.count_user_backlog(user_id)
+            if user_backlog >= settings.max_queued_jobs_per_user:
+                raise CapacityExceededError(
+                    f"you already have {user_backlog} job(s) waiting "
+                    f"(limit {settings.max_queued_jobs_per_user}) -- "
+                    "wait for one to finish before submitting more",
+                    retry_after_s=15,
+                )
 
     # queue_position/estimated_wait_seconds (2026-08-20, see AdmissionResult's
     # docstring and estimate_wait_seconds above): computed BEFORE enqueue -- every job
@@ -308,6 +324,7 @@ async def admit_generation_job(
         input_payload=inputs,
         idempotency_key=idempotency_key,
         queued_at=datetime.now(timezone.utc),
+        conversation_id=conversation_id,
     )
     await queue.enqueue(job)
     return AdmissionResult(

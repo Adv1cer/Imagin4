@@ -179,18 +179,20 @@ class PostgresJobQueue:
 
     async def enqueue(self, job: QueuedJob) -> QueuedJob:
         model_family, workflow_version = _resolve_workflow_defaults(job.kind)
+        available_at = job.available_at or job.queued_at or datetime.now(timezone.utc)
         async with self.session_factory() as session, session.begin():
             await session.execute(
                 text(
                     """
                         INSERT INTO generation_jobs
-                            (id, user_id, kind, model_family, workflow_version, state,
-                             priority, effective_priority, idempotency_key, input_payload,
-                             current_attempt, max_attempts, queued_at)
+                            (id, user_id, conversation_id, kind, model_family, workflow_version,
+                             state, priority, effective_priority, idempotency_key, input_payload,
+                             current_attempt, max_attempts, queued_at, available_at)
                         VALUES
-                            (:id, :user_id, :kind, :model_family, :workflow_version, :state,
-                             :priority, :effective_priority, :idempotency_key, :input_payload,
-                             :current_attempt, :max_attempts, :queued_at)
+                            (:id, :user_id, :conversation_id, :kind, :model_family,
+                             :workflow_version, :state, :priority, :effective_priority,
+                             :idempotency_key, :input_payload, :current_attempt, :max_attempts,
+                             :queued_at, :available_at)
                         """
                     # Raw text() params default to NullType -- without an explicit JSONB
                     # type here, SQLAlchemy skips the JSON-serialize bind processor and
@@ -203,6 +205,7 @@ class PostgresJobQueue:
                 {
                     "id": job.id,
                     "user_id": job.user_id,
+                    "conversation_id": job.conversation_id,
                     "kind": job.kind,
                     "model_family": model_family,
                     "workflow_version": workflow_version,
@@ -214,6 +217,7 @@ class PostgresJobQueue:
                     "current_attempt": job.current_attempt,
                     "max_attempts": job.max_attempts,
                     "queued_at": job.queued_at,
+                    "available_at": available_at,
                 },
             )
             await self._append_event(session, job.id, "created", {})
@@ -316,6 +320,7 @@ class PostgresJobQueue:
                     SELECT id
                     FROM generation_jobs
                     WHERE state IN ('queued', 'retry_wait')
+                    AND available_at <= now()
                     {kinds_clause}
                     ORDER BY
                         (priority + (extract(epoch from (now() - queued_at)) / 60.0)
@@ -376,6 +381,7 @@ class PostgresJobQueue:
                 SELECT id
                 FROM generation_jobs
                 WHERE state IN ('queued', 'retry_wait')
+                AND available_at <= now()
                 {kinds_clause}
                 AND (
                     SELECT count(*) FROM generation_jobs g2
@@ -464,6 +470,36 @@ class PostgresJobQueue:
             )
             return [_row_to_queued_job(row) for row in result.fetchall()]
 
+    async def count_active(self, kinds: frozenset[str] | None = None) -> int:
+        kinds_clause = "AND kind IN :kinds" if kinds is not None else ""
+        stmt = text(f"""
+            SELECT count(*) FROM generation_jobs
+            WHERE state IN ('dispatched', 'running')
+            {kinds_clause}
+            """)
+        params: dict[str, Any] = {}
+        if kinds is not None:
+            stmt = stmt.bindparams(bindparam("kinds", expanding=True))
+            params["kinds"] = list(kinds)
+        async with self.session_factory() as session:
+            result = await session.execute(stmt, params)
+            return int(result.scalar_one())
+
+    async def renew_lease(self, job_id: uuid.UUID, lease_seconds: float) -> None:
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+        async with self.session_factory() as session, session.begin():
+            await session.execute(
+                text("""
+                    UPDATE job_attempts
+                    SET lease_expires_at = :expires_at
+                    WHERE job_id = :job_id
+                      AND attempt_no = (
+                          SELECT max(attempt_no) FROM job_attempts WHERE job_id = :job_id
+                      )
+                    """),
+                {"job_id": job_id, "expires_at": expires_at},
+            )
+
     async def mark_running(self, job_id: uuid.UUID) -> None:
         async with self.session_factory() as session, session.begin():
             await session.execute(
@@ -480,11 +516,18 @@ class PostgresJobQueue:
             # prompt_id lives on a DIFFERENT row entirely. See module docstring.
 
     async def mark_succeeded(self, job_id: uuid.UUID, result: dict) -> None:
+        # error_code/error_detail_sanitized reset to NULL here (2026-08-20, see
+        # JobQueue.mark_succeeded's Protocol docstring) -- without this, a job that hit
+        # a transient error on an earlier attempt (mark_retry_wait stamped these two
+        # columns) and then succeeded on a LATER attempt kept showing that now-stale
+        # error forever, which is exactly what the /admin load-test tool's table was
+        # displaying: state=succeeded with a red comfy_transient error next to it.
         async with self.session_factory() as session, session.begin():
             updated = await session.execute(
                 text("""
                         UPDATE generation_jobs
-                        SET state = 'succeeded', finished_at = now()
+                        SET state = 'succeeded', finished_at = now(),
+                            error_code = NULL, error_detail_sanitized = NULL
                         WHERE id = :id AND state NOT IN :terminal
                         RETURNING id
                         """).bindparams(bindparam("terminal", expanding=True)),
@@ -526,14 +569,35 @@ class PostgresJobQueue:
             )
 
     async def mark_retry_wait(
-        self, job_id: uuid.UUID, error_code: str, error_detail: str | None = None
+        self,
+        job_id: uuid.UUID,
+        error_code: str,
+        error_detail: str | None = None,
+        delay_seconds: float | None = None,
     ) -> None:
+        from app.domain.jobs.retry import compute_backoff_seconds
+
         async with self.session_factory() as session, session.begin():
+            # Read current_attempt first so backoff uses the attempt number AFTER the bump
+            # (matches InMemoryJobQueue / compute_backoff_seconds' 1-indexed contract).
+            row = (
+                await session.execute(
+                    text("SELECT current_attempt FROM generation_jobs WHERE id = :id"),
+                    {"id": job_id},
+                )
+            ).first()
+            if row is None:
+                return
+            next_attempt = int(row.current_attempt) + 1
+            if delay_seconds is None:
+                delay_seconds = compute_backoff_seconds(next_attempt)
+            available_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
             updated = await session.execute(
                 text("""
                     UPDATE generation_jobs
                     SET state = 'retry_wait', current_attempt = current_attempt + 1,
-                        error_code = :error_code, error_detail_sanitized = :error_detail
+                        error_code = :error_code, error_detail_sanitized = :error_detail,
+                        available_at = :available_at
                     WHERE id = :id AND state NOT IN :terminal
                     RETURNING id
                     """).bindparams(bindparam("terminal", expanding=True)),
@@ -542,6 +606,7 @@ class PostgresJobQueue:
                     "terminal": list(_TERMINAL_STATES),
                     "error_code": error_code,
                     "error_detail": error_detail,
+                    "available_at": available_at,
                 },
             )
             if updated.first() is None:
@@ -553,7 +618,11 @@ class PostgresJobQueue:
                 session,
                 job_id,
                 "job_retry_scheduled",
-                {"error_code": error_code, "detail": error_detail},
+                {
+                    "error_code": error_code,
+                    "detail": error_detail,
+                    "delay_seconds": delay_seconds,
+                },
             )
 
     async def set_prompt_id(self, job_id: uuid.UUID, prompt_id: str) -> None:
@@ -611,6 +680,20 @@ class PostgresJobQueue:
                     WHERE user_id = :user_id AND state IN :backlog_states
                     """).bindparams(bindparam("backlog_states", expanding=True)),
                 {"user_id": user_id, "backlog_states": list(_BACKLOG_STATES)},
+            )
+            return int(result.scalar_one())
+
+    async def count_conversation_backlog(self, conversation_id: uuid.UUID) -> int:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                text("""
+                    SELECT count(*) FROM generation_jobs
+                    WHERE conversation_id = :conversation_id AND state IN :backlog_states
+                    """).bindparams(bindparam("backlog_states", expanding=True)),
+                {
+                    "conversation_id": conversation_id,
+                    "backlog_states": list(_BACKLOG_STATES),
+                },
             )
             return int(result.scalar_one())
 

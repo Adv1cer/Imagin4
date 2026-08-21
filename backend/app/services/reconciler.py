@@ -44,7 +44,10 @@ from app.domain.jobs.retry import BackoffConfig, compute_backoff_seconds, is_ret
 logger = logging.getLogger("imaginv.reconciler")
 
 DEFAULT_POLL_INTERVAL_S = 5.0
-STALE_RUNNING_SECONDS = 300.0  # a running job with no known prompt_id this old is orphaned
+DEFAULT_LEASE_SECONDS = 120.0
+# Fallback when lease_expires_at is missing on an active job (should be rare once
+# claim_next_with_lease is always used).
+STALE_RUNNING_SECONDS = 300.0
 
 
 class Reconciler:
@@ -55,6 +58,7 @@ class Reconciler:
         settings: Settings | None = None,
         session_factory=None,
         poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
         rng: random.Random | None = None,
     ) -> None:
         self.job_queue = job_queue
@@ -62,6 +66,7 @@ class Reconciler:
         self.settings = settings or get_settings()
         self.session_factory = session_factory
         self.poll_interval_s = poll_interval_s
+        self.lease_seconds = lease_seconds
         self.rng = rng or random.Random()
         self._shutdown = asyncio.Event()
         self._pass_lock = asyncio.Lock()
@@ -76,7 +81,7 @@ class Reconciler:
         real DB-backed implementation is a drop-in replacement of this one method."""
         logger.info("job_event job_id=%s type=%s payload=%s", job_id, event_type, payload)
 
-    async def _resolve_via_comfy(self, job: QueuedJob) -> None:
+    async def _resolve_via_comfy(self, job: QueuedJob, now: datetime) -> None:
         """Job has a known prompt_id: ask ComfyUI for the authoritative outcome."""
         status = await self.comfy_client.get_status(job.prompt_id)
         if status.state == "succeeded":
@@ -85,10 +90,26 @@ class Reconciler:
             self._emit_event(job.id, "job_succeeded", {"prompt_id": job.prompt_id})
             return
         if status.state == "running":
-            # Still genuinely in progress; only re-lease if the previous lease expired
-            # (worker/scheduler died mid-flight) -- extend so it isn't repeatedly reclaimed.
-            if hasattr(self.job_queue, "claim_next_with_lease"):
-                job.lease_expires_at = datetime.now(timezone.utc)
+            # Still genuinely in Comfy's queue -- renew lease so long gens aren't
+            # treated as orphans, and so a later "unknown" can still time out.
+            if hasattr(self.job_queue, "renew_lease"):
+                await self.job_queue.renew_lease(job.id, self.lease_seconds)
+            return
+        if status.state == "unknown":
+            # Lost from Comfy (restart / dropped) or race right after submit. Only
+            # fail/retry once the lease has expired so a brief registration race
+            # doesn't kill a healthy job. If no lease was stamped, fall back to
+            # stale_running_seconds from queued_at.
+            expired = job.lease_expires_at is not None and job.lease_expires_at < now
+            if not expired and job.lease_expires_at is None:
+                stale_s = getattr(self.settings, "stale_running_seconds", STALE_RUNNING_SECONDS)
+                expired = (now - job.queued_at).total_seconds() >= stale_s
+            if expired:
+                await self._fail_or_retry(
+                    job,
+                    error_code="comfy_transient",
+                    detail="prompt_unknown_to_comfy_after_lease",
+                )
             return
         # status.state == "failed"
         await self._fail_or_retry(job, error_code="comfy_transient", detail=status.error)
@@ -98,7 +119,9 @@ class Reconciler:
         if is_retryable(error_code, attempt_no, job.max_attempts):
             delay_s = compute_backoff_seconds(attempt_no, BackoffConfig(), rng=self.rng)
             if hasattr(self.job_queue, "mark_retry_wait"):
-                await self.job_queue.mark_retry_wait(job.id, error_code, detail)
+                await self.job_queue.mark_retry_wait(
+                    job.id, error_code, detail, delay_seconds=delay_s
+                )
             else:
                 await self.job_queue.mark_failed(job.id, error_code, detail)
             self._emit_event(
@@ -120,12 +143,11 @@ class Reconciler:
             )
 
     async def _reconcile_job(self, job: QueuedJob, now: datetime) -> None:
-        lease_expired = job.lease_expires_at is not None and job.lease_expires_at < now
         if job.prompt_id:
             # We know the durable prompt_id: ComfyUI is the source of truth for outcome,
             # regardless of whether our lease/heartbeat lapsed (submission may have
             # succeeded even if the process that submitted it then crashed/lost contact).
-            await self._resolve_via_comfy(job)
+            await self._resolve_via_comfy(job, now)
             return
 
         # No known prompt_id. If the lease expired (or the job has been "running" for an
@@ -133,6 +155,7 @@ class Reconciler:
         # authoritative outcome, so we must fail/retry conservatively. This is the
         # duplicate-execution risk window documented in README.md: a crash between
         # ComfyUI accepting the prompt and us persisting prompt_id.
+        lease_expired = job.lease_expires_at is not None and job.lease_expires_at < now
         if lease_expired:
             await self._fail_or_retry(
                 job, error_code="worker_lease_expired", detail="lease expired with no prompt_id"
