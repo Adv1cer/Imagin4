@@ -13,38 +13,46 @@ enable `CUDA_MPS_*` unless the host MPS daemon is running (see `MPS_RUNBOOK.md`)
 
 ## 1. Download models (run on the DGX host)
 
-Files are flat basenames under the usual ComfyUI folders (from
-[Comfy-Org/z_image_turbo](https://huggingface.co/Comfy-Org/z_image_turbo) and
-[lightx2v/Qwen-Image-2512-Lightning](https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning)).
+Comfy-Org packs Z-Image under `split_files/…` — **not** repo root (a bare
+`hf download … z_image_turbo_bf16.safetensors` returns “File not found”).
 
 ```bash
 export COMFYUI_ROOT="${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}"
 mkdir -p "$COMFYUI_ROOT/models/"{diffusion_models,text_encoders,vae}
-pip install -U "huggingface_hub[cli]"
 
-# --- student: Z-Image Turbo ---
-hf download Comfy-Org/z_image_turbo z_image_turbo_bf16.safetensors \
-  --local-dir "$COMFYUI_ROOT/models/diffusion_models"
-hf download Comfy-Org/z_image_turbo qwen_3_4b.safetensors \
-  --local-dir "$COMFYUI_ROOT/models/text_encoders"
-hf download Comfy-Org/z_image_turbo ae.safetensors \
-  --local-dir "$COMFYUI_ROOT/models/vae"
+# --- student: Z-Image Turbo (paths under split_files/) ---
+hf download Comfy-Org/z_image_turbo \
+  split_files/diffusion_models/z_image_turbo_bf16.safetensors \
+  --local-dir /tmp/zit-dl
+hf download Comfy-Org/z_image_turbo \
+  split_files/text_encoders/qwen_3_4b.safetensors \
+  --local-dir /tmp/zit-dl
+hf download Comfy-Org/z_image_turbo \
+  split_files/vae/ae.safetensors \
+  --local-dir /tmp/zit-dl
 
-# --- personnel: Qwen-Image-2512 Lightning 4-step UNet ---
+cp -n /tmp/zit-dl/split_files/diffusion_models/z_image_turbo_bf16.safetensors \
+  "$COMFYUI_ROOT/models/diffusion_models/"
+cp -n /tmp/zit-dl/split_files/text_encoders/qwen_3_4b.safetensors \
+  "$COMFYUI_ROOT/models/text_encoders/"
+cp -n /tmp/zit-dl/split_files/vae/ae.safetensors \
+  "$COMFYUI_ROOT/models/vae/"
+
+# --- personnel: Qwen Lightning 4-step UNet (file IS at repo root) ---
 hf download lightx2v/Qwen-Image-2512-Lightning \
   qwen_image_2512_fp8_e4m3fn_scaled_comfyui_4steps_v1.0.safetensors \
   --local-dir "$COMFYUI_ROOT/models/diffusion_models"
 
-# Qwen TE + VAE (skip if already present from prior Qwen setup)
+# Qwen TE + VAE (skip if already present)
 hf download Comfy-Org/Qwen-Image_ComfyUI \
   split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors \
-  --local-dir /tmp/qwen-te
-cp -n /tmp/qwen-te/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors \
-  "$COMFYUI_ROOT/models/text_encoders/"
+  --local-dir /tmp/qwen-dl
 hf download Comfy-Org/Qwen-Image_ComfyUI \
   split_files/vae/qwen_image_vae.safetensors \
-  --local-dir /tmp/qwen-vae
-cp -n /tmp/qwen-vae/split_files/vae/qwen_image_vae.safetensors \
+  --local-dir /tmp/qwen-dl
+cp -n /tmp/qwen-dl/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors \
+  "$COMFYUI_ROOT/models/text_encoders/"
+cp -n /tmp/qwen-dl/split_files/vae/qwen_image_vae.safetensors \
   "$COMFYUI_ROOT/models/vae/"
 
 ls -lh "$COMFYUI_ROOT/models/diffusion_models"/z_image_turbo_bf16.safetensors \
@@ -55,8 +63,9 @@ ls -lh "$COMFYUI_ROOT/models/diffusion_models"/z_image_turbo_bf16.safetensors \
        "$COMFYUI_ROOT/models/vae"/qwen_image_vae.safetensors
 ```
 
-If a hub path nests under `split_files/…`, copy the `.safetensors` up to the flat
-folder so the basename matches `APP_COMFY_*` / allowlists exactly.
+Optional smaller ZIT UNet on hub (same folder): `z_image_turbo_int8_convrot.safetensors`
+(~6.2GB) or `z_image_turbo_nvfp4.safetensors` (~4.5GB) — only switch
+`APP_COMFY_DIFFUSION_MODEL_NAME` after confirming ComfyUI on GB10 loads that quant.
 
 ## 2. Sync Imaginv4 config + rebuild workers
 
