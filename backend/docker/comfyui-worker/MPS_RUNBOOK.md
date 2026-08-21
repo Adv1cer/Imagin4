@@ -8,11 +8,13 @@ crashed with `CUDA error: CUBLAS_STATUS_INTERNAL_ERROR`. MPS (Multi-Process Serv
 multiple processes share ONE GPU context instead of each fighting for their own —
 NVIDIA's own documented fix for exactly this class of multi-process contention.
 
-`docker-compose.yml`'s `comfyui-worker-1..4` already have the MPS *client* wiring
-(`ipc: host`, `CUDA_MPS_PIPE_DIRECTORY`, `CUDA_MPS_LOG_DIRECTORY`, and the pipe/log
-volumes) — inert until the *server* (the MPS control daemon) is actually running on the
-host. That daemon can only run on the host, not inside a container, because it has to
-broker access to the real GPU driver across every container that wants to share it.
+`docker-compose.yml`'s `comfyui-worker-1..4` keep `ipc: host` only. **Do not** set
+`CUDA_MPS_PIPE_DIRECTORY` / `CUDA_MPS_LOG_DIRECTORY` (or mount `/tmp/nvidia-mps*`) until
+the host MPS control daemon is actually running. Those env vars are **not** inert: on
+DGX Spark (2026-08-21) pointing clients at an empty/missing MPS control socket hung
+first CUDA context init indefinitely (0% CPU after ComfyUI's "Setting user directory").
+The daemon can only run on the host, not inside a container, because it has to broker
+access to the real GPU driver across every container that wants to share it.
 
 **Important caveat before you start** (confirmed via NVIDIA's own developer forum,
 2026-03, not guessed): GB10's unified-memory architecture has a known gap where
@@ -41,7 +43,24 @@ If `nvidia-cuda-mps-control` isn't found, it ships with the NVIDIA driver packag
 (`nvidia-utils`/`cuda-toolkit` depending on your distro) — check
 `dpkg -L nvidia-driver-<version> | grep mps` or the DGX OS's package manager.
 
-## 2. Recreate the worker containers so they pick up the new compose wiring
+## 2. Add MPS *client* wiring to the workers, then recreate
+
+Default `docker-compose.yml` deliberately omits `CUDA_MPS_*` (see note above). For each
+`comfyui-worker-N` you want on MPS, add under `environment:` / `volumes:`:
+
+```yaml
+    environment:
+      PYTHONUNBUFFERED: "1"
+      CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
+      CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
+    volumes:
+      - ${COMFYUI_HOST_PATH:-/home/nvidia/comfyui/ComfyUI}:/workspace/ComfyUI
+      - /tmp/nvidia-mps:/tmp/nvidia-mps
+      - /tmp/nvidia-mps-log:/tmp/nvidia-mps-log
+```
+
+Confirm the host daemon is up (`ls /tmp/nvidia-mps/` shows a `control` socket) **before**
+recreating, or CUDA init will hang again.
 
 ```bash
 cd backend

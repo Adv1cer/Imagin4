@@ -243,15 +243,15 @@ run more than 2 processes against one physical GPU. Don't re-widen
 otherwise a live campus rollout would intermittently fail generations under load exactly
 like this.
 
-**2026-08-17 update**: `docker-compose.yml`'s `comfyui-worker-1..4` now carry the client
-side of an NVIDIA MPS wiring (`ipc: host` + `CUDA_MPS_PIPE_DIRECTORY`/
-`CUDA_MPS_LOG_DIRECTORY` + shared pipe/log volumes), inert until the host-side MPS
-control daemon is actually started. See `docker/comfyui-worker/MPS_RUNBOOK.md` for the
-full step-by-step (start the daemon, widen back to 4 workers, reproduce the load test,
-judge success by the absence of the CUBLAS crash in worker-3/4's own logs -- **not** by
+**2026-08-17 update**: `docker-compose.yml`'s `comfyui-worker-1..4` keep `ipc: host`.
+Do **not** set `CUDA_MPS_PIPE_DIRECTORY` / mount `/tmp/nvidia-mps*` until the host MPS
+daemon is running — those client env vars are **not** inert (2026-08-21 DGX: empty MPS
+pipe dir hung first CUDA context init forever). See `docker/comfyui-worker/MPS_RUNBOOK.md`
+for starting the daemon, adding client wiring, widening back to 4 workers, and judging
+success by the absence of the CUBLAS crash in worker-3/4's logs under load -- **not** by
 `nvidia-smi`'s VRAM column, which has a confirmed reporting gap on GB10's unified-memory
-architecture, see the runbook). **Not yet run against the real DGX Spark** -- this is
-wiring + a runbook, not a confirmed fix; update this section with the actual result
+architecture. **MPS itself not yet run against the real DGX Spark** -- wiring + a runbook,
+not a confirmed fix; update this section with the actual result
 (pass or fail) once tested.
 
 ## Mock vs. live ComfyUI vs. Gemini

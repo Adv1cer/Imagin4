@@ -107,4 +107,12 @@ mkdir -p /opt/comfyui-user
 
 # --listen 0.0.0.0 so other containers (the api/scheduler/reconciler services) can reach
 # this over the docker network by service name, e.g. http://comfyui-worker-1:8188.
+#
+# Next log line after this is from ComfyUI itself. On GB10/NGC, the first real
+# `import torch` / CUDA context inside main.py can sit silent for a long time (same
+# hang the timed probe above is meant to detect). If docker logs stall right after
+# "Setting user directory", that is usually CUDA init -- not a dead process. Unset
+# CUDA_MPS_* unless the host MPS daemon is actually running (see MPS_RUNBOOK.md);
+# a pipe dir without a live control socket has hung CUDA clients here.
+echo "comfyui-worker: starting ComfyUI (python main.py)..."
 exec python main.py --listen 0.0.0.0 --port 8188 "$@"
