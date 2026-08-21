@@ -9,8 +9,18 @@ cd /workspace/ComfyUI
 
 echo "comfyui-worker: checking GPU visibility..."
 nvidia-smi || echo "comfyui-worker: WARNING - nvidia-smi failed; GPU may not be visible to this container (check docker-compose.yml's GPU reservation and that the NVIDIA Container Toolkit is installed on the host)"
-python -c "import torch; print('comfyui-worker: torch', torch.__version__, 'cuda available:', torch.cuda.is_available())" \
-  || echo "comfyui-worker: WARNING - could not import torch / check CUDA availability"
+
+# IMPORTANT (2026-08-21, Chet's DGX Spark GB10): a bare
+#   python -c "import torch; torch.cuda.is_available()"
+# can hang indefinitely on first CUDA context init inside this NGC image (observed:
+# entrypoint stuck >6 minutes on that one line, PID still alive, never reaches
+# requirements install / main.py -- container stays "Up (unhealthy)", port 8188
+# accepts then RSTs). Bound it with `timeout` and continue either way -- ComfyUI's
+# own startup is the real CUDA probe; this line is only a diagnostic print.
+echo "comfyui-worker: probing torch/CUDA (30s timeout)..."
+if ! timeout 30 python -c "import torch; print('comfyui-worker: torch', torch.__version__, 'cuda available:', torch.cuda.is_available())"; then
+  echo "comfyui-worker: WARNING - torch/CUDA probe timed out or failed; continuing to start ComfyUI anyway"
+fi
 
 if [ -f requirements.txt ]; then
   echo "comfyui-worker: installing ComfyUI's requirements.txt (skipping torch/torchvision/torchaudio -- the base image's NGC-matched build must not be overwritten by a generic PyPI wheel)..."
