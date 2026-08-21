@@ -195,6 +195,10 @@ services:
     # + VAE) fits comfortably, and subsequent jobs skip the per-prompt stage cost. Do
     # NOT add this if you later run multiple workers that each try to keep a full copy
     # resident on the same physical GPU (see MPS_RUNBOOK.md).
+    # --disable-all-custom-nodes: Imaginv4's LiveComfyUIClient only needs core nodes.
+    # Shared checkout custom_nodes (comfyui-manager, ExtraModels, text overlays) hung
+    # main.py at 0% CPU for 40+ minutes after Manager prestartup on DGX Spark
+    # (2026-08-21) -- no comfyui.log written, port 8188 RST. Disable for API workers.
     # --user-directory: ComfyUI keeps per-instance state (notably user/comfyui.db, a
     # SQLite file) under <ComfyUI path>/user by default. Both workers bind-mount the
     # SAME host ComfyUI checkout (models/custom_nodes/output are meant to be shared),
@@ -206,7 +210,7 @@ services:
     # filesystem (not the bind mount) gives every worker private, non-conflicting state
     # -- safe to use the identical path string in both services below since each
     # container's root filesystem is already isolated from the other's.
-    command: ["--user-directory", "/opt/comfyui-user", "--highvram"]
+    command: ["--user-directory", "/opt/comfyui-user", "--highvram", "--disable-all-custom-nodes"]
     # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
     # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
     # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
@@ -223,6 +227,9 @@ services:
     # in worker-3/4's logs under load, not by VRAM numbers.
     ipc: host
     environment:
+      # Unbuffered so docker logs show ComfyUI progress while it boots (otherwise a hang
+      # after Manager prestartup looks like a silent freeze).
+      PYTHONUNBUFFERED: "1"
       CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
       CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
     volumes:
@@ -249,7 +256,7 @@ services:
     build: ./docker/comfyui-worker
     restart: unless-stopped
     # See comfyui-worker-1's --user-directory comment above -- same reasoning.
-    command: ["--user-directory", "/opt/comfyui-user", "--highvram"]
+    command: ["--user-directory", "/opt/comfyui-user", "--highvram", "--disable-all-custom-nodes"]
     # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
     # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
     # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
@@ -266,6 +273,9 @@ services:
     # in worker-3/4's logs under load, not by VRAM numbers.
     ipc: host
     environment:
+      # Unbuffered so docker logs show ComfyUI progress while it boots (otherwise a hang
+      # after Manager prestartup looks like a silent freeze).
+      PYTHONUNBUFFERED: "1"
       CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
       CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
     volumes:
@@ -299,7 +309,7 @@ services:
     build: ./docker/comfyui-worker
     restart: unless-stopped
     # See comfyui-worker-1's --user-directory comment above -- same reasoning.
-    command: ["--user-directory", "/opt/comfyui-user", "--highvram"]
+    command: ["--user-directory", "/opt/comfyui-user", "--highvram", "--disable-all-custom-nodes"]
     # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
     # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
     # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
@@ -316,6 +326,9 @@ services:
     # in worker-3/4's logs under load, not by VRAM numbers.
     ipc: host
     environment:
+      # Unbuffered so docker logs show ComfyUI progress while it boots (otherwise a hang
+      # after Manager prestartup looks like a silent freeze).
+      PYTHONUNBUFFERED: "1"
       CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
       CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
     volumes:
@@ -342,7 +355,7 @@ services:
     build: ./docker/comfyui-worker
     restart: unless-stopped
     # See comfyui-worker-1's --user-directory comment above -- same reasoning.
-    command: ["--user-directory", "/opt/comfyui-user", "--highvram"]
+    command: ["--user-directory", "/opt/comfyui-user", "--highvram", "--disable-all-custom-nodes"]
     # NVIDIA MPS wiring (2026-08-17, see README "Known issue: worker-3/4 CUBLAS crash"):
     # worker-3/worker-4 crashed with CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when a
     # 3rd/4th independent CUDA context landed on this single physical GB10 GPU -- a
@@ -359,6 +372,9 @@ services:
     # in worker-3/4's logs under load, not by VRAM numbers.
     ipc: host
     environment:
+      # Unbuffered so docker logs show ComfyUI progress while it boots (otherwise a hang
+      # after Manager prestartup looks like a silent freeze).
+      PYTHONUNBUFFERED: "1"
       CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
       CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
     volumes:
@@ -417,6 +433,9 @@ services:
     restart: unless-stopped
     ipc: host
     environment:
+      # Unbuffered so docker logs show ComfyUI progress while it boots (otherwise a hang
+      # after Manager prestartup looks like a silent freeze).
+      PYTHONUNBUFFERED: "1"
       CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
       CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-mps-log
       # Qwen3.8-27B-FP8 is a gated/rate-limited repo on some accounts -- set in .env if
