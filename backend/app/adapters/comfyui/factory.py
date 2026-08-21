@@ -84,7 +84,7 @@ def build_comfy_client(settings: Settings, storage: ObjectStorage) -> ComfyUICli
             settings.comfy_model_family,
             (
                 settings.comfy_diffusion_model_name
-                if settings.comfy_model_family == "qwen_image"
+                if settings.comfy_model_family in ("qwen_image", "z_image_turbo")
                 else settings.comfy_checkpoint_name
             ),
             sorted(profiles.keys()),

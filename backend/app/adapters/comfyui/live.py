@@ -107,6 +107,8 @@ _MAX_DIM = 4096
 def _resolve_dimensions(
     aspect_ratio: str | None, resolution: str | None, family: str = "checkpoint"
 ) -> tuple[int, int]:
+    # z_image_turbo trains around classic ~1024 long-edge sizes (official simple
+    # workflow uses 1024x1024) -- reuse the checkpoint/SDXL table, not Qwen's.
     table = _QWEN_IMAGE_BASE_DIMENSIONS_1K if family == "qwen_image" else _BASE_DIMENSIONS_1K
     base = table.get(aspect_ratio or "1:1", table["1:1"])
     scale = _RESOLUTION_SCALE.get(resolution or "1K", 1)
@@ -247,7 +249,16 @@ class LiveComfyUIClient:
         seed = int(workflow_payload.get("seed") or uuid.uuid4().int % (2**32))
 
         if profile.model_family == "qwen_image":
-            return self._build_qwen_image_graph(profile, prompt_text, width, height, seed, filename_prefix)
+            return self._build_split_auraflow_graph(
+                profile, prompt_text, width, height, seed, filename_prefix, clip_type="qwen_image"
+            )
+        if profile.model_family == "z_image_turbo":
+            # Official Z-Image Turbo simple workflow: CLIPLoader type=lumina2,
+            # EmptySD3LatentImage, ModelSamplingAuraFlow, KSampler (euler/simple, few
+            # steps, cfg≈1). Same skeleton as Qwen-Image; different TE type + sizes.
+            return self._build_split_auraflow_graph(
+                profile, prompt_text, width, height, seed, filename_prefix, clip_type="lumina2"
+            )
         return self._build_checkpoint_graph(profile, prompt_text, width, height, seed, filename_prefix)
 
     def _build_checkpoint_graph(
@@ -303,7 +314,7 @@ class LiveComfyUIClient:
             },
         }
 
-    def _build_qwen_image_graph(
+    def _build_split_auraflow_graph(
         self,
         profile: ComfyProfile,
         prompt_text: str,
@@ -311,16 +322,15 @@ class LiveComfyUIClient:
         height: int,
         seed: int,
         filename_prefix: str,
+        *,
+        clip_type: str,
     ) -> dict[str, Any]:
-        """Qwen-Image's split-file architecture: separate diffusion model (UNETLoader),
-        text encoder (CLIPLoader with type="qwen_image"), and VAE (VAELoader), plus a
-        required ModelSamplingAuraFlow node between the loaded model and KSampler.
+        """Split-file AuraFlow-family graph: UNETLoader + CLIPLoader + VAELoader +
+        ModelSamplingAuraFlow + EmptySD3LatentImage + KSampler.
 
-        Graph structure verified node-for-node against the official Comfy-Org workflow
-        template (https://docs.comfy.org/tutorials/image/qwen/qwen-image, fetched
-        2026-08 -- not guessed): UNETLoader -> ModelSamplingAuraFlow -> KSampler, with
-        CLIPLoader feeding both CLIPTextEncode nodes and EmptySD3LatentImage (not the
-        generic EmptyLatentImage) providing the initial latent.
+        Shared by Qwen-Image (`clip_type="qwen_image"`) and Z-Image Turbo
+        (`clip_type="lumina2"`). Node ids match the previously verified Qwen template so
+        existing contract tests stay stable; only CLIPLoader.type differs.
         """
         return {
             "3": {
@@ -362,7 +372,7 @@ class LiveComfyUIClient:
                 "class_type": "CLIPLoader",
                 "inputs": {
                     "clip_name": profile.clip_name,
-                    "type": "qwen_image",
+                    "type": clip_type,
                     "device": "default",
                 },
             },
@@ -379,6 +389,20 @@ class LiveComfyUIClient:
                 "inputs": {"model": ["37", 0], "shift": profile.model_sampling_shift},
             },
         }
+
+    def _build_qwen_image_graph(
+        self,
+        profile: ComfyProfile,
+        prompt_text: str,
+        width: int,
+        height: int,
+        seed: int,
+        filename_prefix: str,
+    ) -> dict[str, Any]:
+        """Backward-compatible alias -- prefer `_build_split_auraflow_graph`."""
+        return self._build_split_auraflow_graph(
+            profile, prompt_text, width, height, seed, filename_prefix, clip_type="qwen_image"
+        )
 
     async def submit(self, workflow_payload: dict, kind: str | None = None) -> ComfySubmitResult:
         # Unique per submission -- see _build_prompt_graph's docstring for why every job

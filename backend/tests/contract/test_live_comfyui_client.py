@@ -460,3 +460,55 @@ def test_resolve_dimensions_qwen_image_family_uses_its_own_table() -> None:
     assert checkpoint_dims == (1024, 1024)
     assert qwen_dims == (1328, 1328)
     assert checkpoint_dims != qwen_dims
+
+
+@pytest.mark.asyncio
+async def test_submit_z_image_turbo_family_builds_lumina2_clip_graph() -> None:
+    """Z-Image Turbo reuses the AuraFlow split graph but CLIPLoader type must be
+    lumina2 (not qwen_image), and sizes come from the ~1024 table."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"prompt_id": "p1"})
+
+    client = LiveComfyUIClient(
+        base_url=BASE_URL,
+        storage=InMemoryObjectStorage(),
+        model_family="z_image_turbo",
+        diffusion_model_name="z_image_turbo_bf16.safetensors",
+        clip_name="qwen_3_4b.safetensors",
+        vae_name="ae.safetensors",
+        model_sampling_shift=3.0,
+        sampler_name="euler",
+        scheduler="simple",
+        steps=8,
+        cfg_scale=1.0,
+        transport=httpx.MockTransport(handler),
+    )
+    await client.submit({"prompt": "a campus photo", "aspect_ratio": "1:1", "resolution": "1K"})
+
+    graph = captured["body"]["prompt"]
+    assert graph["37"]["inputs"]["unet_name"] == "z_image_turbo_bf16.safetensors"
+    assert graph["38"] == {
+        "class_type": "CLIPLoader",
+        "inputs": {
+            "clip_name": "qwen_3_4b.safetensors",
+            "type": "lumina2",
+            "device": "default",
+        },
+    }
+    assert graph["39"]["inputs"]["vae_name"] == "ae.safetensors"
+    assert graph["66"]["inputs"]["shift"] == 3.0
+    assert graph["3"]["inputs"]["model"] == ["66", 0]
+    assert graph["3"]["inputs"]["steps"] == 8
+    assert graph["3"]["inputs"]["cfg"] == 1.0
+    assert graph["58"]["class_type"] == "EmptySD3LatentImage"
+    assert (graph["58"]["inputs"]["width"], graph["58"]["inputs"]["height"]) == (1024, 1024)
+
+
+def test_resolve_dimensions_z_image_turbo_uses_1024_table() -> None:
+    zit = _resolve_dimensions("1:1", "1K", family="z_image_turbo")
+    qwen = _resolve_dimensions("1:1", "1K", family="qwen_image")
+    assert zit == (1024, 1024)
+    assert qwen == (1328, 1328)

@@ -39,21 +39,19 @@ export interface ScenarioConfig {
 
 export const DEFAULT_SCENARIO: ScenarioConfig = {
   mode: 'burst',
-  totalRequests: 20,
+  // Match APP_DEFAULT_COMFY_ACTIVE_SLOTS (2 on DGX Spark). Bursting far above worker
+  // count only builds a queue and produces poll_timeout rows -- not higher GPU throughput.
+  totalRequests: 10,
   burstWindowMs: 100,
-  batchSize: 10,
+  batchSize: 2,
   batchIntervalMs: 60_000,
   batchCount: 6,
   spreadWithinBatch: false,
-  poolConcurrency: 10,
+  poolConcurrency: 2,
   pollIntervalMs: 1500,
-  // Real Qwen-Image jobs on this backend were observed taking 270-320s end-to-end even
-  // on an otherwise-idle worker (see comfyui-worker-1/-2 container logs, 2026-08-20 test
-  // run: "Prompt executed in 311.95 seconds"). 120s was too short and produced a wall of
-  // false "poll_timeout" rows for jobs that were still genuinely running server-side --
-  // the admin tool just stopped watching them. 600s gives headroom above the observed
-  // worst case; raise it further if you're intentionally testing deep queue backlog with
-  // more requests than there are ComfyUI workers to drain them.
+  // Warm Lightning 4-step jobs are ~20–50s; cold first load of the ~20GB UNet can still
+  // approach ~5 minutes. 600s keeps headroom for cold start + a short queue behind 2
+  // workers. Raise further only when intentionally testing deep backlog.
   maxWaitMs: 600_000,
   submitTimeoutMs: 15_000,
 }

@@ -184,22 +184,30 @@ class Settings(BaseSettings):
     #   ModelSamplingAuraFlow node) -- graph verified against the official workflow at
     #   https://docs.comfy.org/tutorials/image/qwen/qwen-image (2026-08). Uses
     #   comfy_diffusion_model_name/comfy_clip_name/comfy_vae_name/comfy_model_sampling_shift.
-    comfy_model_family: Literal["checkpoint", "qwen_image"] = "qwen_image"
+    #   CLIPLoader type="qwen_image".
+    # "z_image_turbo" = Z-Image Turbo (Tongyi 6B distilled) -- same split AuraFlow skeleton
+    #   as qwen_image but CLIPLoader type="lumina2", TE=qwen_3_4b, VAE=ae (Flux). Official
+    #   simple workflow uses ~8–9 steps, cfg=1, euler/simple. Fast student lane on DGX.
+    comfy_model_family: Literal["checkpoint", "qwen_image", "z_image_turbo"] = "qwen_image"
     comfy_checkpoint_name: str = "sd_xl_base_1.0.safetensors"
     comfy_diffusion_model_name: str = "qwen_image_2512_fp8_e4m3fn.safetensors"
     comfy_clip_name: str = "qwen_2.5_vl_7b_fp8_scaled.safetensors"
     comfy_vae_name: str = "qwen_image_vae.safetensors"
     # ModelSamplingAuraFlow's "shift" widget -- Qwen-Image's official template ships 3.1;
-    # changing it shifts the noise schedule and is a quality/style tuning knob, not
-    # something to guess differently without reason.
+    # Z-Image Turbo simple workflows commonly use 3.0. Changing it shifts the noise
+    # schedule and is a quality/style tuning knob, not something to guess differently
+    # without reason.
     comfy_model_sampling_shift: float = 3.1
     comfy_sampler_name: str = "euler"
-    # "simple" is Qwen-Image's official default scheduler; "normal" is the classic
-    # SDXL-era default -- kept as a single setting since only one family is active at a
-    # time, but worth remembering if you switch comfy_model_family later.
+    # "simple" is Qwen-Image's / Z-Image Turbo official default scheduler; "normal" is the
+    # classic SDXL-era default -- kept as a single setting since only one family is
+    # active at a time on the student profile, but worth remembering if you switch
+    # comfy_model_family later.
     comfy_scheduler: str = "simple"
     comfy_steps: int = 20
     # Qwen-Image's official template uses cfg=4.0 (vs the classic SDXL default of ~7.0).
+    # Lightning 4-step UNet (qwen_image_2512_fp8_e4m3fn_scaled_comfyui_4steps_v1.0) and
+    # Z-Image Turbo both use cfg=1.0 -- set via APP_COMFY_CFG_SCALE on the DGX .env.
     comfy_cfg_scale: float = 4.0
     comfy_negative_prompt: str = ""
 
@@ -216,7 +224,7 @@ class Settings(BaseSettings):
     # instead of silently reusing the student model. Same field shape/meaning as the
     # comfy_* block above; see those fields' comments for what each one does.
     comfy_personnel_checkpoint_name: str = ""
-    comfy_personnel_model_family: Literal["checkpoint", "qwen_image"] = "checkpoint"
+    comfy_personnel_model_family: Literal["checkpoint", "qwen_image", "z_image_turbo"] = "checkpoint"
     comfy_personnel_diffusion_model_name: str = ""
     comfy_personnel_clip_name: str = ""
     comfy_personnel_vae_name: str = ""

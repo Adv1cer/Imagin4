@@ -252,6 +252,17 @@ success by the absence of the CUBLAS crash in worker-3/4's logs under load -- **
 `nvidia-smi`'s VRAM column, which has a confirmed reporting gap on GB10's unified-memory
 architecture. **MPS itself not yet run against the real DGX Spark** -- wiring + a runbook,
 not a confirmed fix; update this section with the actual result
+when you have it.
+
+**2026-08-21 throughput recipe (DGX Spark)**: run **2** workers (`comfyui-worker-1` +
+`comfyui-worker-2`, host `:8188`/`:8189`), `APP_DEFAULT_COMFY_ACTIVE_SLOTS=2`.
+Dual-lane profiles:
+- `student` (default) → **Z-Image Turbo** (`z_image_turbo`, 8 steps, cfg 1)
+- `personnel` → **Qwen-Image-2512 Lightning 4-step** UNet
+
+Download + bring-up commands: `docker/comfyui-worker/DGX_MODELS_RUNBOOK.md`.
+Do not use `run_nvidia_gpu_fast_fp16_accumulation` / `--fast fp16_accumulation`
+expecting a win on these stacks. Admin load-test concurrency defaults to 2.
 (pass or fail) once tested.
 
 ## Mock vs. live ComfyUI vs. Gemini
